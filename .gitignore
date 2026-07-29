@@ -1,0 +1,21 @@
+# Runtime artifacts from running the recipes in place
+*.log
+*.out
+*.err
+*.pid
+*.peerid
+*.multiaddr
+last_service.env
+run-*/
+logs/
+cache/
+
+# Binaries and images the recipes fetch or build
+*.sif
+*.sqsh
+opentela-arm64
+opentela-amd64
+
+# Editor / OS
+.DS_Store
+*.swp
