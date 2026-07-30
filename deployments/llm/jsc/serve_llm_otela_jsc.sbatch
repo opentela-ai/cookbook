@@ -51,6 +51,17 @@
 # just dials the prefilled $OTELA_RELAY_ADDR (overridable via env or
 # $RELAY_ADDR_FILE); it never starts a relay.
 #
+# CRITICAL — relay data must live on /e/scratch, NOT /e/home. The binary puts
+# its go-ds-crdt / badger store at $HOME/jupiter/.ocfcore/ (resolved via
+# os/user.Current(), which reads /etc/passwd — NOT the $HOME env var, so no
+# --data-dir flag exists). /e/home is NFS-backed: after a few days the file
+# handle goes stale (ESTALE), badger can no longer write to its value log, the
+# CRDT DAG freezes, and the LLM service never propagates to the public relay
+# -> api.opentela.ai returns 503 "No provider found". Fix: symlink
+# $HOME/jupiter/.ocfcore -> <some dir on /e/scratch> before starting the
+# relay. The relay's identity (PeerID) comes from --config-dir, which is
+# already on /e/scratch, so the symlink does not affect it.
+#
 # The relay's second hop depends on the P2PForwardHandler fix ("dial the target
 # peer, not the incoming Host header"; without it every hop self-dials — "failed
 # to dial: dial to self attempted" — and the job registers but never serves a
