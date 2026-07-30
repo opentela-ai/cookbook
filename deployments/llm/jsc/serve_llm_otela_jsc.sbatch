@@ -51,11 +51,12 @@
 # just dials the prefilled $OTELA_RELAY_ADDR (overridable via env or
 # $RELAY_ADDR_FILE); it never starts a relay.
 #
-# The relay runs an OFFICIAL release (v0.2.3+). Its second hop depends on the
-# P2PForwardHandler fix ("dial the target peer, not the incoming Host header";
-# without it every hop self-dials — "failed to dial: dial to self attempted" —
-# and the job registers but never serves a request). That fix landed in v0.2.3,
-# so the stock release is now correct for the relay — no custom build needed.
+# The relay's second hop depends on the P2PForwardHandler fix ("dial the target
+# peer, not the incoming Host header"; without it every hop self-dials — "failed
+# to dial: dial to self attempted" — and the job registers but never serves a
+# request). That fix landed in v0.2.3, so any OFFICIAL release >= v0.2.3 is
+# correct for the relay; the v0.2.2-"relayfix" build also carries it. The
+# running relay is us-managed — see $OTELA_RELAY_DEFAULT.
 #
 # -----------------------------------------------------------------------------
 # NO socat IS NEEDED
