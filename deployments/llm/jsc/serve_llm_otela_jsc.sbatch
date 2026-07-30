@@ -91,6 +91,14 @@ export CG_DECODE="${CG_DECODE:-full}"
 export MOE_BACKEND="${MOE_BACKEND:-marlin}"
 export CTX_LEN="${CTX_LEN:-65536}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
+# PyTorch distributed init + Store.wait() timeout (seconds). The default
+# (None -> 600 s for NCCL) is problematic on JSC racks whose GH200 nodes DO
+# advertise CUDA multimem: sglang's CUDASymmetricMemory rendezvous is
+# attempted on the default process group (all 32 ranks across 8 nodes),
+# IPC handles can't cross nodes, and every rank burns the full timeout
+# before falling back. 60 s is ample for the real rendezvous (sub-second)
+# while keeping the fallback fast on those racks.
+export DIST_TIMEOUT="${DIST_TIMEOUT:-60}"
 # Passthrough for experimental sglang flags without forking this script.
 # Example: SGLANG_EXTRA_ARGS="--mamba-radix-cache-strategy extra_buffer_lazy"
 export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
@@ -227,7 +235,7 @@ exec apptainer exec --nv \
     --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health \
     --enable-hierarchical-cache --hicache-ratio 2.0 \
     --hicache-write-policy write_through_selective --hicache-io-backend kernel \
-    --host 0.0.0.0 --port "$SERVE_PORT" $SGLANG_EXTRA_ARGS
+    --host 0.0.0.0 --port "$SERVE_PORT" --dist-timeout "$DIST_TIMEOUT" $SGLANG_EXTRA_ARGS
 ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
