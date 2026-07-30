@@ -102,6 +102,12 @@ export DIST_TIMEOUT="${DIST_TIMEOUT:-60}"
 # Passthrough for experimental sglang flags without forking this script.
 # Example: SGLANG_EXTRA_ARGS="--mamba-radix-cache-strategy extra_buffer_lazy"
 export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
+# Metrics are OFF by default. PyTorch's NCCL watchdog, on a collective
+# timeout, re-registers Prometheus metrics that sglang already registered
+# -> prometheus_client.registry.DuplicateTimeseries -> the server crashes.
+# A single transient cross-node collective hang is enough to bring down the
+# whole deployment. Opt in with ENABLE_METRICS=1 only when you can tolerate
+# that risk (e.g. short benchmarking runs on a well-behaved rack).
 export DIST_PORT="${DIST_PORT:-20000}"
 export SERVE_PORT="${SERVE_PORT:-30000}"
 export K3_NIC="${K3_NIC:-ib0}"             # confirmed present on booster nodes
@@ -199,6 +205,18 @@ SGLANG_HOST_IP="$(ip -o -4 addr show "$IFACE" 2>/dev/null | awk '{print $4}' | c
 [ -z "$SGLANG_HOST_IP" ] && SGLANG_HOST_IP="$(hostname -I | awk '{print $1}')"
 export SGLANG_HOST_IP
 export NCCL_IB_DISABLE=0 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}" NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Force IPv4 for every NCCL socket (bootstrap + data). Without this, some
+# JSC compute nodes resolve peer hostnames to IPv6 (fdff::), NCCL's
+# bootstrap tries the AAAA record, fails with errno 97 (Address family not
+# supported) and has NO fallback -> the PP/EP communicator init deadlocks.
+# Verified: TP8/EP8/PP4 init completes all 32 PP comms with this set
+# (vs 5/32 without). Pair with GLOO for consistency.
+export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-IPv4}" GLOO_SOCKET_FAMILY="${GLOO_SOCKET_FAMILY:-IPv4}"
+# IB reliability for cross-node collectives. NCCL_IB_RETRY_CNT (default 0)
+# and NCCL_IB_TIMEOUT (default 18 ~ 36 s) control how long the RC QP
+# retries before giving up. Raising them lets the transport ride out
+# transient switch hiccups on the JSC InfiniBand fabric.
+export NCCL_IB_RETRY_CNT="${NCCL_IB_RETRY_CNT:-7}" NCCL_IB_TIMEOUT="${NCCL_IB_TIMEOUT:-22}"
 
 # Keep caches off the quota-limited /e/home; the deploy dir is bind-mounted.
 export HOME="$DEPLOY_DIR/home" HF_HOME="$DEPLOY_DIR/cache/hf"
@@ -232,7 +250,7 @@ exec apptainer exec --nv \
     --cuda-graph-backend-decode "$CG_DECODE" \
     --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC" \
     --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
-    --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health \
+    ${ENABLE_METRICS:+--enable-metrics} --uvicorn-access-log-exclude-prefixes /metrics /health \
     --enable-hierarchical-cache --hicache-ratio 2.0 \
     --hicache-write-policy write_through_selective --hicache-io-backend kernel \
     --host 0.0.0.0 --port "$SERVE_PORT" --dist-timeout "$DIST_TIMEOUT" $SGLANG_EXTRA_ARGS
