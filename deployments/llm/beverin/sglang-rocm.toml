@@ -1,0 +1,77 @@
+# EDF for serving GLM-4.7-Flash with the *plain upstream* SGLang ROCm image on
+# Beverin (AMD MI300A / gfx942) compute nodes, launched via the CSCS Slurm
+# Container Engine (enroot + Pyxis) with `srun --environment=sglang-rocm`.
+#
+# Why this image / tag:
+#   * sglang only publishes ROCm builds for MI300A (gfx942, `*-mi30x`) and the
+#     MI350 series (gfx950, `*-mi35x`) — there is NO MI250X/gfx90a build, so the
+#     job MUST run on the `mi300` partition even though the login node is
+#     MI250X. Confirmed via `docker/rocm.Dockerfile`:
+#       docker build --build-arg GPU_ARCH=gfx942-rocm720 \
+#         -t <ver>-rocm720-mi30x -f rocm.Dockerfile .
+#   * Pinned by digest (not a floating :rocm720-mi30x tag) so the Triton JIT
+#     caches on shared /capstor stay warm across launches — a moving tag
+#     silently invalidates the whole cache. Digest resolved 2026-07-30 from
+#     Docker Hub lmsysorg/sglang:v0.5.16-rocm720-mi30x
+#     (ROCm 7.2 userspace; the MI300A kernel driver on Beverin is 6.3/6.4 and
+#      is forward-compatible with the 7.2 userspace, same as the existing
+#      vllm/vllm-openai-rocm and minisgl-rocm EDFs in ~/.edf).
+#
+# First run pulls ~26 GiB into $SCRATCH/.edf_imagestore (shared, cached for
+# every subsequent job across all nodes). To pre-warm from the login node:
+#   enroot import docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x
+image = "lmsysorg/sglang@sha256:80d04638deb64fac000fa565cb46e5d2f692173dc125a32a956014a6383ecaee"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin"
+
+[env]
+# Per-rank HOME on /capstor (NOT /users — quota-limited). otela writes a libp2p
+# identity key + a badger DB under $HOME/.config/opentela / $HOME/.ocfcore; a
+# shared HOME across ranks/jobs collides. The serve script overrides this per
+# rank (SLURM_PROCID); the value here is the base for rank 0 / single-node runs.
+HOME = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/xdg"
+XDG_CONFIG_HOME = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/config"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/triton"
+PIP_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/pip"
+# tempfile goes on /capstor, NOT the default /users/<u>/.tmp that Slurm hands
+# the container (home is quota-limited and sglang's tempfile cleanup on quota
+# dirs throws OSError [Errno 39]). The serve script also re-exports this.
+TMPDIR = "/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/cache/tmp"
+# MI300A + ROCm 7.2 hard-requires this or HIP/RCCL aborts at kernel launch
+# (mandatory on Beverin; see ~/.edf/minisgl-rocm.toml and tokenspeed-rocm*).
+HSA_NO_SCRATCH_RECLAIM = "1"
+ROCM_PATH = "/opt/rocm"
+HIP_PATH = "/opt/rocm"
+# /opt/rocm/lib MUST come first: some base images ship a stale libhsa-runtime64
+# in /lib/x86_64-linux-gnu that breaks torch import on MI300A.
+LD_LIBRARY_PATH = "/opt/rocm/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+NCCL_DEBUG = "WARN"
+NCCL_SOCKET_IFNAME = "hsn"
+# Disable the image-wide SGLANG_USE_AITER=1 (set in the container's
+# /etc/environment). aiter's get_rope unconditionally indexes
+# rope_scaling["original_max_position_embeddings"] and crashes on
+# GLM-4.7-Flash, whose rope_scaling is {rope_type:default} with no such key
+# (KeyError, kills all 4 scheduler ranks at init). sglang's own get_rope
+# (selected when SGLANG_USE_AITER=0) defaults the missing key via
+# _get_rope_param — same path bristen uses on CUDA, where aiter is off by
+# default. sglang still auto-selects attention_backend=triton on hip, so this
+# only sheds aiter-specific kernels that have Triton fallbacks.
+SGLANG_USE_AITER = "0"
+# Use the image's own SGLang/torch; never pick up stale user venvs on /users.
+PYTHONPATH = ""
+PYTHONNOUSERSITE = "1"
+PIP_BREAK_SYSTEM_PACKAGES = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+
+[annotations]
+com.pyxis.entrypoint_log = "true"
