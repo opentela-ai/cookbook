@@ -110,6 +110,21 @@ export DIST_TIMEOUT="${DIST_TIMEOUT:-60}"
 # Passthrough for experimental sglang flags without forking this script.
 # Example: SGLANG_EXTRA_ARGS="--mamba-radix-cache-strategy extra_buffer_lazy"
 export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
+# Auto-enable FlashKDA (MoonshotAI/FlashKDA) for the KDA linear-attention
+# prefill when the prefix is present at $DEPLOY_DIR/flashkda_prefix. Build
+# it with:  FLASH_KDA_CUDA_ARCHS=90a pip install --prefix $DEPLOY_DIR/flashkda_prefix \
+#            git+https://github.com/MoonshotAI/FlashKDA.git
+# Measured: +14% / +19% agg throughput at C=8 / C=16 (prefill-bound); flat
+# at C=32 (pipeline-bound). No-op if absent; override with
+# SGLANG_PYTHONPATH_EXTRA / SGLANG_EXTRA_ARGS to force a different backend.
+FLASHKADA_PREFIX="${FLASHKADA_PREFIX:-$DEPLOY_DIR/flashkda_prefix}"
+if [ -f "$FLASHKADA_PREFIX/flash_kda/__init__.py" ]; then
+  [ -z "${SGLANG_PYTHONPATH_EXTRA:-}" ] && export SGLANG_PYTHONPATH_EXTRA="$FLASHKADA_PREFIX"
+  case "$SGLANG_EXTRA_ARGS" in *linear-attn-prefill-backend*) ;; *)
+    SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:+$SGLANG_EXTRA_ARGS }--linear-attn-prefill-backend flashkda"
+    export SGLANG_EXTRA_ARGS ;;
+  esac
+fi
 # Metrics are OFF by default. PyTorch's NCCL watchdog, on a collective
 # timeout, re-registers Prometheus metrics that sglang already registered
 # -> prometheus_client.registry.DuplicateTimeseries -> the server crashes.
