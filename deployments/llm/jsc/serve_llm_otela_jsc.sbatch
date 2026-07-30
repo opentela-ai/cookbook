@@ -77,8 +77,16 @@ export MODEL_PATH="${MODEL_PATH:-/e/data1/datasets/products/mmlaion/shared/model
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3}"
 
 # ------------------------------------------------------------------- shape ----
-# TP stays intra-node (4x GH200 on NVLink); the pipeline spans nodes so captured
-# decode collectives never cross the fabric. PP_SIZE MUST equal the node count.
+# WHY TP4/PP8 (NOT the TP32/EP32 the SGLang Kimi-K3 cookbook recommends for
+# Hopper): the JSC Jupiter fabric runs an NCCL SHARP plugin (nccl_rdma_sharp)
+# that the stock sglang container CANNOT load — every HPC-X install on JSC
+# is built for CUDA 12 (libcudart.so.12) while the container is CUDA 13
+# (libcudart.so.13), an ABI hard stop. Without SHARP, NCCL's built-in IB
+# driver reliably hangs a cross-node ALLGATHER_BASE after ~800-2000 ops
+# (verified live on TP8/EP8/PP4 and TP32/EP32/PP1). Cross-node POINT-TO-
+# POINT (pipeline send/recv) is unaffected, so we keep TP on the 4 GH200
+# NVLink domain and push only PP across the fabric. This caps throughput
+# (~510-530 tok/s @ C=32) but is the only topology that is stable on JSC.
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
