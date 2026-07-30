@@ -91,6 +91,9 @@ export CG_DECODE="${CG_DECODE:-full}"
 export MOE_BACKEND="${MOE_BACKEND:-marlin}"
 export CTX_LEN="${CTX_LEN:-65536}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
+# Passthrough for experimental sglang flags without forking this script.
+# Example: SGLANG_EXTRA_ARGS="--mamba-radix-cache-strategy extra_buffer_lazy"
+export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
 export DIST_PORT="${DIST_PORT:-20000}"
 export SERVE_PORT="${SERVE_PORT:-30000}"
 export K3_NIC="${K3_NIC:-ib0}"             # confirmed present on booster nodes
@@ -192,9 +195,17 @@ export NCCL_IB_DISABLE=0 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}" NCCL_DEBUG=
 # Keep caches off the quota-limited /e/home; the deploy dir is bind-mounted.
 export HOME="$DEPLOY_DIR/home" HF_HOME="$DEPLOY_DIR/cache/hf"
 export XDG_CACHE_HOME="$DEPLOY_DIR/cache/xdg" TRITON_CACHE_DIR="$DEPLOY_DIR/cache/triton"
-mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR"
+# tvm-ffi JIT kernel cache. The default (~/.cache/tvm-ffi) lands on the
+# REAL, quota-limited /e/home shared across every node, so concurrent
+# cold-cache builds corrupt each other. Point it at a shared dir on
+# /e/scratch instead; the pre-warm step below builds every JIT kernel once,
+# single-process, so every rank only loads (never races to build).
+export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}"
+mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TVM_FFI_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
-export PYTHONPATH="" PYTHONNOUSERSITE=1
+# Optional: inject extra Python paths into the container (e.g. a bind-mounted
+# flash_kda prefix). Example: SGLANG_PYTHONPATH_EXTRA=/e/.../flashkda_prefix
+export PYTHONPATH="${SGLANG_PYTHONPATH_EXTRA:-}" PYTHONNOUSERSITE=1
 
 echo "[rank $RANK] $(hostname) ip=$SGLANG_HOST_IP iface=$IFACE head=$HEAD_IP:$DIST_PORT"
 
@@ -216,7 +227,7 @@ exec apptainer exec --nv \
     --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health \
     --enable-hierarchical-cache --hicache-ratio 2.0 \
     --hicache-write-policy write_through_selective --hicache-io-backend kernel \
-    --host 0.0.0.0 --port "$SERVE_PORT"
+    --host 0.0.0.0 --port "$SERVE_PORT" $SGLANG_EXTRA_ARGS
 ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
@@ -290,18 +301,37 @@ trap 'stop_otela' EXIT TERM INT
 ) &
 
 # ------------------------------------------------------------- run engine ----
+# These exports run in the MAIN body (not the engine.sh heredoc). The
+# pre-warm apptainer exec below needs the SAME TVM_FFI_CACHE_DIR that
+# engine.sh sets, or tvm-ffi defaults to ~/.cache/tvm-ffi (the real
+# quota-limited /e/home) and the pre-warm builds into a DIFFERENT dir than
+# the ranks read from — making the warm-up a silent no-op.
+export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}"
+mkdir -p "$TVM_FFI_CACHE_DIR"
+
 # Pre-warm the tvm-ffi JIT cache single-process first. sglang JIT-builds kernels
-# into ~/.cache/tvm-ffi (the REAL home — tvm_ffi ignores a redirected HOME). On a
-# cold cache every rank races to build into that one shared directory and some
-# load a half-written .so, surfacing as
+# into $TVM_FFI_CACHE_DIR (shared on /e/scratch). On a cold cache every
+# rank races to build into that one shared directory and some load a
+# some load a half-written .so, surfacing during model init as either
 #   AttributeError: Module has no function 'gptq_marlin_repack'
-# during model-runner init. Building once here removes the race; no-op when warm.
+#   RuntimeError: Failed to load dynamic shared library ...tiny_gemm...file too short
+# This step runs on the allocation's first node (it has a GPU), so it can
+# JIT-compile gptq_marlin_repack + all three Kimi-K3 tiny_gemm dispatch
+# shapes (144x7168, 896x7168, 1536x128) — covering every TP width — before
+# any serve rank starts. Warm cache = instant no-op.
 echo "[$(date -Is)] pre-warming JIT cache"
 apptainer exec --nv --bind /e/scratch:/e/scratch --bind /e/home:/e/home "$IMAGE" \
   python3 -c "
+import torch
 from sglang.jit_kernel.gptq_marlin_repack import _jit_gptq_marlin_repack_module as m
 assert hasattr(m(), 'gptq_marlin_repack')
+from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+for n, k in [(144, 7168), (896, 7168), (1536, 128)]:
+    x = torch.zeros(min(n, 8), k, dtype=torch.bfloat16, device='cuda')
+    w = torch.zeros(n, k, dtype=torch.bfloat16, device='cuda')
+    kimi_k3_tiny_gemm(x, w)
+    torch.cuda.synchronize()
 print('jit warm ok')
-" 2>&1 | tail -2
+" 2>&1 | tail -3
 
 srun --ntasks-per-node=1 bash "$RUNDIR/engine.sh"
