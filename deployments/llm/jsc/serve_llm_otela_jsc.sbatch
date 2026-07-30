@@ -20,14 +20,14 @@
 #          serve_llm_otela_jsc.sbatch
 #
 # What it does, in order:
-#   1. resolves the shared OpenTela relay on the login node (prerequisite, see below)
+#   1. resolves the shared OpenTela relay on the login node (us-managed; prefilled, see below)
 #   2. srun's one engine process per node -> apptainer exec --nv sglang serve
 #   3. waits for the head node's /health, then starts an otela WORKER on the
 #      head node (srun --overlap) which registers the `llm` service
 #   4. on job end / scancel, stops the worker so it announces LEFT cleanly
 #
 # -----------------------------------------------------------------------------
-# WHY A SHARED RELAY IS A PREREQUISITE (and why this script cannot start it)
+# THE SHARED LOGIN-NODE RELAY (us-managed; this script only dials it)
 # -----------------------------------------------------------------------------
 # JSC compute nodes have NO outbound internet — not even Cloudflare:443. The
 # login node does. So a compute-side otela cannot reach the public head; it must
@@ -35,26 +35,27 @@
 #
 #   client ─https─▶ api.opentela.ai ──P2P──▶ ocf head
 #                                              ▲ WSS out via p2p.opentela.ai:443
-#   ┌── JSC login node ──────────────────────────────────────────────┐
-#   │  RELAY otela  --role relay   (tmux/screen; shared by all jobs) │
-#   │  listens on <login 10.x IP>:43917                              │
-#   └────────────────────────────────────────────────────────────────┘
+#   ┌── JSC login node (jpbl-s01-01, ib0 10.128.1.1) ───────────────────────┐
+#   │  RELAY opentela --role relay   (tmux; shared by all jobs/users)       │
+#   │  listens on 10.128.1.1:43917   peer QmXbXAnu9…DaZ1An                  │
+#   └────────────────────────────────────────────────────────────────────────┘
 #                          ▲ TCP, JSC-internal 10.x
 #   ┌── compute head node (this job) ────────────────────────────────┐
-#   │  WORKER otela --role worker --service.port $SERVE_PORT         │
+#   │  WORKER opentela --role worker --service.port $SERVE_PORT      │
 #   │  sglang serve (apptainer --nv, host netns) on localhost        │
 #   └────────────────────────────────────────────────────────────────┘
 #
-# An sbatch body runs on a COMPUTE node, so it physically cannot launch a
-# login-node process. The relay is long-lived and shared across jobs and users
-# anyway — starting one per job would be wrong. This script therefore discovers
-# it and fails loudly with the exact command if it is absent.
+# The relay is a long-lived, shared resource OPERATED BY US — started once in a
+# tmux session on the login node and outliving any single job. An sbatch body
+# runs on a COMPUTE node, so it could not start it anyway. This script therefore
+# just dials the prefilled $OTELA_RELAY_ADDR (overridable via env or
+# $RELAY_ADDR_FILE); it never starts a relay.
 #
-# NOTE ON THE RELAY BINARY: the relay must run a build containing the
-# P2PForwardHandler fix (req.URL.Host must be target.Host, not req.Host).
-# Without it every relay hop self-dials — "failed to dial: dial to self
-# attempted" — and this job will register fine but never serve a request.
-# The WORKER can use a stock release; only the relay does the second hop.
+# The relay runs an OFFICIAL release (v0.2.3+). Its second hop depends on the
+# P2PForwardHandler fix ("dial the target peer, not the incoming Host header";
+# without it every hop self-dials — "failed to dial: dial to self attempted" —
+# and the job registers but never serves a request). That fix landed in v0.2.3,
+# so the stock release is now correct for the relay — no custom build needed.
 #
 # -----------------------------------------------------------------------------
 # NO socat IS NEEDED
@@ -82,11 +83,11 @@ export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"      # ep_size * moe_dp_size == tp_size
 export CG_DECODE="${CG_DECODE:-full}"
-# Do NOT use `marlin` with the current lmsysorg/sglang:kimi-k3 image on aarch64:
-# model-runner init dies with "Module has no function 'gptq_marlin_repack'".
-# That kernel is JIT-built (sglang/jit_kernel/gptq_marlin_repack.py) and the
-# build yields no wrapper here. `auto` -> TRITON_KERNELS for mxfp4 on CUDA.
-export MOE_BACKEND="${MOE_BACKEND:-auto}"
+# Keep `marlin` for mxfp4 models: it is the only SM90 backend that leaves the
+# weights PACKED. `auto` picks TRITON_KERNELS, whose upcast_from_mxfp()
+# dequantizes to bf16 and OOMs a 4-bit model on 95 GiB HBM regardless of
+# --mem-fraction-static.
+export MOE_BACKEND="${MOE_BACKEND:-marlin}"
 export CTX_LEN="${CTX_LEN:-65536}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
 export DIST_PORT="${DIST_PORT:-20000}"
@@ -94,9 +95,12 @@ export SERVE_PORT="${SERVE_PORT:-30000}"
 export K3_NIC="${K3_NIC:-ib0}"             # confirmed present on booster nodes
 
 # ------------------------------------------------------------------- otela ----
-# Stock release is fine for the WORKER (it only receives hops).
+# Stock release is fine for the WORKER (it only receives hops). v0.2.3 also
+# carries the relay's P2PForwardHandler fix, so the SAME release runs the
+# us-managed login-node relay (see header) — no special build anymore.
+OTELA_VERSION="${OTELA_VERSION:-v0.2.3}"
 OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/opentela-arm64}"
-OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/v0.2.2/opentela-arm64}"
+OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/$OTELA_VERSION/opentela-arm64}"
 OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 OTELA_SEED="${OTELA_SEED:-21}"
 OTELA_TCP_PORT="${OTELA_TCP_PORT:-43920}"
@@ -109,7 +113,10 @@ OTELA_STEP_NAME="${OTELA_STEP_NAME:-otela-worker-$SLURM_JOB_ID}"
 # never registers and never announces LEFT. Set to true only if every node in
 # the path runs an official signed release.
 OTELA_REQUIRE_SIGNED="${OTELA_REQUIRE_SIGNED:-false}"
-# Where the login-node relay publishes its dial address.
+# The shared login-node relay (us-managed; see header). An explicit
+# $OTELA_RELAY_ADDR or a non-empty $RELAY_ADDR_FILE overrides this default.
+OTELA_RELAY_DEFAULT="/ip4/10.128.1.1/tcp/43917/p2p/QmXbXAnu9XVvfyXPaS57rzvKHbTjC4xMpxSdTpFQDaZ1An"
+# Where the login-node relay may publish its dial address (optional override).
 RELAY_ADDR_FILE="${RELAY_ADDR_FILE:-/e/scratch/$PROJECT/$USER/otela-relay/relay.multiaddr}"
 
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5400}"   # weights can be ~1.5 TB; be patient
@@ -123,62 +130,41 @@ echo "[$(date -Is)] job=$SLURM_JOB_ID nodes=$SLURM_JOB_NODELIST"
 echo "[$(date -Is)] head=$HEAD ($HEAD_IP)  tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE nnodes=$NNODES"
 echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME"
 
-[ -f "$IMAGE" ]      || { echo "FATAL: image not found: $IMAGE" >&2; exit 1; }
+[ -f "$IMAGE" ] || { echo "FATAL: image not found: $IMAGE" >&2; echo "       build it on a login node with build_kimi_k3_image.sh (next to this sbatch)" >&2; exit 1; }
 [ -d "$MODEL_PATH" ] || { echo "FATAL: weights not found: $MODEL_PATH" >&2; exit 1; }
 [ "$PP_SIZE" = "$NNODES" ] || echo "WARN: PP_SIZE=$PP_SIZE != NNODES=$NNODES (intended?)" >&2
 
 # ------------------------------------------------------ resolve the relay -----
+# Precedence: explicit $OTELA_RELAY_ADDR > non-empty $RELAY_ADDR_FILE > the
+# built-in us-managed login-node relay ($OTELA_RELAY_DEFAULT). This script
+# never starts the relay — see the header.
 RELAY_ADDR="${OTELA_RELAY_ADDR:-}"
-[ -z "$RELAY_ADDR" ] && [ -f "$RELAY_ADDR_FILE" ] && RELAY_ADDR="$(cat "$RELAY_ADDR_FILE")"
-if [ -z "$RELAY_ADDR" ]; then
-  cat >&2 <<EOM
-FATAL: no OpenTela relay address.
-
-  Looked for \$OTELA_RELAY_ADDR and $RELAY_ADDR_FILE
-
-  Compute nodes have no outbound internet, so a relay must be running on the
-  LOGIN node. Start one there (once; it is shared by all jobs and users):
-
-    mkdir -p ~/otela-relay && cd ~/otela-relay
-    curl -fL $OTELA_URL -o opentela-arm64 && chmod +x opentela-arm64
-    # NOTE: the relay needs the P2PForwardHandler fix — see the header.
-    cat > cfg.yaml <<'CFG'
-    name: jsc-relay
-    seed: "11"
-    port: "18092"
-    tcpport: "43917"
-    udpport: "59835"
-    mode: node
-    role: relay
-    loglevel: debug
-    cleanslate: false
-    # MUST be public: libp2p only starts the circuit-relay service when the host
-    # believes it is publicly reachable. With "private" the worker's reservation
-    # fails with "protocols not supported: [/libp2p/circuit/relay/0.2.0/hop]".
-    reachability: public
-    security:
-      require_signed_binary: false
-    solana:
-      skip_verification: true
-CFG
-    tmux new -s otela-relay -d "./opentela-arm64 start --config-dir . \\
-      --bootstrap.static /dns4/p2p.opentela.ai/tcp/443/wss/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7 \\
-      --solana.skip_verification 2>&1 | tee -a relay.log"
-
-    # then publish its dial address for jobs to find:
-    ID=\$(grep -aoE 'id=Qm[A-Za-z0-9]{44}' relay.log | head -1 | cut -d= -f2)
-    IP=\$(ip -4 addr show | grep -oP 'inet \\K10\\.128\\.[0-9.]+' | head -1)
-    mkdir -p $(dirname "$RELAY_ADDR_FILE")
-    echo "/ip4/\$IP/tcp/43917/p2p/\$ID" > $RELAY_ADDR_FILE
-EOM
-  exit 1
-fi
+[ -z "$RELAY_ADDR" ] && [ -s "$RELAY_ADDR_FILE" ] && RELAY_ADDR="$(cat "$RELAY_ADDR_FILE")"
+[ -z "$RELAY_ADDR" ] && RELAY_ADDR="$OTELA_RELAY_DEFAULT"
 echo "[$(date -Is)] relay=$RELAY_ADDR"
 
 if [ ! -x "$OTELA_BIN" ]; then
-  echo "[$(date -Is)] fetching otela -> $OTELA_BIN"
-  curl -fL "$OTELA_URL" -o "$OTELA_BIN" && chmod +x "$OTELA_BIN" \
-    || { echo "FATAL: otela fetch failed (login node has internet; compute may not)" >&2; exit 1; }
+  echo "[$(date -Is)] fetching otela $OTELA_VERSION -> $OTELA_BIN"
+  # This sbatch body runs on a COMPUTE node, which on JSC has NO outbound
+  # internet — so the curl below is usually doomed here. Try it anyway with a
+  # short timeout (clusters whose compute nodes do have egress self-serve), and
+  # on failure print the EXACT login-node command: stage the binary once on a
+  # login node and every job after reads it.
+  if curl -fL --max-time 20 "$OTELA_URL" -o "$OTELA_BIN" && chmod +x "$OTELA_BIN"; then
+    echo "[$(date -Is)] otela fetched"
+  else
+    rm -f "$OTELA_BIN"
+    cat >&2 <<EOM
+FATAL: otela binary missing at $OTELA_BIN and unreachable from here.
+  JSC compute nodes have no outbound internet. Stage it ONCE on a LOGIN node:
+
+    mkdir -p "$(dirname "$OTELA_BIN")"
+    curl -fL "$OTELA_URL" -o "$OTELA_BIN" && chmod +x "$OTELA_BIN"
+
+  then re-submit. (Override path/version with \$OTELA_BIN / \$OTELA_VERSION.)
+EOM
+    exit 1
+  fi
 fi
 
 cat > "$DEPLOY_DIR/last_service.env" <<ENV
@@ -303,4 +289,18 @@ trap 'stop_otela' EXIT TERM INT
 ) &
 
 # ------------------------------------------------------------- run engine ----
+# Pre-warm the tvm-ffi JIT cache single-process first. sglang JIT-builds kernels
+# into ~/.cache/tvm-ffi (the REAL home — tvm_ffi ignores a redirected HOME). On a
+# cold cache every rank races to build into that one shared directory and some
+# load a half-written .so, surfacing as
+#   AttributeError: Module has no function 'gptq_marlin_repack'
+# during model-runner init. Building once here removes the race; no-op when warm.
+echo "[$(date -Is)] pre-warming JIT cache"
+apptainer exec --nv --bind /e/scratch:/e/scratch --bind /e/home:/e/home "$IMAGE" \
+  python3 -c "
+from sglang.jit_kernel.gptq_marlin_repack import _jit_gptq_marlin_repack_module as m
+assert hasattr(m(), 'gptq_marlin_repack')
+print('jit warm ok')
+" 2>&1 | tail -2
+
 srun --ntasks-per-node=1 bash "$RUNDIR/engine.sh"
