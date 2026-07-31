@@ -15,6 +15,8 @@ deployments/<service-kind>/<site>/
 | Path | What it covers |
 |------|----------------|
 | `deployments/llm/jsc/` | LLM serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
+| `deployments/llm/beverin/` | LLM serving on Beverin (AMD MI300A, ROCm, EDF). |
+| [`deployments/llm/BENCHMARKING.md`](deployments/llm/BENCHMARKING.md) | How we benchmark an LLM service: strategy, the C=1 trap, the shared `bench/` harness, and the reporting checklist every throughput claim must carry. |
 
 ## Conventions
 

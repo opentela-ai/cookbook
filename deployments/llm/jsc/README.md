@@ -54,6 +54,10 @@ Why each of these is pinned the way it is (each was a discovered failure mode):
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 256-out)
 
+Taken with the shared `deployments/llm/bench/` harness — see
+[`BENCHMARKING.md`](../BENCHMARKING.md) for the full protocol (warmup, the
+C=1 trap, how to read the curve shape).
+
 | Concurrency | Aggregate out tok/s | per-req tok/s |
 |---|---|---|
 | 1  | 28.8  | 28.8 |
