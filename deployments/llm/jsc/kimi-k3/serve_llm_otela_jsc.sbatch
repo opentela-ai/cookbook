@@ -163,7 +163,10 @@ export MOE_BACKEND="${MOE_BACKEND:-marlin}"
 # (topk16/hidden3584/SourceMeta). Requires EP>1 to do anything. See the
 # "WHY TP4/PP8" block + EP_JIT_CACHE_DIR note below.
 export MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-}"
-export CTX_LEN="${CTX_LEN:-65536}"
+# 1 Mi-token context (Kimi-K3's native window; used by the laion prod job).
+# Bounds *request* length, not the KV pool — KV pages are allocated on demand,
+# so this does not pre-reserve memory for 1M tokens.
+export CTX_LEN="${CTX_LEN:-1048576}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
 # PyTorch distributed init + Store.wait() timeout (seconds). The default
 # (None -> 600 s for NCCL) is problematic on JSC racks whose GH200 nodes DO

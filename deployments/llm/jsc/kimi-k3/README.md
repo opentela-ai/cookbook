@@ -277,7 +277,7 @@ NET/IB : Using [0]mlx5_0:1/IB/SHARP ...   (/SHARP suffix = engaged)
 | `MOE_A2A_BACKEND` | *(empty=none)* | `deepep`/`megamoe` crash on K3-sm90 (§3); kept for Blackwell. |
 | `SHARP_PLUGIN_DIR` | *(empty=off)* | set to the staged dir + a cu12 image to enable cross-node SHARP (§2). |
 | `MEM_FRAC` | 0.90 | |
-| `CTX_LEN` | 65536 | bounds request length; does not size the KV pool. |
+| `CTX_LEN` | 1048576 | Kimi-K3's native 1 Mi-token window; bounds request length, does not size the KV pool. |
 | `IMAGE` | `.../sglang-kimi-k3.sif` | use `-cu12.sif` for SHARP. |
 | `MODEL_PATH` | `/e/data1/.../Kimi-K3` | shared model cache (no internet on compute). |
 | `DIST_TIMEOUT` | 60 | raise for large TP/EP init. |
