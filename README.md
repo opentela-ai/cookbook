@@ -14,7 +14,7 @@ deployments/<service-kind>/<site>/
 
 | Path | What it covers |
 |------|----------------|
-| `deployments/llm/jsc/` | LLM serving on JSC Jupiter Booster (GH200, Slurm, Apptainer) |
+| `deployments/llm/jsc/` | LLM serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
 
 ## Conventions
 

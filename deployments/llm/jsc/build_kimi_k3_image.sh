@@ -14,8 +14,17 @@
 # Env overrides:
 #   PROJECT=reformo                       Slurm account / scratch project
 #   KIMI_K3_DIR=/e/scratch/$PROJECT/$USER/kimi-k3   deploy root (matches the sbatch $DEPLOY_DIR)
-#   IMAGE_SOURCE=docker://lmsysorg/sglang:kimi-k3   source image
-#   IMAGE=/e/scratch/.../sglang-kimi-k3.sif         output path (matches the sbatch $IMAGE)
+#   IMAGE_SOURCE=docker://lmsysorg/sglang:kimi-k3       source image (CUDA 13 — default)
+#   IMAGE_SOURCE=docker://lmsysorg/sglang:kimi-k3-cu12  CUDA-12 variant. REQUIRED to load the
+#                                                       JSC SHARP plugin (it links libcudart.so.12,
+#                                                       absent under CUDA 13): build it as
+#                                                       sglang-kimi-k3-cu12.sif, run
+#                                                       stage_sharp_plugin.sh, then submit the
+#                                                       sbatch with TP_SIZE=32 EP_SIZE=32 PP_SIZE=1
+#                                                       SHARP_PLUGIN_DIR=.../sharp-plugin-only.
+#                                                       Same recipe otherwise. See the sbatch
+#                                                       "WHY TP4/PP8" block for the full story.
+#   IMAGE=/e/scratch/.../sglang-kimi-k3.sif             output path (matches the sbatch $IMAGE)
 #
 # ~20 GiB image: expect 10-25 min depending on the link. The .sif lands at the
 # SAME path the sbatch reads by default, so the two scripts are wired together

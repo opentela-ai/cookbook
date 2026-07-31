@@ -88,26 +88,81 @@ export MODEL_PATH="${MODEL_PATH:-/e/data1/datasets/products/mmlaion/shared/model
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3}"
 
 # ------------------------------------------------------------------- shape ----
-# WHY TP4/PP8 (NOT the TP32/EP32 the SGLang Kimi-K3 cookbook recommends for
-# Hopper): the JSC Jupiter fabric runs an NCCL SHARP plugin (nccl_rdma_sharp)
-# that the stock sglang container CANNOT load — every HPC-X install on JSC
-# is built for CUDA 12 (libcudart.so.12) while the container is CUDA 13
-# (libcudart.so.13), an ABI hard stop. Without SHARP, NCCL's built-in IB
-# driver reliably hangs a cross-node ALLGATHER_BASE after ~800-2000 ops
-# (verified live on TP8/EP8/PP4 and TP32/EP32/PP1). Cross-node POINT-TO-
-# POINT (pipeline send/recv) is unaffected, so we keep TP on the 4 GH200
-# NVLink domain and push only PP across the fabric. This caps throughput
-# (~510-530 tok/s @ C=32) but is the only topology that is stable on JSC.
+# WHY TP4/PP8 is the DEFAULT (and the now-solved path beyond it):
+# The SGLang Kimi-K3 cookbook recommends TP32/EP32 for H200. On JSC that needs
+# cross-node NCCL ALLGATHER, which historically hung after ~800-2000 ops WITHOUT
+# the SHARP switch-offload plugin (verified live on TP8/EP8/PP4 and on
+# TP32/EP32/PP1). Cross-node point-to-point (pipeline send/recv) was always
+# fine, so the DEFAULT keeps TP on the 4-GH200 NVLink domain and pushes only PP
+# across the fabric — stable, but throughput-capped (~510-530 tok/s @ C=32).
+#
+# The SHARP plugin (nccl_rdma_sharp) used to look un-loadable; it is now SOLVED
+# (build the cu12 image + stage the plugin — see stage_sharp_plugin.sh):
+#   - ABI: every JSC HPC-X build links libcudart.so.12, absent in the CUDA-13
+#     image. Fix: build from docker://lmsysorg/sglang:kimi-k3-cu12 (see
+#     build_kimi_k3_image.sh, set IMAGE_SOURCE to the -cu12 tag).
+#   - /opt/mellanox (SHARP runtime) is NOT mounted on compute nodes. Fix:
+#     stage_sharp_plugin.sh copies the whole chain to /e/scratch and closes two
+#     SONAME gaps (libsmx-3.10, libsharprdmacm-3.10) + a libmlx5 symbol gap
+#     (container ships MLX5_1.24, plugin needs MLX5_1.25).
+#   - Inject via `apptainer --env LD_LIBRARY_PATH=$SHARP_PLUGIN_DIR` (NOT srun
+#     --export, which apptainer discards — the plugin then silently fails to
+#     load and NCCL falls back to its built-in IB driver).
+#   VERIFIED end-to-end (8 nodes / 32 GH200, cu12 image, SHARP injected):
+#     - SHARP engages: "Loaded collnet plugin SHARP", 32 /SHARP device refs,
+#       8 collnet channels/rank. NCCL init across 32 ranks completes in ~7-9s.
+#     - The documented hang is GONE: 0 NCCL WARN, 0 watchdog timeouts, server
+#       stays up. (2-node probe: 3000x all_reduce + all_gather clean.)
+#     - With the DEFAULT a2a backend ('none') TP32/EP32 is impractically slow
+#       (~0.76 tok/s/req measured at C=1; TP4/PP8 does 28.8 tok/s at C=1 = 38x
+#       slower): every MoE layer does an UNOPTIMIZED cross-node allgather across
+#       8 nodes each step. The fix is an optimized a2a backend -- which is where
+#       it STOPS on Hopper (see below).
+#   EP SPEEDUP IS BLACKWELL-GATED (the real finding). We tried DeepEP
+#   (--moe-a2a-backend deepep; the cu12 image ships it pip-installed with native
+#   sm_90 cubins + K3 patches): it ENGAGES cleanly ("DeepEP MoE is enabled",
+#   SHARP still up, init completes). But it crashes at the FIRST MoE forward:
+#       RuntimeError: /deepgemm/csrc/apis/layout.hpp:60: Unknown SF transformation
+#   Root cause, fully traced in the image:
+#     - Kimi-K3 is mxfp4 with a CUSTOM scale-factor format ("SiTU"). The only
+#       DeepGEMM kernel that knows it is sm100_fp8_fp4_mega_moe.cuh, patched by
+#       docker/kimi_k3/apply_deepgemm_situ_patch.py (activation_clamp==0.03125).
+#     - That kernel is BOTH Blackwell-only (sm100) AND mega_moe-only. There is
+#       NO sm90 fp4 mega_moe kernel (only sm90_fp8_mega_moe.cuh -- wrong dtype).
+#     - So on Hopper K3-mxfp4 can ONLY run on Marlin (the lone SM90 backend
+#       that keeps mxfp4 weights packed; see MOE_BACKEND note). And Marlin
+#       registers no DeepEP fused func (--moe-runner-backend marlin + deepep ->
+#       "requires a fused func ... none is registered"). deep_gemm's runner_core
+#       takes the non-fused path but hits the SiTU assertion above.
+#   NET: the network blocker (hang) is solved by SHARP, but the THROUGHPUT
+#   blocker (EP a2a) is a quantization-kernel gap that needs Blackwell. EP for
+#   K3 cannot be enabled on GH200 regardless of image/network work. TP4/PP8
+#   stays the production default AND the Hopper throughput ceiling. The a2a +
+#   EP_JIT_CACHE_DIR knobs below are kept (correct mechanism) so the day K3
+#   runs on B200/GB200 here, flipping MOE_A2A_BACKEND=deepep Just Works.
+#   (Also verified en route: a cold tvm-ffi / DeepEP JIT cache races across 32
+#   ranks -> "file too short"; fixed by the rank-local TVM_FFI_CACHE_DIR and
+#   EP_JIT_CACHE_DIR below.)
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"      # ep_size * moe_dp_size == tp_size
+# SHARP plugin dir on /e/scratch (stage with stage_sharp_plugin.sh). Empty =
+# SHARP off (default, TP4/PP8). Set it + a cu12 image to enable cross-node SHARP.
+export SHARP_PLUGIN_DIR="${SHARP_PLUGIN_DIR:-}"
 export CG_DECODE="${CG_DECODE:-full}"
 # Keep `marlin` for mxfp4 models: it is the only SM90 backend that leaves the
 # weights PACKED. `auto` picks TRITON_KERNELS, whose upcast_from_mxfp()
 # dequantizes to bf16 and OOMs a 4-bit model on 95 GiB HBM regardless of
 # --mem-fraction-static.
 export MOE_BACKEND="${MOE_BACKEND:-marlin}"
+# MoE all-to-all backend. Empty = sglang default ("none" = naive cross-node
+# allgather, the thing that made plain TP32/EP32 hit ~0.76 tok/s/req). Set "deepep"
+# to engage DeepEP V2 (NCCL Gin backend, rides the SHARP fabric) — it is already
+# pip-installed in the cu12 image with native sm_90 cubins + K3 patches
+# (topk16/hidden3584/SourceMeta). Requires EP>1 to do anything. See the
+# "WHY TP4/PP8" block + EP_JIT_CACHE_DIR note below.
+export MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-}"
 export CTX_LEN="${CTX_LEN:-65536}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
 # PyTorch distributed init + Store.wait() timeout (seconds). The default
@@ -256,20 +311,45 @@ export NCCL_IB_RETRY_CNT="${NCCL_IB_RETRY_CNT:-7}" NCCL_IB_TIMEOUT="${NCCL_IB_TI
 export HOME="$DEPLOY_DIR/home" HF_HOME="$DEPLOY_DIR/cache/hf"
 export XDG_CACHE_HOME="$DEPLOY_DIR/cache/xdg" TRITON_CACHE_DIR="$DEPLOY_DIR/cache/triton"
 # tvm-ffi JIT kernel cache. The default (~/.cache/tvm-ffi) lands on the
-# REAL, quota-limited /e/home shared across every node, so concurrent
-# cold-cache builds corrupt each other. Point it at a shared dir on
-# /e/scratch instead; the pre-warm step below builds every JIT kernel once,
-# single-process, so every rank only loads (never races to build).
-export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}"
-mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TVM_FFI_CACHE_DIR"
+# REAL, quota-limited /e/home. Point it at /e/scratch AND make it RANK-LOCAL
+# (suffixed by $SLURM_PROCID): on a cold cache, CUDA graph capture JIT-builds
+# MANY tvm-ffi kernels (marlin, tiny_gemm, AND Kimi-K3's kda_packed_decode
+# linear-attention decode kernel, concat_mla, ...), and a SHARED dir lets one
+# rank read a .so another is still writing -> "file too short" /
+# "Module has no function 'run'" mid-graph-capture (observed on a cold cu12
+# cache: every rank raced kda_packed_decode; the cu13 path only survived
+# because its cache was already warm from a prior run). The pre-warm below
+# covers marlin + tiny_gemm + kda single-process into rank 0; the per-rank
+# dirs make the rest race-proof (each rank compiles into its OWN dir, and all
+# stay warm across runs). VERIFIED: cu12 TP32/EP32 8-node cleared graph
+# capture once this rank-local suffix was added.
+export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}/rank-${SLURM_PROCID:-0}"
+# DeepEP V2 JITs its dispatch/combine kernels into a cache dir (default
+# ~/.deep_ep). SAME 32-rank cold-cache race as tvm-ffi -> "file too short";
+# must be rank-local. Inert when DeepEP isn't loaded (the dir just sits empty).
+export EP_JIT_CACHE_DIR="${EP_JIT_CACHE_DIR:-$DEPLOY_DIR/cache/deepep}/rank-${SLURM_PROCID:-0}"
+mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TVM_FFI_CACHE_DIR" "$EP_JIT_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 # Optional: inject extra Python paths into the container (e.g. a bind-mounted
 # flash_kda prefix). Example: SGLANG_PYTHONPATH_EXTRA=/e/.../flashkda_prefix
 export PYTHONPATH="${SGLANG_PYTHONPATH_EXTRA:-}" PYTHONNOUSERSITE=1
 
+# Optional SHARP injection (see the WHY TP4/PP8 block). Only active when
+# $SHARP_PLUGIN_DIR points at the staged self-contained plugin dir on
+# /e/scratch. NCCL then dlopens nccl_rdma_sharp -> cross-node ALLGATHER uses
+# switch offload instead of hanging. Verified 2-node; 8-node pending.
+SHARP_ARGS=()
+if [ -n "${SHARP_PLUGIN_DIR:-}" ] && [ -d "${SHARP_PLUGIN_DIR}" ]; then
+  export LD_LIBRARY_PATH="$SHARP_PLUGIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  # --env (not srun --export) is what actually reaches the container: apptainer
+  # discards --export, leaving the plugin unfound and NCCL silently on built-in IB.
+  SHARP_ARGS=(--env "LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+  echo "[rank $RANK] SHARP plugin injected: $SHARP_PLUGIN_DIR"
+fi
+
 echo "[rank $RANK] $(hostname) ip=$SGLANG_HOST_IP iface=$IFACE head=$HEAD_IP:$DIST_PORT"
 
-exec apptainer exec --nv \
+exec apptainer exec --nv "${SHARP_ARGS[@]}" \
   --bind /e/scratch:/e/scratch --bind /e/home:/e/home --bind /e/data1:/e/data1 \
   --pwd "$DEPLOY_DIR" "$IMAGE" \
   sglang serve \
@@ -279,7 +359,7 @@ exec apptainer exec --nv \
     --tp-size "$TP_SIZE" --pp-size "$PP_SIZE" --ep-size "$EP_SIZE" \
     --nnodes "$NNODES" --node-rank "$RANK" \
     --dist-init-addr "$HEAD_IP:$DIST_PORT" \
-    --moe-runner-backend "$MOE_BACKEND" \
+    --moe-runner-backend "$MOE_BACKEND" ${MOE_A2A_BACKEND:+--moe-a2a-backend "$MOE_A2A_BACKEND"} \
     --prefill-attention-backend flashmla --decode-attention-backend flashmla \
     --cuda-graph-backend-decode "$CG_DECODE" \
     --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC" \
@@ -365,8 +445,10 @@ trap 'stop_otela' EXIT TERM INT
 # pre-warm apptainer exec below needs the SAME TVM_FFI_CACHE_DIR that
 # engine.sh sets, or tvm-ffi defaults to ~/.cache/tvm-ffi (the real
 # quota-limited /e/home) and the pre-warm builds into a DIFFERENT dir than
-# the ranks read from — making the warm-up a silent no-op.
-export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}"
+# the ranks read from — making the warm-up a silent no-op. Target rank 0's
+# rank-local dir (engine.sh suffixes by SLURM_PROCID); ranks 1..N self-build
+# race-free into their own dirs.
+export TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-$DEPLOY_DIR/cache/tvm-ffi}/rank-0"
 mkdir -p "$TVM_FFI_CACHE_DIR"
 
 # Pre-warm the tvm-ffi JIT cache single-process first. sglang JIT-builds kernels
@@ -391,6 +473,13 @@ for n, k in [(144, 7168), (896, 7168), (1536, 128)]:
     w = torch.zeros(n, k, dtype=torch.bfloat16, device='cuda')
     kimi_k3_tiny_gemm(x, w)
     torch.cuda.synchronize()
+# Kimi-K3's linear-attention decode kernel; JIT-built during graph capture
+# and the first to race on a cold shared cache (see TVM_FFI_CACHE_DIR note).
+try:
+    from sglang.kernels.ops.attention.kda_packed_decode import _jit_kda_packed_decode_module
+    _jit_kda_packed_decode_module()
+except Exception as e:
+    print('kda warm skipped:', repr(e)[:120])
 print('jit warm ok')
 " 2>&1 | tail -3
 
