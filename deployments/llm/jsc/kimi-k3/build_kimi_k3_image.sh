@@ -9,7 +9,7 @@
 # internet the pull needs, Apptainer, and (conveniently) GH200 for a quick
 # `sglang --version` smoke check. No Slurm allocation required.
 #
-#   bash deployments/llm/jsc/build_kimi_k3_image.sh
+#   bash deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh
 #
 # Env overrides:
 #   PROJECT=reformo                       Slurm account / scratch project

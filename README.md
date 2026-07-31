@@ -9,15 +9,16 @@ runtime, scheduler quirks, and the OpenTela settings those force.
 ## Layout
 
 ```
-deployments/<service-kind>/<site>/
+deployments/<service-kind>/<site>/<model>/    # one self-contained recipe per directory
+meta/bench/                                   # benchmark harness shared by all recipes
 ```
 
 | Path | What it covers |
 |------|----------------|
-| `deployments/llm/jsc/` | LLM serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
-| `deployments/llm/beverin-glm47-flash/` | GLM-4.7-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
-| `deployments/llm/beverin-deepseek-v4/` | DeepSeek-V4-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
-| [`deployments/llm/BENCHMARKING.md`](deployments/llm/BENCHMARKING.md) | How we benchmark an LLM service: strategy, the C=1 trap, the shared `bench/` harness, and the reporting checklist every throughput claim must carry. |
+| `deployments/llm/jsc/kimi-k3/` | Kimi-K3 serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
+| `deployments/llm/beverin/glm47-flash/` | GLM-4.7-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
+| `deployments/llm/beverin/deepseek-v4/` | DeepSeek-V4-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
+| [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared benchmark harness, and the reporting checklist every throughput claim must carry. |
 
 ## Conventions
 

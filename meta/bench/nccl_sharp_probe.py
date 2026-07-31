@@ -9,7 +9,7 @@ sits on — never report these numbers as "model throughput."
 
 Run one process per GPU (e.g. srun -n$WORLD python3 nccl_sharp_probe.py) with
 NCCL_DEBUG=INFO and grep the log for `/SHARP` (engaged) vs `Socket/IB`
-(fallback). See deployments/llm/BENCHMARKING.md §"Transport check".
+(fallback). See meta/bench/README.md §"Transport check".
 """
 import os, time, torch, torch.distributed as dist
 rank  = int(os.environ["SLURM_PROCID"]); world = int(os.environ["SLURM_NTASKS"]); local = int(os.environ["SLURM_LOCALID"])

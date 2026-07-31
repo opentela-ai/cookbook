@@ -59,12 +59,12 @@ log (= real requests being routed in from the mesh — the decisive proof).
 
 | Symptom | Cause | Source of truth |
 |---|---|---|
-| Public API returns 503 "No provider found" | relay data dir on NFS went stale (ESTALE) -> badger value log unwritable -> CRDT frozen; fix: symlink relay's `~/.ocfcore` to scratch | `deployments/llm/jsc/serve_llm_otela_jsc.sbatch` header |
+| Public API returns 503 "No provider found" | relay data dir on NFS went stale (ESTALE) -> badger value log unwritable -> CRDT frozen; fix: symlink relay's `~/.ocfcore` to scratch | `deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch` header |
 | Job registers but never serves a request | relay predates the P2PForwardHandler fix (needs official >= v0.2.3) | jsc sbatch header |
 | Self-built otela relays/serves but never registers | peers discard records from unattested ("dev") binaries; use a signed release | jsc sbatch, `OTELA_REQUIRE_SIGNED` |
 | Peer stuck `connected: true` after job ended | otela was SIGKILLed; always TERM the srun **step** and wait for the leave announcement | jsc sbatch, `stop_otela()` |
 | Registry never propagates the service at all | same relay ESTALE/CRDT freeze as the 503 above | jsc sbatch header |
-| OOM SIGKILL ~35 s after "Load weight end", no traceback (MI300A) | APU `is_integrated=True` makes sglang budget KV against whole-node RAM; launcher forces `is_integrated=False` | `deployments/llm/beverin-glm47-flash/README.md` fix #5 |
+| OOM SIGKILL ~35 s after "Load weight end", no traceback (MI300A) | APU `is_integrated=True` makes sglang budget KV against whole-node RAM; launcher forces `is_integrated=False` | `deployments/llm/beverin/glm47-flash/README.md` fix #5 |
 | `ValueError: CPU number N is not eligible` (MI300A) | container cpuset smaller than host CPU ids used for NUMA pinning; pass full node CPUs to the srun step | beverin README fix #1 |
 | `KeyError` in aiter `get_rope` (GLM on ROCm) | model config lacks `rope_scaling` key; `SGLANG_USE_AITER=0` | beverin README fix #3 |
 

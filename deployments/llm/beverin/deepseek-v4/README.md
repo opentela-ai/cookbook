@@ -4,14 +4,14 @@ Serve `deepseek-ai/DeepSeek-V4-Flash` on **Beverin** (AMD MI300A / gfx942,
 `mi300` partition) with the plain upstream SGLang ROCm image through the CSCS
 Slurm Container Engine (EDF + enroot + Pyxis), and register it on OpenTela.
 
-Like the sibling [`beverin-glm47-flash/`](../beverin-glm47-flash/) GLM-4.7-Flash recipe and unlike the
+Like the sibling [`glm47-flash/`](../glm47-flash/) GLM-4.7-Flash recipe and unlike the
 JSC one, **no relay is needed**: Beverin compute nodes have full outbound
 internet and reach the bootstrap `/ip4/148.187.108.178/...` directly, so each
 rank runs `otela start --mode node --subprocess <sglang-wrapper>` on the same
 node as SGLang.
 
 > **Read the GLM recipe first if you are new to Beverin.**
-> [`../beverin-glm47-flash/README.md`](../beverin-glm47-flash/README.md) documents the MI300A basics
+> [`../glm47-flash/README.md`](../glm47-flash/README.md) documents the MI300A basics
 > (NUMA affinity, TMPDIR, integrated-memory accounting) that both recipes
 > share. This page covers what is *different* for DeepSeek-V4 — and two of the
 > shared knobs are set to the **opposite** value here, so do not copy settings

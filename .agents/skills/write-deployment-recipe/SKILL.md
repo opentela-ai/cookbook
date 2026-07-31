@@ -1,6 +1,6 @@
 ---
 name: write-deployment-recipe
-description: Add or modify an OpenTela deployment recipe under deployments/<service-kind>/<site>/ — a self-contained Slurm sbatch that serves a service and registers it on OpenTela. Use when creating a new recipe, porting an existing recipe to a new site (different cluster, GPU, partition, or container runtime), or serving a different model through an existing recipe.
+description: Add or modify an OpenTela deployment recipe under deployments/<service-kind>/<site>/<model>/ — a self-contained Slurm sbatch that serves a service and registers it on OpenTela. Use when creating a new recipe, porting an existing recipe to a new site (different cluster, GPU, partition, or container runtime), or serving a different model through an existing recipe.
 ---
 
 # Write a deployment recipe
@@ -10,8 +10,8 @@ details that are hard to rediscover: firewall shape, container runtime,
 scheduler quirks, and the OpenTela settings those force.
 
 Canonical references to imitate:
-- `deployments/llm/jsc/serve_llm_otela_jsc.sbatch` (Slurm + Apptainer, relay)
-- `deployments/llm/beverin-glm47-flash/` (Slurm + Pyxis/EDF, direct mesh, per-site README)
+- `deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch` (Slurm + Apptainer, relay)
+- `deployments/llm/beverin/glm47-flash/` (Slurm + Pyxis/EDF, direct mesh, per-site README)
 
 A starting skeleton lives at [assets/recipe.sbatch](assets/recipe.sbatch)
 (inline comments mark every block you must re-derive per site).
@@ -19,7 +19,7 @@ A starting skeleton lives at [assets/recipe.sbatch](assets/recipe.sbatch)
 ## Layout
 
 ```
-deployments/<service-kind>/<site>/
+deployments/<service-kind>/<site>/<model>/
 ├── serve_<thing>.sbatch          # the recipe — one self-contained sbatch
 ├── build_<thing>.sh              # OPTIONAL: login-node-only step (image build, binary staging)
 ├── <site>.toml                   # OPTIONAL: container-runtime config (EDF/enroot)
@@ -79,7 +79,7 @@ Step ordering is deliberate; reorder only with a comment saying why.
 
 ## Site README format
 
-Match `deployments/llm/beverin-glm47-flash/README.md`:
+Match `deployments/llm/beverin/glm47-flash/README.md`:
 
 1. One-paragraph summary: what model/service, what site (GPU/arch/partition),
    what serving stack, and how it reaches OpenTela (direct vs relay — and WHY,

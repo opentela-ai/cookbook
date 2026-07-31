@@ -30,7 +30,7 @@
 #                            multiaddr, where its data dir lives (NOT on NFS —
 #                            a stale handle freezes the CRDT -> 503 from the
 #                            public API), and the >=v0.2.3 P2PForwardHandler
-#                            requirement. See deployments/llm/jsc header.
+#                            requirement. See deployments/llm/jsc/kimi-k3 header.
 # =============================================================================
 
 set -uo pipefail
@@ -46,8 +46,8 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5400}"             # large weights take long; 
 
 # ----------------------------------------------------------------- otela -----
 # Model the block below on the closest existing recipe:
-#   direct egress site  -> deployments/llm/beverin-glm47-flash/serve_glm_47_flash_sglang.sbatch
-#   relay site          -> deployments/llm/jsc/serve_llm_otela_jsc.sbatch
+#   direct egress site  -> deployments/llm/beverin/glm47-flash/serve_glm_47_flash_sglang.sbatch
+#   relay site          -> deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
 OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/opentela-<arch>}"
 OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 RELAY_ADDR="${OTELA_RELAY_ADDR:-<us-managed relay multiaddr, or bootstrap>}"

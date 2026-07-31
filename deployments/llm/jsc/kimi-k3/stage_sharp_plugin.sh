@@ -23,7 +23,7 @@
 # TODO(unverified): full 8-node TP32/EP32 sglang run.
 #
 # Usage (login node):
-#   bash deployments/llm/jsc/stage_sharp_plugin.sh
+#   bash deployments/llm/jsc/kimi-k3/stage_sharp_plugin.sh
 # Env overrides:
 #   PROJECT=reformo                                 Slurm account / scratch project
 #   DEPLOY_DIR=/e/scratch/$PROJECT/$USER/kimi-k3    deploy root (matches the sbatch)

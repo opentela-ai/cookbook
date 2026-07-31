@@ -12,7 +12,7 @@ Usage:
 Each spec is CONC:NUMREQ. A warmup pass (C=4 n=8, discarded) runs first so
 the first measured level sees warm CUDA graphs, JIT kernels and KV cache.
 One JSON line is printed per level as it completes, so partial results
-survive a timeout or kill. See deployments/llm/BENCHMARKING.md.
+survive a timeout or kill. See meta/bench/README.md.
 """
 import asyncio, aiohttp, sys, time, json, os
 

@@ -54,8 +54,8 @@ Why each of these is pinned the way it is (each was a discovered failure mode):
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 256-out)
 
-Taken with the shared `deployments/llm/bench/` harness — see
-[`BENCHMARKING.md`](../BENCHMARKING.md) for the full protocol (warmup, the
+Taken with the shared `meta/bench/` harness — see
+[`meta/bench/README.md`](../../../meta/bench/README.md) for the full protocol (warmup, the
 C=1 trap, how to read the curve shape).
 
 | Concurrency | Aggregate out tok/s | per-req tok/s |
@@ -220,11 +220,11 @@ default `~/.deep_ep`) — the recipe makes that rank-local too for the same reas
 
 ```bash
 # 0. one-time prep (login node): build image + (optional) stage SHARP
-bash deployments/llm/jsc/build_kimi_k3_image.sh
-bash deployments/llm/jsc/stage_sharp_plugin.sh
+bash deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh
+bash deployments/llm/jsc/kimi-k3/stage_sharp_plugin.sh
 
 # 1. production default: Kimi-K3, 8 nodes, TP4×PP8 (~542 tok/s @ C=32)
-sbatch deployments/llm/jsc/serve_llm_otela_jsc.sbatch
+sbatch deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
 
 # 2. experiment: TP32/EP32/PP1 with SHARP (boots stable; see §3 for the
 #    throughput caveat — a2a=none is ~38× slower, deepep/megamoe crash on sm90)
@@ -232,7 +232,7 @@ sbatch --export=ALL,\
 IMAGE=/e/scratch/reformo/$USER/kimi-k3/images/sglang-kimi-k3-cu12.sif,\
 TP_SIZE=32,EP_SIZE=32,PP_SIZE=1,NNODES=8,\
 SHARP_PLUGIN_DIR=/e/scratch/reformo/$USER/otela-llm/sharp-plugin-only \
-  deployments/llm/jsc/serve_llm_otela_jsc.sbatch
+  deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
 ```
 
 ## Verify

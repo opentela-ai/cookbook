@@ -5,7 +5,7 @@ The smallest possible request: a fixed prompt, `max_tokens` short, temperature
 0. Prints wall time and decode tok/s from the `usage` field. Use it to (a)
 confirm the server is up and routing, (b) get a single-request latency floor
 BEFORE the full sweep. A single-shot number is NOT a serving number for
-distributed topologies (see BENCHMARKING.md §"The C=1 rule") — it is a health
+distributed topologies (see meta/bench/README.md §"The C=1 rule") — it is a health
 + latency-floor check, nothing more.
 
 Usage:

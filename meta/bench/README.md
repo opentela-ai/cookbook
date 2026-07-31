@@ -2,9 +2,9 @@
 
 How we measure LLM serving throughput in this cookbook — the strategy, the
 exact protocol, and the traps we hit (so you don't repeat them). This governs
-every `deployments/llm/<site>/` recipe. The harness lives in `bench/` and is
-shared across sites; only the run mechanics (login-vs-compute reachability,
-container) differ.
+every `deployments/llm/<site>/<model>/` recipe. The harness lives here, in
+`meta/bench/`, and is shared across sites; only the run mechanics (login-vs-
+compute reachability, container) differ.
 
 ## The one number we care about
 
@@ -53,7 +53,7 @@ TP4/PP8's 542 — but you only know that by *sweeping*, not by one shot.
 ### 0. Confirm the server is up (one shot, labeled)
 ```bash
 # from INSIDE the allocation (JSC: login can't reach compute)
-python3 bench/oneshot.py 127.0.0.1 30000 64 16
+python3 meta/bench/oneshot.py 127.0.0.1 30000 64 16
 # → model=... wall=1.3s in=64 out=16 decode_tok/s=12.3
 ```
 This is the latency floor and a routing check. **Do not report it as
@@ -63,7 +63,7 @@ throughput.**
 ```bash
 # spec is CONC:NUMREQ, space-separated. Warmup is automatic (C=4 n=8, discarded).
 # The FIRST measured level must be past warmup or it's meaningless.
-python3 bench/bench.py "1:8 8:32 16:48 32:64 52:52" 127.0.0.1 30000 1024 256 \
+python3 meta/bench/bench.py "1:8 8:32 16:48 32:64 52:52" 127.0.0.1 30000 1024 256 \
   | tee bench-$MODEL-$JOB.txt
 ```
 Each level prints one JSON line as it completes, so a timeout or kill still
@@ -74,7 +74,7 @@ kernels and warms the KV/KDA pools before measurement begins.
 `max_running_requests` is a hard ceiling — concurrency above it just queues.
 Sweep past it deliberately to see the knee:
 ```bash
-python3 bench/bench.py "32:64 48:48 64:64 96:96 128:64" 127.0.0.1 30000 1024 256
+python3 meta/bench/bench.py "32:64 48:48 64:64 96:96 128:64" 127.0.0.1 30000 1024 256
 ```
 - `agg_out_tok_s` flat from C=48→128 while `lat_max_s` climbs → **capacity-
   bound** at `max_running_requests`; raise it (more HBM) if you have headroom.
@@ -90,7 +90,7 @@ Before trusting a TP>1node / EP>1 benchmark, confirm the collectives actually
 use the fast path — otherwise you benchmark a silent TCP fallback and blame
 the model. This is a *transport* probe, never an LLM number:
 ```bash
-NCCL_DEBUG=INFO srun -n$WORLD python3 bench/nccl_sharp_probe.py
+NCCL_DEBUG=INFO srun -n$WORLD python3 meta/bench/nccl_sharp_probe.py
 # log: /SHARP suffix = switch offload engaged; Socket/IB = fallback
 ```
 On JSC this is what caught that the SHARP plugin wasn't loading (apptainer
@@ -129,7 +129,7 @@ JSC example (run on the job's head node, not the login node):
 JOB=1138651; HEAD=$(awk -F= '/SERVICE_HEAD_NODE/{print $2}' $DEPLOY_DIR/last_service.env)
 srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" \
   apptainer exec --bind /e/scratch:/e/scratch "$IMAGE" \
-  python3 $DEPLOY_DIR/../../cookbook/deployments/llm/bench/bench.py \
+  python3 $DEPLOY_DIR/../../cookbook/meta/bench/bench.py \
     "1:8 8:32 16:48 32:64 52:52" 127.0.0.1 30000 1024 256
 ```
 
@@ -166,7 +166,7 @@ Example of a fully-specified claim:
 
 The JSC results are the canonical example of reading this table:
 - **TP4/PP8**: row 1 (pipeline-bound, 542 tok/s ceiling, the production point).
-- **TP32/EP32 a2a=none**: row 3 (collective-bound, ~40 tok/s max, Blackwell-gated fix — see `jsc/README.md` §3).
+- **TP32/EP32 a2a=none**: row 3 (collective-bound, ~40 tok/s max, Blackwell-gated fix — see `deployments/llm/jsc/kimi-k3/README.md` §3).
 
 ---
 
@@ -174,10 +174,10 @@ The JSC results are the canonical example of reading this table:
 
 | File | Purpose |
 |------|---------|
-| `bench/bench.py` | Warmup + concurrency sweep, JSON per level. The default harness. |
-| `bench/bench_nowarm.py` | Same sweep, no warmup. Use for cold-start or when wall-clock is tight and partial results matter. |
-| `bench/oneshot.py` | One request, stdlib only. Latency floor + health check — **not** throughput. |
-| `bench/nccl_sharp_probe.py` | NCCL transport probe (SHARP/RDMA vs fallback). Network-layer check, **not** an LLM number. |
+| `bench.py` | Warmup + concurrency sweep, JSON per level. The default harness. |
+| `bench_nowarm.py` | Same sweep, no warmup. Use for cold-start or when wall-clock is tight and partial results matter. |
+| `oneshot.py` | One request, stdlib only. Latency floor + health check — **not** throughput. |
+| `nccl_sharp_probe.py` | NCCL transport probe (SHARP/RDMA vs fallback). Network-layer check, **not** an LLM number. |
 
 `MODEL` is an env var on all three LLM scripts, so the same harness serves
 Kimi-K3 (JSC), GLM-4.7-Flash (Beverin), and anything else without edits.
