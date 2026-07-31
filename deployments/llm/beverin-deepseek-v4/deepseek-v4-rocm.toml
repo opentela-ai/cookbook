@@ -1,0 +1,66 @@
+# EDF for serving deepseek-ai/DeepSeek-V4-Flash with the plain upstream SGLang
+# ROCm image on beverin (AMD MI300A / gfx942) compute nodes, launched via the
+# CSCS Slurm Container Engine (enroot + Pyxis) with
+# `srun --environment=deepseek-v4-rocm`.
+#
+# Why this image / tag:
+#   * sglang only publishes ROCm builds for MI300A (gfx942, `*-mi30x`) and the
+#     MI350 series (gfx950, `*-mi35x`) — there is NO MI250X/gfx90a build, so
+#     the job MUST run on the `mi300` partition even though the login node is
+#     MI250X.
+#   * v0.5.16 is the first tag that carries `sglang/srt/models/deepseek_v4.py`
+#     (DeepseekV4ForCausalLM + the C4Indexer sparse-attention path) and the
+#     gfx942-specific branches it needs. Verified against the pinned submodule
+#     in src/engines/sglang (v0.5.16, fdebc938).
+#   * Pinned by digest (not a floating :rocm720-mi30x tag) so the Triton JIT
+#     caches on shared /capstor stay warm across launches — a moving tag
+#     silently invalidates the whole cache.
+#
+# The image is already in $SCRATCH/.edf_imagestore (66 GiB, shared across
+# nodes/jobs). To (re-)warm it from a login node:
+#   enroot import docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x
+image = "lmsysorg/sglang@sha256:80d04638deb64fac000fa565cb46e5d2f692173dc125a32a956014a6383ecaee"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang"
+
+[env]
+# Per-rank HOME on /capstor (NOT /users — quota-limited). otela writes a libp2p
+# identity key + a badger DB under $HOME/.config/opentela / $HOME/.ocfcore; a
+# shared HOME across ranks/jobs collides. The serve script overrides this per
+# rank (SLURM_PROCID); the value here is the base for rank 0 / single-node runs.
+HOME = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/xdg"
+XDG_CONFIG_HOME = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/config"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/triton"
+PIP_CACHE_DIR = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/pip"
+# tempfile goes on /capstor, NOT the default /users/<u>/.tmp that Slurm hands
+# the container (home is quota-limited and sglang's tempfile cleanup on quota
+# dirs throws OSError [Errno 39] Directory not empty).
+TMPDIR = "/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/cache/tmp"
+# MI300A + ROCm 7.2 hard-requires this or HIP/RCCL aborts at kernel launch
+# (mandatory on beverin; see ~/.edf/minisgl-rocm.toml and tokenspeed-rocm*).
+HSA_NO_SCRATCH_RECLAIM = "1"
+ROCM_PATH = "/opt/rocm"
+HIP_PATH = "/opt/rocm"
+# /opt/rocm/lib MUST come first: some base images ship a stale libhsa-runtime64
+# in /lib/x86_64-linux-gnu that breaks torch import on MI300A.
+LD_LIBRARY_PATH = "/opt/rocm/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+NCCL_DEBUG = "WARN"
+NCCL_SOCKET_IFNAME = "hsn"
+# Use the image's own SGLang/torch; never pick up stale user venvs on /users.
+PYTHONPATH = ""
+PYTHONNOUSERSITE = "1"
+PIP_BREAK_SYSTEM_PACKAGES = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+
+[annotations]
+com.pyxis.entrypoint_log = "true"
