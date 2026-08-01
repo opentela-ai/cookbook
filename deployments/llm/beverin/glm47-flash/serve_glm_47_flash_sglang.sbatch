@@ -13,6 +13,13 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=12:00:00
+# NOTE: no `B:` prefix. `B:` signals only the batch shell; our cleanup() trap
+# lives inside the OTELA_LAUNCHER heredoc and therefore runs as a JOB STEP under
+# srun, so the signal must reach the steps. Without this, wall-time expiry gives
+# only KillWait (default 30s) between SIGTERM and SIGKILL — otela cannot finish
+# its ~10s graceful leave, no LEFT is published, and the head keeps a
+# `connected: true` row round-robining traffic into a dead endpoint.
+#SBATCH --signal=TERM@120
 #SBATCH --output=/capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/logs/%x-%j.out
 #
 # Serve zai-org/GLM-4.7-Flash on Beverin (AMD MI300A / gfx942) with the plain
@@ -388,6 +395,32 @@ nohup "${OPENTELA_BIN}" start \\
   > "\${OPENTELA_LOG}" 2>&1 &
 OPENTELA_PID=\$!
 echo "opentela_started rank=\${RANK} pid=\${OPENTELA_PID} log=\${OPENTELA_LOG}"
+
+# Stop the peer with SIGTERM (never SIGKILL) so it leaves the mesh gracefully:
+# a killed peer stays connected:true in the registry and the head keeps
+# round-robining traffic into a dead endpoint. Mirrors the deepseek-v4 recipe.
+# Previously this recipe had no teardown at all — otela was left to be reaped by
+# SLURM, so it depended entirely on winning an unguaranteed race against KillWait.
+cleanup() {
+  # The trap fires for both TERM and EXIT, and bash runs the EXIT trap after the
+  # TERM handler returns, so guard against running the teardown twice.
+  [ "\${_OTELA_CLEANED:-0}" = 1 ] && return 0
+  _OTELA_CLEANED=1
+  echo "otela_stopping rank=\${RANK} \$(date --iso-8601=seconds)"
+  kill -TERM "\${OPENTELA_PID}" 2>/dev/null || true
+  # 20s: --signal=TERM@120 covers wall-time expiry, but on the \`scancel\` path the
+  # only grace is KillWait (default 30s) and otela needs ~10s to shut down
+  # (AnnounceLeave -> 5s CRDT drain -> srv.Shutdown). 20s leaves margin.
+  for _ in \$(seq 1 20); do
+    kill -0 "\${OPENTELA_PID}" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "\${OPENTELA_PID}" 2>/dev/null; then
+    echo "WARN otela did not exit within 20s of SIGTERM rank=\${RANK}; no LEFT published" >&2
+  fi
+  [[ -n "\${VMAGENT_PID:-}" ]] && kill "\${VMAGENT_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT
 
 # Wait for SGLang to be ready before starting vmagent. vmagent's Go HTTP client
 # can get stuck if it starts scraping before the target is listening. SGLang's

@@ -13,6 +13,13 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=12:00:00
+# NOTE: no `B:` prefix here, unlike the JSC recipe. `B:` signals only the batch
+# shell; our cleanup() trap lives inside the OTELA_LAUNCHER heredoc and therefore
+# runs as a JOB STEP under srun, so the signal must go to the steps. Without
+# this, wall-time expiry gives only KillWait (default 30s) between SIGTERM and
+# SIGKILL — cleanup() cannot finish, no LEFT is published, and the head keeps a
+# `connected: true` row round-robining traffic into a dead endpoint.
+#SBATCH --signal=TERM@120
 #SBATCH --output=/capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/logs/%x-%j.out
 #
 # Serve deepseek-ai/DeepSeek-V4-Flash on beverin (AMD MI300A / gfx942) with the
@@ -181,6 +188,37 @@ echo "started=$(date --iso-8601=seconds)"
   echo "    curl -fsSL -o otela <otela-x86_64-release-url> && chmod +x otela" >&2
   exit 1
 }
+
+# --- sweep stale aiter baton locks -------------------------------------------
+# aiter guards each module build with a baton that only the BUILDING process
+# removes, and it uses TWO of them at different depths:
+#   <jit>/build/lock_module_<name>            (outer, one per module)
+#   <jit>/build/module_<name>/build/lock      (inner, the ninja build)
+# scancel a job mid-compile and both survive on /capstor. The next job then
+# acquires the outer lock, starts the ninja build, and blocks forever on the
+# DEAD job's inner lock — 0% CPU, no compiler running, no error, just a hang.
+# (Cleaning only the outer one is not enough; that is exactly how job 574156
+# stalled.) Anything predating this job's start cannot belong to it, so sweep
+# it here — in the sbatch body, before srun, so it runs exactly once and cannot
+# race a rank that is legitimately building.
+if [ -d "${AITER_JIT_DIR}/build" ]; then
+  STALE=0
+  while IFS= read -r stale_lock; do
+    echo "sweeping stale aiter lock: ${stale_lock}"
+    rm -rf -- "${stale_lock}"
+    STALE=$((STALE + 1))
+  done < <(find "${AITER_JIT_DIR}/build" -maxdepth 3 \
+             \( -name 'lock_module_*' -o -path '*/build/lock' \) \
+             ! -newermt '-60 seconds' -print 2>/dev/null)
+  # 0-byte *.o.tmp are hipcc scratch abandoned by the killed build; ninja will
+  # regenerate them, but leaving them confuses the mtime-based upload delta.
+  while IFS= read -r stale_tmp; do
+    rm -f -- "${stale_tmp}"
+    STALE=$((STALE + 1))
+  done < <(find "${AITER_JIT_DIR}/build" -name '*.o.tmp' -size 0 \
+             ! -newermt '-60 seconds' -print 2>/dev/null)
+  [ "${STALE}" -gt 0 ] && echo "aiter_stale_locks_swept=${STALE}"
+fi
 
 # ================================================================ engine ======
 # MI300A APU memory-accounting fix. PyTorch reports is_integrated=True for
@@ -444,12 +482,17 @@ echo "opentela_started rank=\${RANK} pid=\${OPENTELA_PID} log=\${OPENTELA_LOG}"
 cleanup() {
   echo "otela_stopping rank=\${RANK} \$(date --iso-8601=seconds)"
   kill -TERM "\${OPENTELA_PID}" 2>/dev/null || true
-  for _ in \$(seq 1 30); do
+  # 20s, not 30s. --signal=TERM@120 covers wall-time expiry, but on the \`scancel\`
+  # path the only grace is KillWait (default 30s). otela needs ~10s to shut down
+  # (AnnounceLeave -> 5s CRDT drain -> srv.Shutdown), so 20s leaves margin and
+  # still completes before SIGKILL. Waiting the full 30s just guarantees we are
+  # still waiting when the process is destroyed.
+  for _ in \$(seq 1 20); do
     kill -0 "\${OPENTELA_PID}" 2>/dev/null || break
     sleep 1
   done
   if kill -0 "\${OPENTELA_PID}" 2>/dev/null; then
-    echo "WARN otela did not exit within 30s of SIGTERM rank=\${RANK}" >&2
+    echo "WARN otela did not exit within 20s of SIGTERM rank=\${RANK}; no LEFT published" >&2
   fi
   [[ -n "\${VMAGENT_PID:-}" ]] && kill "\${VMAGENT_PID}" 2>/dev/null || true
 }
