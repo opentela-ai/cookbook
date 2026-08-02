@@ -11,19 +11,24 @@ runtime, scheduler quirks, and the OpenTela settings those force.
 ```
 deployments/<service-kind>/<site>/<model>/          # one self-contained recipe per directory
 deployments/local/<service-kind>/<site>/<model>/    # no scheduler: single-box, hand-run scripts
+conventions/                                       # cross-recipe rules (LLM served-model naming, …)
 meta/bench/                                        # benchmark harness shared by all recipes
 ```
 
 | Path | What it covers |
 |------|----------------|
-| `deployments/llm/jsc/kimi-k3/` | Kimi-K3 serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
-| `deployments/llm/beverin/glm47-flash/` | GLM-4.7-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
-| `deployments/llm/beverin/deepseek-v4/` | DeepSeek-V4-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
-| `deployments/local/llm/dgx-spark/qwen36-35b-a3b/` | Qwen3.6-35B-A3B-FP8 serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
+| `deployments/llm/jsc/kimi-k3/` | `moonshotai/Kimi-K3` serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
+| `deployments/llm/beverin/glm47-flash/` | `zai-org/GLM-4.7-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
+| `deployments/llm/beverin/deepseek-v4/` | `deepseek-ai/DeepSeek-V4-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
+| `deployments/local/llm/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
+| [`conventions/`](conventions/) | Cross-recipe rules, starting with LLM served-model names use the `org/model-name` form. |
 | [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared benchmark harness, and the reporting checklist every throughput claim must carry. |
 
 ## Conventions
 
+- LLM served-model names use the `org/model-name` form and must agree across
+  `--served-model-name`, the otela `model=` label, and the client `model` field.
+  See [`conventions/`](conventions/).
 - One recipe per directory, self-contained where the environment allows it.
   Where it does not, the script says so explicitly and prints the exact commands
   for the missing prerequisite rather than failing obscurely.

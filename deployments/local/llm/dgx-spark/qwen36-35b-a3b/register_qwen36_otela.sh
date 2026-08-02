@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Register the running Qwen3.6-35B-A3B-FP8 engine as the `llm` service on the
+# Register the running Qwen/Qwen3.6-35B-A3B-FP8 engine as the `llm` service on the
 # OpenTela network (swiss-ai/OpenTela sai-v0.0.6 / arm64). Sidecar topology:
 # the engine (sglang in the qwen36-dgx-spark container, --network host) is
 # already serving on :${SERVE_PORT}. This script launches a standalone otela
@@ -36,7 +36,7 @@ LOGFILE="${LOGFILE:-${OTELA_DIR}/otela.log}"
 # User-supplied bootstrap (public relay / head peer).
 BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 SERVICE_PORT="${SERVE_PORT:-30000}"
-SERVED_MODEL_ID="${SERVED_MODEL_ID:-Qwen3.6-35B-A3B-FP8}"
+SERVED_MODEL_ID="${SERVED_MODEL_ID:-Qwen/Qwen3.6-35B-A3B-FP8}"   # org/model-name form; see ../../../../../conventions/
 # WHY: otela derives its libp2p peer ID from --seed (sai-v0.0.6 has no stored
 # identity key). A graceful `stop` announces LEFT, and if you restart with the
 # SAME seed (the binary's default "0") the gateway keeps a LEFT tombstone that

@@ -116,7 +116,7 @@ bash register_qwen36_otela.sh daemon
 # direct inference (engine is on host :30000):
 curl http://localhost:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+  -d '{"model":"Qwen/Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
 
 # tear down
 bash register_qwen36_otela.sh stop
@@ -140,13 +140,13 @@ bash register_qwen36_otela.sh status
 
 The peer appears on the gateway status page at
 `http://140.238.223.116:8092/v1/dnt/table` as `connected: true` with
-`service: llm` and `identity_group: ["model=Qwen3.6-35B-A3B-FP8"]`. A routed
+`service: llm` and `identity_group: ["model=Qwen/Qwen3.6-35B-A3B-FP8"]`. A routed
 request through the gateway returns 200:
 
 ```bash
 curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \
   -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"Qwen/Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## Knobs (env, all overridable)
@@ -161,7 +161,7 @@ curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \
 `$HOME/models/Qwen3.6-35B-A3B-FP8`), `IMAGE`, `SERVE_PORT` (30000), `CONTAINER`
 (`qwen36-dgx-spark`), `TP_SIZE` (1), `ATTENTION_BACKEND` (`triton`),
 `MEM_FRACTION_STATIC` (0.85), `REASONING_PARSER` (`qwen3`), `TOOL_CALL_PARSER`
-(empty → omitted), `SERVED_MODEL_NAME` (`Qwen3.6-35B-A3B-FP8`),
+(empty → omitted), `SERVED_MODEL_NAME` (`Qwen/Qwen3.6-35B-A3B-FP8`),
 `HEALTH_TIMEOUT` (600), `LAST_SERVICE_ENV`.
 
 | Flag | Why |
@@ -179,8 +179,9 @@ curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \
 ### `register_qwen36_otela.sh`
 `DEPLOY_DIR` (default `./run`), `OTELA_DIR` (default `$DEPLOY_DIR/otela`),
 `OTELA_BIN` (default `$OTELA_DIR/otela`), `OPENTELA_CFG_DIR`, `PIDFILE`,
-`LOGFILE`, `OPENTELA_BOOTSTRAP`, `SERVE_PORT` (30000), `SERVED_MODEL_ID`,
-`OPENTELA_SERVICE_NAME` (`llm`), `OPENTELA_SEED` (default `$$` — fresh peer ID
+`LOGFILE`, `OPENTELA_BOOTSTRAP`, `SERVE_PORT` (30000), `SERVED_MODEL_ID`
+  (`Qwen/Qwen3.6-35B-A3B-FP8`), `OPENTELA_SERVICE_NAME` (`llm`), `OPENTELA_SEED`
+  (default `$$` — fresh peer ID
 per invocation; see [Site-specific fixes](#site-specific-fixes)),
 `OPENTELA_TCP_PORT` (43905), `OPENTELA_UDP_PORT` (59820).
 
@@ -200,7 +201,7 @@ per invocation; see [Site-specific fixes](#site-specific-fixes)),
    per invocation), so every `daemon` start gets a new peer ID and registers
    in ~60 s. Verified: `--seed 1` →
    `QmRjEHiBLfMBpczfnTYXHr5vuXQdho9iYrLyQYWcdj69mW` appeared on the gateway as
-   `connected:true, service:llm, identity_group:["model=Qwen3.6-35B-A3B-FP8"]`
+   `connected:true, service:llm, identity_group:["model=Qwen/Qwen3.6-35B-A3B-FP8"]`
    and a routed request returned 200 within ~60 s. Set `OPENTELA_SEED` to a
    constant only if you want a stable peer ID — and then avoid
    stop-and-immediately-restart with that seed (or wait out the tombstone).

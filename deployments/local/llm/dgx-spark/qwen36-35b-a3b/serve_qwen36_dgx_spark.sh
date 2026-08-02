@@ -43,7 +43,7 @@ LAST_SERVICE_ENV="${LAST_SERVICE_ENV:-${DEPLOY_DIR}/last_service.env}"
 # attention-backend triton: hybrid GDN (Gated DeltaNet) on Blackwell rejects
 #   torch_native; triton is the only backend that accepts the hybrid
 #   linear+full attention schedule this model uses.
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.6-35B-A3B-FP8}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.6-35B-A3B-FP8}"   # org/model-name form; see ../../../../../conventions/
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 # mem-fraction-static 0.85: leaves headroom for the ~29 GB Mamba/SSM + conv
 #   state that sglang does NOT count in its KV budget (documented in the
@@ -57,6 +57,21 @@ TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
 # state load on a single GB10 takes several minutes; 600s matched the original
 # bring-up. Raise for cold loads.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-600}"
+
+# ----------------------------------------------------------- subcommand ----
+case "${1:-start}" in
+  stop)
+    docker rm -f "${CONTAINER}" 2>/dev/null && echo "Stopped ${CONTAINER}" \
+      || echo "${CONTAINER} not running"
+    exit 0
+    ;;
+  start|"")
+    ;;
+  *)
+    echo "usage: $0 {start|stop}" >&2
+    exit 2
+    ;;
+esac
 
 # ----------------------------------------------------------- preflight ----
 docker image inspect "${IMAGE}" >/dev/null 2>&1 || {
