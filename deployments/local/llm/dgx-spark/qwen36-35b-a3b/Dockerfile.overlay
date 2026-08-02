@@ -1,0 +1,76 @@
+# Overlay on top of the golden GB10 SGLang image (sglang-golden-gb10).
+#
+# Reinstalls sglang from the current vendored source (release/v0.5.16 with
+# latest cherry-picks) and adds the s3er entrypoint CLI. All heavy artifacts
+# (NGC torch sm_121, sgl-kernel compiled from source, snapshot .so, CRIU)
+# are inherited unchanged from the golden image — this layer only touches
+# pure-Python packages, so it builds in ~30 seconds.
+#
+# Build: build_image.sh stages sglang-src.tar.gz + entrypoint-src.tar.gz into a
+# temp context and runs this Dockerfile, so prefer:
+#   bash build_image.sh
+#
+# To build by hand, stage the two tarballs into the build context first (same
+# paths the COPY lines below expect):
+#   tar -czf sglang-src.tar.gz -C <sglang-checkout> .
+#   tar -czf entrypoint-src.tar.gz -C <entrypoint-checkout> .
+#   docker build -t s3er-qwen36-dgx-spark -f Dockerfile.overlay .
+#
+# Run:
+#   bash serve_qwen36_dgx_spark.sh
+FROM sglang-golden-gb10
+
+ENV DEBIAN_FRONTEND=noninteractive
+# PIP can reach the system site-packages (NGC torch etc.) — needed because we
+# reinstall sglang in place over the golden image's packages.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+# WHY: there is no aarch64 flashinfer wheel; the golden image ships only a
+# stub with no CUTLASS data. Routing attention through flashinfer here would
+# fail to JIT, so force it off and let sglang use the triton backend instead.
+ENV SGLANG_IS_FLASHINFER_AVAILABLE=0
+
+# Reinstall sglang from the updated vendored source (release/v0.5.16 + latest
+# cherry-picks). The golden image's sgl-kernel .so (0.4.4, sm_121) is
+# ABI-compatible with the 0.5.16 release branch, so we keep it.
+COPY sglang-src.tar.gz /tmp/sglang-src.tar.gz
+RUN cd /tmp && \
+    mkdir -p sglang-src && \
+    tar -xzf sglang-src.tar.gz -C sglang-src && \
+    cd sglang-src && \
+    # WHY: the vendored pyproject declares Rust extension modules; the overlay
+    # only reinstalls the pure-Python `sglang` package (sgl-kernel .so is
+    # inherited unchanged from the golden image), so strip the
+    # [tool.setuptools-rust.ext-modules] blocks to build without a Rust toolchain.
+    sed -i '/\[\[tool.setuptools-rust.ext-modules\]\]/,/^$/d' python/pyproject.toml && \
+    # --no-deps: keep the golden image's pinned deps (NGC torch, sgl-kernel).
+    # A normal install would pull torch from PyPI, for which GB10 has no wheel.
+    pip install --no-input --no-deps ./python && \
+    python3 -c "import sglang; print('sglang reinstalled:', getattr(sglang,'__version__','unknown'))" && \
+    rm -rf /tmp/sglang-src /tmp/sglang-src.tar.gz
+
+# Install s3er entrypoint CLI from the vendored source.
+COPY entrypoint-src.tar.gz /tmp/entrypoint-src.tar.gz
+RUN cd /tmp && \
+    mkdir -p entrypoint-src && \
+    tar -xzf entrypoint-src.tar.gz -C entrypoint-src && \
+    pip install --no-input --no-deps ./entrypoint-src && \
+    python3 -c "from s3er.cli import main; print('s3er installed ok')" && \
+    rm -rf /tmp/entrypoint-src /tmp/entrypoint-src.tar.gz
+
+# CUTLASS headers for JIT-compiled FP8 GEMM kernels (sm_121).
+# The flashinfer stub has no CUTLASS data (no aarch64 wheel); symlink the
+# NGC-bundled CUTLASS into the flashinfer data dir that
+# sglang.jit_kernel.utils.deps.get_cutlass_include_paths() scans.
+RUN FLASHINFER_DATA=/usr/local/lib/python3.12/dist-packages/flashinfer/data && \
+    NGC_CUTLASS=/opt/pytorch/pytorch/third_party/cutlass && \
+    mkdir -p $FLASHINFER_DATA/cutlass/tools/util && \
+    ln -sf $NGC_CUTLASS/include $FLASHINFER_DATA/cutlass/include && \
+    ln -sf $NGC_CUTLASS/tools/util/include $FLASHINFER_DATA/cutlass/tools/util/include && \
+    ls $FLASHINFER_DATA/cutlass/include/cutlass/ \
+        $FLASHINFER_DATA/cutlass/tools/util/include/cutlass/util/packed_stride.hpp && \
+    echo 'CUTLASS headers linked'
+
+# Smoke: verify sglang can resolve the Qwen3.6 architecture.
+RUN python3 -c "import sglang.srt.models.qwen3_5 as m; print('Qwen3.6 arch module: OK')"
+
+ENTRYPOINT ["s3er"]

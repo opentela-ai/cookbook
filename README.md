@@ -9,8 +9,9 @@ runtime, scheduler quirks, and the OpenTela settings those force.
 ## Layout
 
 ```
-deployments/<service-kind>/<site>/<model>/    # one self-contained recipe per directory
-meta/bench/                                   # benchmark harness shared by all recipes
+deployments/<service-kind>/<site>/<model>/          # one self-contained recipe per directory
+deployments/local/<service-kind>/<site>/<model>/    # no scheduler: single-box, hand-run scripts
+meta/bench/                                        # benchmark harness shared by all recipes
 ```
 
 | Path | What it covers |
@@ -18,6 +19,7 @@ meta/bench/                                   # benchmark harness shared by all 
 | `deployments/llm/jsc/kimi-k3/` | Kimi-K3 serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
 | `deployments/llm/beverin/glm47-flash/` | GLM-4.7-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
 | `deployments/llm/beverin/deepseek-v4/` | DeepSeek-V4-Flash serving on Beverin (AMD MI300A, ROCm, EDF). |
+| `deployments/local/llm/dgx-spark/qwen36-35b-a3b/` | Qwen3.6-35B-A3B-FP8 serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
 | [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared benchmark harness, and the reporting checklist every throughput claim must carry. |
 
 ## Conventions
@@ -29,3 +31,7 @@ meta/bench/                                   # benchmark harness shared by all 
   it**, not just what it does. Most of these were found by hitting the failure.
 - Defaults target the documented site. Everything else is an environment
   variable override.
+- Local recipes (under `deployments/local/`) have no scheduler: they are plain
+  bash scripts run by hand on the box — a `build_image.sh` for the one-time image,
+  a `serve_*.sh` for the engine, and a `register_*.sh` (or the engine's own
+  `--enable-opentela`) to join OpenTela. Defaults still target the documented site.

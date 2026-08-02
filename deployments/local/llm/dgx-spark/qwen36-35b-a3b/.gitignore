@@ -1,0 +1,12 @@
+# Runtime state (logs, otela config/pid, last_service.env) — created by the
+# serve/register scripts under ./run/
+/run/
+
+# Vendored source checkouts used by build_image.sh (not part of the cookbook):
+#   git checkout of sglang (release/v0.5.16 + cherry-picks)
+#   git checkout of the s3er entrypoint
+/sglang-src/
+/entrypoint-src/
+
+# Tarballs staged during a manual build (build_image.sh uses a temp dir)
+/*.tar.gz
