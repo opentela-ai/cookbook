@@ -48,6 +48,12 @@ DSV4_FP4_DEQUANT="${DSV4_FP4_DEQUANT:-0}"
 # the same stage of the software pipeline cannot be reordered". "triton" is the
 # documented ROCm alternative; "unified_kv_triton" is the other HIP path.
 FLASHMLA_BACKEND="${FLASHMLA_BACKEND:-triton}"
+# MoE runner. "auto" lets Fp8Config pick, which on gfx942 means aiter's native
+# CK MXFP4 path. "humming" selects Mxfp4HummingMoEMethod, which sglang
+# documents as "used for DeepSeek-V4 FP8 checkpoints" and which supplies its
+# OWN process_weights_after_loading — so it sidesteps the Fp8MoEMethod
+# _is_fp8_fnuz branch that asserts on mxfp4-packed I8 weights.
+MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-auto}"
 # Persistent aiter JIT cache — the CK MXFP4 MoE kernel is hipcc-compiled on the
 # FIRST request and aiter's default cache dir is inside the ephemeral
 # container. Seeded from the image below (an empty dir would make aiter rebuild
@@ -64,11 +70,42 @@ NODE_CPUS="${SLURM_CPUS_ON_NODE:-192}"
 echo "job_id=${SLURM_JOB_ID} node=$(hostname) node_cpus=${NODE_CPUS}"
 echo "model=${MODEL}"
 echo "tp=${TP_SIZE} max_model_len=${MAX_MODEL_LEN} mem_fraction_static=${MEM_FRACTION_STATIC}"
-echo "use_aiter=${SGLANG_USE_AITER} dsv4_fp4_dequant=${DSV4_FP4_DEQUANT} flashmla_backend=${FLASHMLA_BACKEND}"
+echo "use_aiter=${SGLANG_USE_AITER} dsv4_fp4_dequant=${DSV4_FP4_DEQUANT} flashmla_backend=${FLASHMLA_BACKEND} moe_runner_backend=${MOE_RUNNER_BACKEND}"
 echo "disable_cuda_graph=${DISABLE_CUDA_GRAPH} skip_warmup=${SKIP_SERVER_WARMUP}"
 echo "started=$(date --iso-8601=seconds)"
 
 [ -d "${MODEL}" ] || { echo "FATAL: weights not found: ${MODEL}" >&2; exit 1; }
+
+# --- sweep stale aiter baton locks -------------------------------------------
+# aiter guards each module build with a baton that only the BUILDING process
+# removes, and it uses TWO of them at different depths:
+#   <jit>/build/lock_module_<name>            (outer, one per module)
+#   <jit>/build/module_<name>/build/lock      (inner, the ninja build)
+# scancel a job mid-compile and both survive on /capstor. The next job then
+# acquires the outer lock, starts the ninja build, and blocks forever on the
+# DEAD job's inner lock — 0% CPU, no compiler running, no error, just a hang.
+# (Cleaning only the outer one is not enough; that is exactly how job 574156
+# stalled.) Anything predating this job's start cannot belong to it, so sweep
+# it here — in the sbatch body, before srun, so it runs exactly once and cannot
+# race a rank that is legitimately building.
+if [ -d "${AITER_JIT_DIR}/build" ]; then
+  STALE=0
+  while IFS= read -r stale_lock; do
+    echo "sweeping stale aiter lock: ${stale_lock}"
+    rm -rf -- "${stale_lock}"
+    STALE=$((STALE + 1))
+  done < <(find "${AITER_JIT_DIR}/build" -maxdepth 3 \
+             \( -name 'lock_module_*' -o -path '*/build/lock' \) \
+             ! -newermt '-60 seconds' -print 2>/dev/null)
+  # 0-byte *.o.tmp are hipcc scratch abandoned by the killed build; ninja will
+  # regenerate them, but leaving them confuses the mtime-based upload delta.
+  while IFS= read -r stale_tmp; do
+    rm -f -- "${stale_tmp}"
+    STALE=$((STALE + 1))
+  done < <(find "${AITER_JIT_DIR}/build" -name '*.o.tmp' -size 0 \
+             ! -newermt '-60 seconds' -print 2>/dev/null)
+  [ "${STALE}" -gt 0 ] && echo "aiter_stale_locks_swept=${STALE}"
+fi
 
 RUNNER="${DEPLOY_DIR}/run/probe_run-${SLURM_JOB_ID}.sh"
 cat > "${RUNNER}" <<RUNNER_EOF
@@ -169,6 +206,7 @@ ARGS=(
   --reasoning-parser deepseek-v4
   --enable-metrics
 )
+[[ "${MOE_RUNNER_BACKEND}" != "auto" ]] && ARGS+=(--moe-runner-backend "${MOE_RUNNER_BACKEND}")
 [[ "${DISABLE_CUDA_GRAPH}" == "1" ]] && ARGS+=(--disable-cuda-graph)
 [[ "${SKIP_SERVER_WARMUP}" == "1" ]] && ARGS+=(--skip-server-warmup)
 
@@ -205,20 +243,54 @@ echo "===== get_model_info ====="
 curl -s "http://\${IP}:${SGLANG_PORT}/get_model_info"; echo
 echo "===== /v1/models ====="
 curl -s "http://\${IP}:${SGLANG_PORT}/v1/models"; echo
+# The generation is the ONLY part of this probe that actually proves anything:
+# a wrong DSA backend or an unsupported MoE kernel config lets the server answer
+# /get_model_info and /v1/models perfectly and then die on the first token. So
+# capture the responses and VERIFY them — an earlier version of this script
+# printed PROBE_OK over an engine that had just been killed mid-generate, which
+# is precisely the failure it exists to catch.
+GEN_OK=0
+CHAT_OK=0
+
 echo "===== /generate ====="
-curl -s "http://\${IP}:${SGLANG_PORT}/generate" -H 'Content-Type: application/json' \
-  -d '{"text":"The capital of Switzerland is","sampling_params":{"max_new_tokens":24,"temperature":0}}'; echo
+GEN_OUT="\$(curl -s --max-time 900 "http://\${IP}:${SGLANG_PORT}/generate" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The capital of Switzerland is","sampling_params":{"max_new_tokens":24,"temperature":0}}' 2>&1)"
+echo "\${GEN_OUT}"
+case "\${GEN_OUT}" in *'"text"'*) GEN_OK=1 ;; esac
+
 echo "===== /v1/chat/completions ====="
-curl -s "http://\${IP}:${SGLANG_PORT}/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d '{"model":"${SERVED_MODEL_NAME}","messages":[{"role":"user","content":"In one sentence, what is tensor parallelism?"}],"max_tokens":128,"temperature":0}'; echo
+CHAT_OUT="\$(curl -s --max-time 900 "http://\${IP}:${SGLANG_PORT}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"${SERVED_MODEL_NAME}","messages":[{"role":"user","content":"In one sentence, what is tensor parallelism?"}],"max_tokens":128,"temperature":0}' 2>&1)"
+echo "\${CHAT_OUT}"
+case "\${CHAT_OUT}" in *'"choices"'*) CHAT_OK=1 ;; esac
+
 echo "===== HBM per GPU ====="
 rocm-smi --showmeminfo vram 2>/dev/null | grep -Ei "GPU\[|Total|Used" | head -20 || true
 echo "===== KV pool / mem lines from engine log ====="
-grep -Ei "KV cache|max_total_num_tokens|Load weight end|available_gpu_mem|Dequantized" \
-  "${DEPLOY_DIR}/logs/engine-${SLURM_JOB_ID}.log" | tail -20 || true
+grep -Ei "max_total_num_tokens|Load weight end|available_gpu_mem|Dequantized FP4" \
+  "${DEPLOY_DIR}/logs/engine-${SLURM_JOB_ID}.log" | tail -12 || true
 
+ENGINE_ALIVE=0
+kill -0 "\${ENGINE_PID}" 2>/dev/null && ENGINE_ALIVE=1
+echo "===== verdict ====="
+echo "generate_ok=\${GEN_OK} chat_ok=\${CHAT_OK} engine_alive=\${ENGINE_ALIVE}"
+
+if [ "\${GEN_OK}" = 1 ] && [ "\${CHAT_OK}" = 1 ] && [ "\${ENGINE_ALIVE}" = 1 ]; then
+  kill "\${ENGINE_PID}" 2>/dev/null || true
+  echo "PROBE_OK \$(date --iso-8601=seconds)"
+  exit 0
+fi
+
+echo "===== PROBE FAILED: the server answered metadata but did not generate ====="
+echo "--- engine log: first error and traceback ---"
+grep -nE "RuntimeError|ValueError|AssertionError|Traceback|SIGQUIT|Unsupported" \
+  "${DEPLOY_DIR}/logs/engine-${SLURM_JOB_ID}.log" | head -20 || true
+echo "--- engine log tail ---"
+grep -v "server_args=ServerArgs" "${DEPLOY_DIR}/logs/engine-${SLURM_JOB_ID}.log" | tail -40
 kill "\${ENGINE_PID}" 2>/dev/null || true
-echo "PROBE_OK \$(date --iso-8601=seconds)"
+exit 1
 RUNNER_EOF
 chmod +x "${RUNNER}"
 

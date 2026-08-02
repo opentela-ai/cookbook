@@ -4,6 +4,20 @@ Serve `deepseek-ai/DeepSeek-V4-Flash` on **Beverin** (AMD MI300A / gfx942,
 `mi300` partition) with the plain upstream SGLang ROCm image through the CSCS
 Slurm Container Engine (EDF + enroot + Pyxis), and register it on OpenTela.
 
+> ## ⛔ STATUS: does not serve on this image
+>
+> Everything here is validated up to and including weight load — the container,
+> EDF, MI300A memory accounting, DSA attention backend, OpenTela wiring and the
+> kernel cache all work, and the model loads in ~10 min at 43.76 GB/rank. But
+> **no token has ever been generated on MI300A.** The MXFP4 expert kernel is
+> disabled by an upstream aiter macro-name bug (fix #2 → *Root cause*), which no
+> setting in this recipe can work around; it needs a patched aiter.
+>
+> Fixes #1 and #3–#8 are independently verified and worth keeping — they are the
+> non-obvious parts of getting *any* DeepSeek-V4 to this point on ROCm. Treat
+> the recipe as a bring-up log, not a working deployment, until the aiter patch
+> is built and this banner comes off.
+
 Like the sibling [`glm47-flash/`](../glm47-flash/) GLM-4.7-Flash recipe and unlike the
 JSC one, **no relay is needed**: Beverin compute nodes have full outbound
 internet and reach the bootstrap `/ip4/148.187.108.178/...` directly, so each
@@ -94,9 +108,107 @@ With aiter on, expert weights **stay fp4**: measured **43.76 GB resident per
 rank** (175 GB across TP=4), leaving `avail mem=75.3 GB` per GPU for the KV
 pool. The alternative — `SGLANG_DSV4_FP4_DEQUANT=1`, which runs
 `cast_e2m1fn_to_e4m3fn` over every expert at load — **doubles** the expert
-footprint to ~264 GiB (~70 GB/rank) and leaves far less KV headroom. Keep it
-as a fallback only. (It asserts `moe_runner_backend=auto`, so it cannot be
-combined with an explicit `--moe-runner-backend`.)
+footprint to ~264 GiB (~70 GB/rank) and leaves less KV headroom. (It asserts
+`moe_runner_backend=auto`, so it cannot be combined with an explicit
+`--moe-runner-backend`.)
+
+> **⚠ On this image, the memory-efficient path does not actually run.** The CK
+> MXFP4 kernel compiles (fix #4) and then fails at dispatch on the first token:
+>
+> ```
+> File "aiter/fused_moe.py", line 2448, in ck_moe_stage1
+>     aiter.ck_moe_stage1_fwd(...)
+> RuntimeError: Unsupported kernel config for moe heuristic dispatch
+> ```
+>
+> aiter 9127c94a ships no CK instance for this model's MoE shape on gfx942
+> (`hidden_size=4096`, `moe_intermediate_size=2048`, so
+> `intermediate_per_partition=512` at TP=4 — already 256-aligned, so it is not
+> the documented padding constraint). Observed on job 574177, *after* the
+> memory fix in #6, so it is a genuine kernel-coverage gap and not another
+> resource problem.
+>
+> **And `DSV4_FP4_DEQUANT` cannot rescue it — the dequant is unreachable on
+> gfx942.** `Fp8MoEMethod.process_weights_after_loading_block_quant()` is one
+> if/elif chain, and the dequant sits in its final `else`:
+>
+> ```python
+> 1319:  if _use_aiter and self.is_fp4_expert:      # aiter native MXFP4
+> ...
+> 1474:  if _is_fp8_fnuz:                           # gfx94* is ALWAYS fnuz
+> 1476:      normalize_e4m3fn_to_e4m3fnuz(...)      #   -> assert on I8 weights
+> 1504:  elif _use_aiter: ...
+> 1512:  elif _is_cpu: ...
+> 1517:  else:                                      # CUDA only
+> 1525:      if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+> ```
+>
+> `is_fp8_fnuz()` returns `"gfx94" in gcnArchName`, so on MI300A the `_is_fp8_fnuz`
+> arm always wins and the `else` never runs. Both settings were tried:
+>
+> | Config | Result |
+> |---|---|
+> | `USE_AITER=1` (default) | line 1319 → CK dispatch gap, dies on **first token** |
+> | `USE_AITER=1, FP4_DEQUANT=1` | silent no-op — job 574280 still logged `mem usage=43.76 GB`, the *fp4* footprint, so the cast never ran |
+> | `USE_AITER=0, FP4_DEQUANT=1` | line 1474 → `assert weight.dtype == torch.float8_e4m3fn` **AssertionError at load** (job 574330) |
+>
+> So on this image the mxfp4 checkpoint has exactly **one** live code path on
+> gfx942, and it has no kernel for this shape. v0.5.16-rocm720-mi30x is already
+> the newest `mi30x` tag (2026-07-24), so there is nothing to upgrade to.
+>
+> `--moe-runner-backend humming` selects `Mxfp4HummingMoEMethod`, which sglang
+> documents as *"used for DeepSeek-V4 FP8 checkpoints"* and which brings its own
+> `process_weights_after_loading`, bypassing the fnuz chain. It gets furthest —
+> `quant_method=Mxfp4HummingMoEMethod` is selected and weights load — then dies
+> with `ModuleNotFoundError: No module named 'humming'` (job 574342). The
+> `humming` package is neither in the image nor on PyPI.
+
+#### Root cause: an aiter macro-name bug, not a shape or config problem
+
+Do not waste node time sweeping TP sizes or memory settings — the CK MXFP4
+kernel is dead on arrival for a reason that has nothing to do with either.
+The generated stage-1/stage-2 dispatch headers wrap their *entire* FP4 body in
+
+```c
+#if defined(__Float4_e2m1fn_x2)
+    ... every supported (block_m, inter_dim) instance ...
+#endif
+    TORCH_CHECK(false, "Unsupported kernel config for moe heuristic dispatch");
+```
+
+and **nothing ever defines `__Float4_e2m1fn_x2`**. The macro aiter's build
+actually passes is the *differently spelled* `-DTORCH_Float4_e2m1fn_x2`:
+
+| Location | Macro |
+|---|---|
+| `csrc/include/py_itfs_common.h:54` | `#ifdef TORCH_Float4_e2m1fn_x2` ✓ matches the build |
+| `csrc/ck_gemm_moe_2stages_codegen/gen_instances.py:267,301,620,677` | emits `#if defined(__Float4_e2m1fn_x2)` ✗ never defined |
+| `build.ninja` (generated) | `-DTORCH_Float4_e2m1fn_x2` |
+
+So the whole FP4 dispatch table is preprocessed away and every call falls to
+the `TORCH_CHECK`. This is **shape- and arch-independent**: no TP size, no
+`mem_fraction_static`, no runner backend changes it. Confirmed by reading the
+generated headers straight out of the JIT cache (fix #4 makes them persist,
+which is how this was found without another job).
+
+Related, and consistent: the build also logs
+`Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.` —
+the flag that enables FP4 illegal-type codegen on gfx942 is dropped too.
+
+**The fix requires patching aiter**, which is tractable because
+`AITER_META_DIR` is overridable (`aiter/jit/core.py:402`) and selects
+`AITER_CSRC_DIR` — i.e. the codegen tree:
+
+1. copy `/sgl-workspace/aiter` to `/capstor`,
+2. in `csrc/ck_gemm_moe_2stages_codegen/gen_instances.py`, emit
+   `TORCH_Float4_e2m1fn_x2` (or add `-D__Float4_e2m1fn_x2` to the build flags),
+3. `export AITER_META_DIR=<patched copy>`,
+4. delete the cached `module_moe_ck2stages_*fp4x2*` from `AITER_JIT_DIR` so it
+   regenerates, and re-pay the ~35 min compile (once — fix #4 keeps it).
+
+`TODO(unverified)` — the patch is derived from reading the source, not yet
+built and run. **As of this image, DeepSeek-V4-Flash does not serve on
+MI300A.**
 
 ### 3. `SGLANG_HACK_FLASHMLA_BACKEND=triton` — the default does not compile
 
@@ -219,19 +331,44 @@ Better still, skip the compile entirely by restoring a prebuilt cache:
 
 ### 7. A killed job leaves aiter's baton lock behind
 
-aiter guards each module build with `build/lock_module_<name>`, and it is
-removed by the *building process* on success. `scancel` the job mid-compile and
-that lock survives on `/capstor` — so the next job sees a build "in progress",
-waits for a baton that will never be released, and hangs with no error.
+aiter guards each module build with a baton that only the *building* process
+removes — and it uses **two of them, at different depths**:
 
-After any non-clean shutdown during a compile:
-
-```bash
-rm -f <deploy>/cache/aiter-jit/build/lock_module_*
+```
+<jit>/build/lock_module_<name>          # outer, one per module
+<jit>/build/module_<name>/build/lock    # inner, the ninja build
 ```
 
-`sync_aiter_kernels.sh` treats the same lock as a refuse-to-upload signal, so a
-stale one will also block uploads until you clear it.
+`scancel` a job mid-compile and both survive on `/capstor`. The next job then
+acquires the *outer* lock, starts its ninja build, and blocks forever on the
+**dead job's inner lock**: 0 % CPU, no compiler process, no error, no log line
+after `start build` — just a hang that looks exactly like a slow compile.
+
+Cleaning only the outer lock is not enough, and that trap is not hypothetical:
+it is precisely how job 574156 stalled after 574156's predecessor was
+cancelled. The give-away is a `waiting for baton release` line whose path ends
+in `/build/lock` rather than `/lock_module_…`, emitted by the *same* pid that
+just logged `start build`:
+
+```
+[aiter] [pid=58819] start build [module_moe_ck2stages_b16_fp4x2_…]
+[aiter] [pid=58819] waiting for baton release at …/module_moe_ck2stages_…/build/lock
+```
+
+**Fix:** both sbatches sweep every baton older than the job's own start, once,
+in the sbatch body before `srun` (so it cannot race a rank that is legitimately
+building). It also drops the 0-byte `*.o.tmp` hipcc scratch the dead build left
+behind. Verified on job 574177: `aiter_stale_locks_swept=11`.
+
+To do it by hand after a non-clean shutdown:
+
+```bash
+find <deploy>/cache/aiter-jit/build -maxdepth 3 \
+     \( -name 'lock_module_*' -o -path '*/build/lock' \) -delete
+```
+
+`sync_aiter_kernels.sh` treats the outer lock as a refuse-to-upload signal, so
+a stale one will also block uploads until it is cleared.
 
 ### 8. NUMA CPU affinity and TMPDIR (inherited)
 
@@ -376,9 +513,10 @@ srun --jobid=<JOB> --overlap -N1 -n1 bash -lc \
 | `MEM_FRACTION_STATIC` | `0.85` | |
 | `MAX_MODEL_LEN` | `65536` | config advertises 1 048 576 (YaRN ×16); 65536 is the un-scaled window |
 | `MAX_RUNNING_REQUESTS` | `256` | |
-| `SGLANG_USE_AITER` | `1` | **fix #2** — opposite of the GLM recipe |
-| `DSV4_FP4_DEQUANT` | `0` | fallback; doubles expert memory |
+| `SGLANG_USE_AITER` | `1` | **fix #2** — opposite of the GLM recipe. Do not set `0`: that path asserts at load on gfx942 |
+| `DSV4_FP4_DEQUANT` | `0` | **has no effect on gfx942** — the dequant branch is unreachable behind `_is_fp8_fnuz` (see fix #2) |
 | `FLASHMLA_BACKEND` | `triton` | **fix #3**; `tilelang` (upstream default) does not compile on gfx942 |
+| `MOE_RUNNER_BACKEND` | `auto` | `humming` selects `Mxfp4HummingMoEMethod`, the remaining candidate for the fix-#2 kernel gap |
 | `AITER_JIT_DIR` | `$DEPLOY_DIR/cache/aiter-jit` | fix #4 |
 | `SGLANG_REASONING_PARSER` | `deepseek-v4` | |
 | `SGLANG_TOOL_CALL_PARSER` | `deepseekv4` | |

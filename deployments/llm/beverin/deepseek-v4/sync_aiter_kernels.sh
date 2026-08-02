@@ -270,7 +270,7 @@ STAGE_HUMAN=$(du -sh "$STAGE/files" | cut -f1)
 cat > "$STAGE/manifest.json" <<EOF
 {
   "kind": "aiter-jit-cache",
-  "produced_by": "cookbook/deployments/llm/beverin/deepseek-v4/sync_aiter_kernels.sh",
+  "produced_by": "cookbook/deployments/llm/beverin-deepseek-v4/sync_aiter_kernels.sh",
   "remote_key": "${REMOTE_KEY}",
   "gpu_arch": "${ARCH:-unknown}",
   "aiter_commit": "${AITER_COMMIT:-unknown}",

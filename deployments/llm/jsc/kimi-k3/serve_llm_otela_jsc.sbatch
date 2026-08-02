@@ -7,6 +7,15 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
+# NOTE: B:TERM@120 signals the BATCH SHELL 120s before the wall-time limit, which
+# is what gives stop_otela below a window to run. Without it the only grace is
+# KillWait (default 30s) between SIGTERM and SIGKILL — less than stop_otela's
+# poll plus otela's ~10s shutdown (AnnounceLeave -> 5s CRDT drain -> srv.Shutdown).
+# The teardown then loses the race at every wall-time expiry, the LEFT record is
+# never published, and the head keeps a `connected: true` row pointing at a dead
+# endpoint. `B:` matters: without it the signal goes to the job steps, not the
+# shell running the trap.
+#SBATCH --signal=B:TERM@120
 #SBATCH --output=/e/scratch/reformo/%u/otela-llm/logs/llm-otela-%j.out
 #SBATCH --error=/e/scratch/reformo/%u/otela-llm/logs/llm-otela-%j.out
 #
@@ -413,14 +422,35 @@ chmod +x "$RUNDIR/otela.sh"
 # relay signals to the task) and wait for it to actually exit: "Leaving network"
 # is logged at the START of shutdown, and the CRDT delta drains after that, so
 # killing on the log line cuts the announcement off.
+_OTELA_STOPPED=0
 stop_otela() {
+  # The trap below fires on both TERM and EXIT, and bash runs the EXIT trap after
+  # the TERM handler returns — so without this guard the teardown runs twice and
+  # the second pass finds no step and reports a spurious warning.
+  [ "$_OTELA_STOPPED" = 1 ] && return 0
+  _OTELA_STOPPED=1
+
   local step
   step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
           | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  [ -z "$step" ] && return 0
+  if [ -z "$step" ]; then
+    # NOTE: this is NOT a clean state — the step should still exist while the job
+    # winds down. It returned 0 silently before, which is exactly what made this
+    # failure invisible in job logs after the fact: "step already gone" and "left
+    # cleanly" looked identical. Say so loudly instead.
+    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
+    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
+    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
+    return 0
+  fi
   echo "[$(date -Is)] stopping otela step $step"
   scancel -s TERM "$step" 2>/dev/null
-  for _ in $(seq 1 45); do
+  # 20s, not 45s. --signal=B:TERM@120 only covers wall-time expiry; on the
+  # `scancel` path the only grace is KillWait (default 30s). otela needs ~10s to
+  # shut down, so 20s leaves margin and still finishes before SIGKILL. Polling
+  # for longer than the fuse just guarantees we are still waiting when the
+  # process is destroyed.
+  for _ in $(seq 1 20); do
     [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
             | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
     sleep 1
