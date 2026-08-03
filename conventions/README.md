@@ -42,5 +42,5 @@ serves `moonshotai/Kimi-K3`.
 | `deployments/llm/jsc/kimi-k3/` | `moonshotai/Kimi-K3` |
 | `deployments/llm/beverin/glm47-flash/` | `zai-org/GLM-4.7-Flash` |
 | `deployments/llm/beverin/deepseek-v4/` | `deepseek-ai/DeepSeek-V4-Flash` |
+| `deployments/llm/local/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` |
 | `deployments/llm/euler/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` |
-| `deployments/local/llm/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` |

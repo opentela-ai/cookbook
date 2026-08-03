@@ -10,7 +10,7 @@ runtime, scheduler quirks, and the OpenTela settings those force.
 
 ```
 deployments/<service-kind>/<site>/<model>/          # one self-contained recipe per directory
-deployments/local/<service-kind>/<site>/<model>/    # no scheduler: single-box, hand-run scripts
+deployments/<service-kind>/local/<site>/<model>/    # no scheduler: single-box, hand-run scripts
 conventions/                                       # cross-recipe rules (LLM served-model naming, …)
 meta/bench/                                        # benchmark harness shared by all recipes
 ```
@@ -21,7 +21,7 @@ meta/bench/                                        # benchmark harness shared by
 | `deployments/llm/beverin/glm47-flash/` | `zai-org/GLM-4.7-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
 | `deployments/llm/beverin/deepseek-v4/` | `deepseek-ai/DeepSeek-V4-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
 | `deployments/llm/euler/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` serving on ETH Zürich Euler (RTX PRO 6000, Blackwell, Slurm + Apptainer). Login-node relay for egress (compute has HTTP(S)-only via `eth_proxy`). Start with its [`README.md`](deployments/llm/euler/qwen36-35b-a3b/README.md) for the cli_filter/GRES routing story and why a login-node relay is required. |
-| `deployments/local/llm/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
+| `deployments/llm/local/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
 | [`conventions/`](conventions/) | Cross-recipe rules, starting with LLM served-model names use the `org/model-name` form. |
 | [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared benchmark harness, and the reporting checklist every throughput claim must carry. |
 
@@ -37,7 +37,7 @@ meta/bench/                                        # benchmark harness shared by
   it**, not just what it does. Most of these were found by hitting the failure.
 - Defaults target the documented site. Everything else is an environment
   variable override.
-- Local recipes (under `deployments/local/`) have no scheduler: they are plain
-  bash scripts run by hand on the box — a `build_image.sh` for the one-time image,
-  a `serve_*.sh` for the engine, and a `register_*.sh` (or the engine's own
+- Local recipes (under `deployments/<service-kind>/local/`) have no scheduler: they are
+  plain bash scripts run by hand on the box — a `build_image.sh` for the one-time
+  image, a `serve_*.sh` for the engine, and a `register_*.sh` (or the engine's own
   `--enable-opentela`) to join OpenTela. Defaults still target the documented site.
