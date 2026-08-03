@@ -52,7 +52,11 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 # reasoning-parser qwen3: model emits <think>...</think>; the parser strips it
 #   into `reasoning_content`.
 REASONING_PARSER="${REASONING_PARSER:-qwen3}"
-TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
+# tool-call-parser qwen3_coder: the running engine registered no tool-call
+#   parser when this flag was absent (observed on ds6: container args had no
+#   --sglang-tool-call-parser), so the gateway can't serve function calls for
+#   this model. qwen3_coder is the parser selected for this model.
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_coder}"
 # How long to poll /v1/models before giving up (seconds). FP8 weights + SSM
 # state load on a single GB10 takes several minutes; 600s matched the original
 # bring-up. Raise for cold loads.

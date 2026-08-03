@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Register the running Qwen/Qwen3.6-35B-A3B-FP8 engine as the `llm` service on the
-# OpenTela network (swiss-ai/OpenTela sai-v0.0.6 / arm64). Sidecar topology:
+# OpenTela network (eth-easl/OpenTela v0.2.3 / arm64). Sidecar topology:
 # the engine (sglang in the qwen36-dgx-spark container, --network host) is
 # already serving on :${SERVE_PORT}. This script launches a standalone otela
 # peer that connects to the given bootstrap and publishes the engine's `llm`
@@ -37,41 +37,40 @@ LOGFILE="${LOGFILE:-${OTELA_DIR}/otela.log}"
 BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 SERVICE_PORT="${SERVE_PORT:-30000}"
 SERVED_MODEL_ID="${SERVED_MODEL_ID:-Qwen/Qwen3.6-35B-A3B-FP8}"   # org/model-name form; see ../../../../../conventions/
-# WHY: otela derives its libp2p peer ID from --seed (sai-v0.0.6 has no stored
-# identity key). A graceful `stop` announces LEFT, and if you restart with the
-# SAME seed (the binary's default "0") the gateway keeps a LEFT tombstone that
-# a fresh-CRDT restart (DAG head 0) cannot override — re-registration stalls
-# for many minutes and the gateway returns `{"error":"No provider found for the
-# requested service."}` (HTTP 503) to /v1/service/llm/... in the meantime.
-# Defaulting to $$ gives a fresh peer ID per invocation, so stop/start cycles
-# register cleanly in ~60 s. Set OPENTELA_SEED to a constant ONLY if you want a
-# stable peer ID and accept that you must not stop-and-immediately-restart with
-# that seed (or wait out the tombstone).
-OPENTELA_SEED="${OPENTELA_SEED:-$$}"
+# WHY: v0.2.3 derives the libp2p peer ID from $CFG_DIR/keys/id (created by
+# `otela init --config-dir $CFG_DIR` if absent), NOT from --seed. Verified on
+# ds6: --seed 0, 1, and 2 all yield the SAME peer ID (keys/id fixes it);
+# deleting $CFG_DIR/keys and re-initing yields a DIFFERENT peer ID. The Solana
+# provider key at ~/.config/opentela/ is separate and not affected by
+# --config-dir. --seed is vestigial and passed only for forward-compat.
+OPENTELA_SEED="${OPENTELA_SEED:-0}"
 
 [ -x "${OTELA_BIN}" ] || { echo "FATAL: otela binary not found/executable: ${OTELA_BIN}" >&2
-  echo "       Obtain the OpenTela 'otela' binary (sai-v0.0.6, arm64) and place it" >&2
+  echo "       Obtain the OpenTela 'otela' binary (v0.2.3, arm64) and place it" >&2
   echo "       at ${OTELA_BIN}, or set OTELA_BIN to an existing path." >&2
   exit 1; }
 mkdir -p "${CFG_DIR}"
-# Idempotent: create the OpenTela config + identity if absent (matches the
-# Slurm recipe pattern). In sai-v0.0.6 this writes nothing and `otela start`
-# generates an ephemeral identity from --seed (default 0, deterministic); kept
-# for forward-compat and so a stale/missing cfg.yaml never fails start.
-"${OTELA_BIN}" init --config "${CFG_DIR}/cfg.yaml" >/dev/null 2>&1 || true
+# Idempotent: `otela init --config-dir $CFG_DIR` writes cfg.yaml + a fresh
+# libp2p key (keys/id) under $CFG_DIR if absent; if keys/id already exists it
+# is preserved (same keys -> same peer ID, see OPENTELA_SEED note). The Solana
+# provider wallet lives at ~/.config/opentela/ regardless of --config-dir.
+# Must run before `start` so the peer ID exists. To force a fresh peer ID
+# (the v0.2.3 analog of the old --seed $$ workaround): rm -rf $CFG_DIR/keys.
+"${OTELA_BIN}" init --config-dir "${CFG_DIR}" >/dev/null 2>&1 || true
 
+# v0.2.3 auto-registers `model=<served-model-name>` as the identity group by
+# querying the engine's /v1/models (which returns --served-model-name, i.e.
+# $SERVED_MODEL_ID); keep --service.name llm so the discovery runs. The
+# cosmetic --label cluster=/host=/launched_by= flags have no v0.2.3 equivalent
+# (--label was removed) and are dropped here.
 CMD=(
   "${OTELA_BIN}" start
-  --config "${CFG_DIR}/cfg.yaml"
+  --config-dir "${CFG_DIR}"
   --mode node
   --service.name "${OPENTELA_SERVICE_NAME:-llm}"
   --service.port "${SERVICE_PORT}"
   --bootstrap.static "${BOOTSTRAP}"
   --solana.skip_verification
-  --label "model=${SERVED_MODEL_ID}"
-  --label "cluster=dgx-spark"
-  --label "host=$(hostname)"
-  --label "launched_by=${USER}"
   --seed "${OPENTELA_SEED}"
   --tcpport "${OPENTELA_TCP_PORT:-43905}"
   --udpport "${OPENTELA_UDP_PORT:-59820}"
