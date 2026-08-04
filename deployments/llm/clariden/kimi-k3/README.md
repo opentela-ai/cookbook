@@ -30,12 +30,20 @@ failures behind each non-obvious choice. The companion
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 1716-tok-actual prompt / 256-out)
 
-Taken with `bench.py` (vendored in this directory — the same script and
-protocol as `meta/bench/` and the JSC recipe): warmup `4:8` discarded, then
-the sweep below, 256 max output tokens, `ignore_eos`, deterministic. Run
-inside the container on the head (nid007464) against `127.0.0.1:30000` of job
-3000965 (2026-08-04); HiCache OFF. Raw output: `bench_3000965.jsonl` (in this
-directory).
+The numbers below were taken with the legacy vendored `bench.py`: warmup
+`4:8` discarded, then the sweep, 256 max output tokens, `ignore_eos`,
+deterministic. Run inside the container on the head (nid007464) against
+`127.0.0.1:30000` of job 3000965 (2026-08-04); HiCache OFF. Raw output:
+`bench_3000965.jsonl` (in this directory).
+
+**The harness is now `meta/bench/cbench.sh` (servekit bench)** — see
+*Benchmark* below and `meta/bench/README.md`. The sbatch also runs a single
+verification level (C=16, n=64) automatically after health, before OpenTela
+registration, and writes a per-node cold-start profile
+(`$RUNDIR/coldstart.node<RANK>.json`). Reproduce the table with the standard
+sweep `1:8 4:16 8:32 16:48 32:64 64:96`. Note: servekit measures prompt
+length in **words** (~1.4 tokens/word), so its 768-word default ≈ the
+1024-token prompt protocol used here — not identical, quote which you ran.
 
 | Concurrency | n | Aggregate out tok/s | per-req tok/s | p50 lat (s) |
 |---|---|---|---|---|
@@ -154,10 +162,10 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
 
 | File | Purpose |
 |------|---------|
-| `serve_kimi_k3_otela_clariden.sbatch` | One self-contained sbatch: distributed SGLang engine (enroot, TP4×PP8) + one otela worker on the head + lifecycle trap. Defaults: 8 nodes, TP4×PP8. |
+| `serve_kimi_k3_otela_clariden.sbatch` | One self-contained sbatch: distributed SGLang engine (enroot, TP4×PP8, wrapped in `servekit profile` for cold-start JSON) + pre-registration servekit verification bench + one otela worker on the head + lifecycle trap. Defaults: 8 nodes, TP4×PP8. |
 | `kimi-k3-clariden.toml` | EDF: image (local .sqsh), mounts, caches, `com.hooks.aws_ofi_nccl` (cuda13) for Slingshot NCCL. |
 | `build_kimi_k3_image.sbatch` | One-time: import `docker://lmsysorg/sglang:kimi-k3` to the local arm64 .sqsh (on a `debug` node, with /dev/shm enroot scratch). |
-| `bench.py` | Vendored copy of the shared `meta/bench/` throughput-vs-concurrency harness (aiohttp only, no tokenizer — works with `HF_HUB_OFFLINE=1`). |
+| `bench.py` | Legacy vendored throughput harness (`--input-len` counts tokens here, unlike servekit's words). New default: `meta/bench/cbench.sh` + `cbench_report.py` (servekit bench); the 3000965 numbers still come from this script. |
 | `bench_3000965.jsonl` | Raw verified benchmark output (job 3000965, 2026-08-04) backing the table above. |
 | `README.md` | This file. |
 
@@ -214,16 +222,39 @@ grep -ac 'POST /v1/chat/completions.*200 OK' $DEPLOY_DIR/logs/k3-clariden-$JOB.o
 # (clean LEFT), do not SIGKILL, then re-check the listing.
 ```
 
-Benchmark from inside the allocation (`bench.py` ships in this recipe
-directory — copy it alongside the sbatch to `$DEPLOY_DIR/recipe/` on Clariden;
-it needs no tokenizer/downloads, only `aiohttp`, which the image has):
+### Benchmark
+
+Standard after any change (protocol and rationale: `meta/bench/README.md`).
+The default sweep from any login node, via the checkout on the shared FS:
+
+```bash
+SERVEKIT_DIR=$DEPLOY_DIR/servekit bash meta/bench/cbench.sh \
+    "http://$SERVICE_HEAD_IP:$SERVICE_PORT" "1:8 4:16 8:32 16:48 32:64 64:96" \
+    768 256 --label k3-clariden-pp8
+```
+
+(768 words ≈ the 1024-token prompt above.) From *inside* the allocation
+instead (pure stdlib, no install — no-egress safe):
 
 ```bash
 srun --jobid=$JOB --overlap --gres=none --nodes=1 -n1 -w "$SERVICE_HEAD_NODE" \
      --environment=kimi-k3-clariden \
-     python3 /capstor/scratch/cscs/xyao/kimi-k3/recipe/bench.py \
-       "1:8 4:16 8:32 16:48 32:64 64:96" 127.0.0.1 "$SERVICE_PORT" 1024 256
+     env PYTHONPATH="$DEPLOY_DIR/servekit/src" \
+     python3 -m servekit.cli bench --url "http://127.0.0.1:$SERVICE_PORT" \
+       --requests 64 --concurrency 16 --input-len 768 --output-len 256 \
+       --out "$DEPLOY_DIR/bench_c16.json"
 ```
+
+Already done for you on every launch: the sbatch benches C=16 n=64 **before**
+registering on OpenTela (merged into `$RUNDIR/coldstart.node0.json`, or
+`$RUNDIR/bench.json` if profiling was unavailable), and the engine runs
+under `servekit profile`, so `$RUNDIR/coldstart.node<RANK>.json` captures
+every node's startup timeline (weight-load/compile/CG phases, `ready_wait_s`).
+Set `SERVEKIT_BENCH=0` to skip the automatic bench.
+
+Historical: the legacy `bench.py` invocation that produced the verified table
+is preserved in the git history of this file; its protocol is 1024 token-in,
+not words.
 
 Alternatively, sglang's own `bench_serving` (random-ids dataset, local
 tokenizer path since `HF_HUB_OFFLINE=1`):
@@ -296,6 +327,10 @@ JSC recipe's curve on identical hardware and protocol.
 | `HEALTH_TIMEOUT` | `9000` | 150 min — cold start is ~105 min (job 3000965); ~1.5 TB weights, be patient |
 | `UNBALANCED_MODEL_LOADING_TIMEOUT_S` | `3600` | sglang weight-load barrier (fix 10); patched via `$DEPLOY_DIR/patches/sitecustomize.py` |
 | `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `sglang serve` line |
+| `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout (stdlib-only, runs via `PYTHONPATH` — no install). Stage once with egress: `git clone --depth=1 https://github.com/eth-easl/servekit $DEPLOY_DIR/servekit`. Missing → WARN, engine runs unprofiled, auto-bench skipped. |
+| `SERVEKIT_BENCH` | `1` | `0` skips the post-health, pre-registration verification bench |
+| `SERVEKIT_BENCH_REQUESTS` / `SERVEKIT_BENCH_CONCURRENCY` | `64` / `16` | single-level verification bench size (pp=8 ↔ max_running_requests=32; keep C≤32) |
+| `SERVEKIT_BENCH_CORRECTNESS` | `1` | attach the greedy correctness probe (non-gating) to the verification bench |
 
 ## Cluster facts (the things you can't rediscover from a manual)
 

@@ -54,9 +54,14 @@ Why each of these is pinned the way it is (each was a discovered failure mode):
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 256-out)
 
-Taken with the shared `meta/bench/` harness — see
-[`meta/bench/README.md`](../../../meta/bench/README.md) for the full protocol (warmup, the
-C=1 trap, how to read the curve shape).
+Numbers below predate the harness switch: they were taken with the legacy
+token-counting `bench.py`. **The harness is now `meta/bench/cbench.sh`
+(servekit bench)** — the sbatch runs a C=16 n=64 verification level
+automatically after health, before OpenTela registration, and the engine
+runs under `servekit profile` (per-node `$RUNDIR/coldstart.node<RANK>.json`).
+See [`meta/bench/README.md`](../../../meta/bench/README.md) for the full protocol (warmup, the
+C=1 trap, how to read the curve shape); servekit `--input-len` counts words
+(~1.4 tok/word), so 768 words ≈ the 1024-token protocol below.
 
 | Concurrency | Aggregate out tok/s | per-req tok/s |
 |---|---|---|
@@ -250,14 +255,37 @@ srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" \
   curl -s http://127.0.0.1:30000/v1/models | python3 -m json.tool
 ```
 
-Benchmark from inside the allocation (compute nodes have `aiohttp` only inside
-the container):
+Benchmark from inside the allocation. servekit is pure stdlib, so the
+no-egress compute nodes need zero installation beyond a checkout on the
+shared FS (the sbatch already warns if `$SERVEKIT_DIR` is missing — default
+`$DEPLOY_DIR/servekit`):
 
 ```bash
+# one-time on a login node:
+git clone --depth=1 https://github.com/eth-easl/servekit "$DEPLOY_DIR/servekit"
+
+# standard sweep (login node CANNOT reach the engine — run inside the allocation):
+srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" \
+  bash meta/bench/cbench.sh http://127.0.0.1:30000 "1:16 8:32 32:64" 768 256 \
+       --label k3-jsc-pp8
+# or directly, container-side:
 srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" \
   apptainer exec --bind /e/scratch:/e/scratch "$IMAGE" \
-  python3 bench.py "1:16 8:32 32:64" 127.0.0.1 30000 1024 256
+  env PYTHONPATH="$DEPLOY_DIR/servekit/src" \
+  python3 -m servekit.cli bench --url http://127.0.0.1:30000 \
+    --requests 64 --concurrency 32 --input-len 768 --output-len 256 \
+    --out "$RUNDIR/bench_c32.json"
 ```
+
+(The legacy `bench.py` form is retired here; its `--input-len` counted
+tokens, servekit's counts words — do not mix the two records.)
+
+Every launch also produces, without any of the above: **before** the otela
+worker registers, a verification bench C=16 n=64 written into
+`$RUNDIR/coldstart.node0.json` (merged with the cold-start timeline), and a
+per-node cold-start profile `$RUNDIR/coldstart.node<RANK>.json` — the
+engine's phase timestamps from spawn to serving. `SERVEKIT_BENCH=0` disables
+the bench; a missing servekit checkout just skips both, with a WARN.
 
 Confirm SHARP engagement in the sglang log (`NCCL_DEBUG=INFO`):
 ```
@@ -283,6 +311,9 @@ NET/IB : Using [0]mlx5_0:1/IB/SHARP ...   (/SHARP suffix = engaged)
 | `DIST_TIMEOUT` | 60 | raise for large TP/EP init. |
 | `TVM_FFI_CACHE_DIR` / `EP_JIT_CACHE_DIR` | rank-local under `$DEPLOY_DIR/cache` | race-proof (§4). |
 | `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `sglang serve` line. |
+| `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout on shared FS (stdlib-only, no install; stage once from a login node). Missing → WARN, engine runs unprofiled, auto-bench skipped. |
+| `SERVEKIT_BENCH` | `1` | `0` skips the post-health, pre-registration verification bench (C=16 n=64 by default) in `$RUNDIR`. |
+| `SERVEKIT_BENCH_REQUESTS` / `SERVEKIT_BENCH_CONCURRENCY` | `64` / `16` | single-level verification size; keep C ≤ 136 (`max_running_requests`, KDA pool). |
 
 ## Cluster facts (the things you can't rediscover from a manual)
 

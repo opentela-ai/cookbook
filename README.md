@@ -44,7 +44,7 @@ substrates (DGX Spark) everything runs without a scheduler.
 | `deployments/llm/local/dgx-spark/qwen36-35b-a3b/` | `Qwen/Qwen3.6-35B-A3B-FP8` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64). No scheduler: a Docker overlay on a golden GB10 image plus a standalone `otela` sidecar. |
 | `deployments/llm/local/dgx-spark/qwen3-1.7b-ollama/` | `ollama/qwen3:1.7b` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64) via **Ollama** (bundled CUDA v13 libs, no golden image, no container). Start with its [`README.md`](deployments/llm/local/dgx-spark/qwen3-1.7b-ollama/README.md) for the Ollama-has-no-`/health` and Modelfile-alias-for-`org/model-name` stories. |
 | [`conventions/`](conventions/) | Cross-recipe rules, starting with LLM served-model names use the `org/model-name` form. |
-| [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared benchmark harness, and the reporting checklist every throughput claim must carry. |
+| [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared harness (**servekit bench** via `cbench.sh` / `cbench_report.py`, stdlib-only so it runs zero-install on no-egress compute nodes; `servekit profile` for cold-start timelines), and the reporting checklist every throughput claim must carry. |
 
 ## Conventions
 

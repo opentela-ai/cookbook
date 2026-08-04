@@ -30,9 +30,13 @@
 #
 # What it does, in order:
 #   1. resolves the shared OpenTela relay on the login node (us-managed; prefilled, see below)
-#   2. srun's one engine process per node -> apptainer exec --nv sglang serve
-#   3. waits for the head node's /health, then starts an otela WORKER on the
-#      head node (srun --overlap) which registers the `llm` service
+#   2. srun's one engine process per node -> apptainer exec --nv [servekit
+#      profile --] sglang serve (cold-start profiling; skipped with a WARN if
+#      the servekit checkout is missing)
+#   3. waits for the head node's /health, runs the servekit verification
+#      bench (pre-registration; SERVEKIT_BENCH=0 skips), then starts an otela
+#      WORKER on the head node (srun --overlap) which registers the `llm`
+#      service
 #   4. on job end / scancel, stops the worker so it announces LEFT cleanly
 #
 # -----------------------------------------------------------------------------
@@ -238,8 +242,24 @@ OTELA_RELAY_DEFAULT="/ip4/10.128.1.1/tcp/43917/p2p/QmXbXAnu9XVvfyXPaS57rzvKHbTjC
 # Where the login-node relay may publish its dial address (optional override).
 RELAY_ADDR_FILE="${RELAY_ADDR_FILE:-/e/scratch/$PROJECT/$USER/otela-relay/relay.multiaddr}"
 
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5400}"   # weights can be ~1.5 TB; be patient
-RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
+export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5400}"   # weights can be ~1.5 TB; be patient
+export RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
+
+# ---- servekit (cold-start profile + pre-registration verification bench) ----
+# engine.sh wraps `sglang serve` with `servekit profile` (github.com/eth-easl/
+# servekit): engine log passes through unmodified; per-phase startup report
+# lands in $RUNDIR/coldstart.node<RANK>.json at readiness. After /health and
+# BEFORE otela registration, a fixed servekit bench runs inside the container
+# and merges into the node-0 report. Pure stdlib -> module-style from a
+# checkout on /e/scratch (bind-mounted into the container); no install, no
+# egress needed on compute nodes. Missing checkout: unwrapped, bench skipped.
+export SERVEKIT_DIR="${SERVEKIT_DIR:-$DEPLOY_DIR/servekit}"
+export SERVEKIT_BENCH="${SERVEKIT_BENCH:-1}"              # 0 skips the auto-bench
+export SERVEKIT_BENCH_REQUESTS="${SERVEKIT_BENCH_REQUESTS:-64}"
+export SERVEKIT_BENCH_CONCURRENCY="${SERVEKIT_BENCH_CONCURRENCY:-16}"
+export SERVEKIT_BENCH_IN="${SERVEKIT_BENCH_IN:-768}"      # words (~1024 tokens)
+export SERVEKIT_BENCH_OUT="${SERVEKIT_BENCH_OUT:-256}"    # tokens, ignore_eos
+export SERVEKIT_BENCH_CORRECTNESS="${SERVEKIT_BENCH_CORRECTNESS:-1}"
 mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home"
 
 HEAD="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
@@ -252,6 +272,13 @@ echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME"
 [ -f "$IMAGE" ] || { echo "FATAL: image not found: $IMAGE" >&2; echo "       build it on a login node with build_kimi_k3_image.sh (next to this sbatch)" >&2; exit 1; }
 [ -d "$MODEL_PATH" ] || { echo "FATAL: weights not found: $MODEL_PATH" >&2; exit 1; }
 [ "$PP_SIZE" = "$NNODES" ] || echo "WARN: PP_SIZE=$PP_SIZE != NNODES=$NNODES (intended?)" >&2
+# servekit is OPTIONAL (cold-start profile + pre-registration bench). Missing
+# checkout -> warn loudly and run unwrapped; never fail the job over it.
+[ -d "$SERVEKIT_DIR/src/servekit" ] || {
+  echo "WARN: servekit checkout not found: $SERVEKIT_DIR — no cold-start" >&2
+  echo "      profile, no auto-bench. Stage it ONCE on a login node (has egress):" >&2
+  echo "        git clone --depth=1 https://github.com/eth-easl/servekit $SERVEKIT_DIR" >&2
+}
 
 # ------------------------------------------------------ resolve the relay -----
 # Precedence: explicit $OTELA_RELAY_ADDR > non-empty $RELAY_ADDR_FILE > the
@@ -361,10 +388,28 @@ fi
 
 echo "[rank $RANK] $(hostname) ip=$SGLANG_HOST_IP iface=$IFACE head=$HEAD_IP:$DIST_PORT"
 
+# servekit profile wraps the engine: it echoes sglang's log unmodified below
+# and writes a per-phase cold-start breakdown to $RUNDIR/coldstart.node<RANK>.json
+# once THIS node reports ready (head: "The server is fired up..."; workers:
+# sglang's multi-node "Dummy health check server started" line — if a future
+# image stops printing it, workers stay unprofiled and the profiler would
+# terminate them at --timeout; check coldstart.node<R>.json after image
+# bumps). Timeout semantics: profile KILLS the engine on expiry, so
+# --timeout must track $HEALTH_TIMEOUT — never set it shorter. PYTHONPATH is
+# exported OUTSIDE apptainer on purpose: apptainer passes host env through.
+PROFILE=()
+if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
+  export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
+  PROFILE=(python3 -m servekit.cli profile --out "${RUNDIR}/coldstart.json"
+           --timeout "${HEALTH_TIMEOUT:-5400}" --)
+else
+  echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold start unprofiled" >&2
+fi
+
 exec apptainer exec --nv "${SHARP_ARGS[@]}" \
   --bind /e/scratch:/e/scratch --bind /e/home:/e/home --bind /e/data1:/e/data1 \
   --pwd "$DEPLOY_DIR" "$IMAGE" \
-  sglang serve \
+  ${PROFILE[@]+"${PROFILE[@]}"} sglang serve \
     --trust-remote-code \
     --model-path "$MODEL_PATH" \
     --served-model-name "$SERVED_MODEL_NAME" \
@@ -468,6 +513,27 @@ trap 'stop_otela' EXIT TERM INT
     [ $SECONDS -ge $deadline ] && { echo "[$(date -Is)] health timeout; not registering" >&2; exit 1; }
     sleep 20
   done
+  # Verification bench BEFORE registration: otela traffic must not pollute
+  # the numbers. Stdlib-only servekit runs inside the container, module-style
+  # from the checkout on /e/scratch. When the head's cold-start profile
+  # report exists, the bench is merged into it (--into): one verified
+  # artifact with profile + throughput.
+  if [ "${SERVEKIT_BENCH:-1}" = "1" ] && [ -d "$SERVEKIT_DIR/src/servekit" ]; then
+    echo "[$(date -Is)] engine healthy — servekit bench C=$SERVEKIT_BENCH_CONCURRENCY n=$SERVEKIT_BENCH_REQUESTS (SERVEKIT_BENCH=0 to skip)"
+    BENCH_ARGS=(--url "http://127.0.0.1:$SERVE_PORT"
+                --requests "$SERVEKIT_BENCH_REQUESTS" --concurrency "$SERVEKIT_BENCH_CONCURRENCY"
+                --input-len "$SERVEKIT_BENCH_IN" --output-len "$SERVEKIT_BENCH_OUT")
+    [ "${SERVEKIT_BENCH_CORRECTNESS:-1}" = "1" ] || BENCH_ARGS+=(--no-correctness)
+    if [ -f "$RUNDIR/coldstart.node0.json" ]; then
+      BENCH_ARGS+=(--into "$RUNDIR/coldstart.node0.json")
+    else
+      BENCH_ARGS+=(--out "$RUNDIR/bench.json")
+    fi
+    srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$HEAD" \
+         apptainer exec --bind /e/scratch:/e/scratch --bind /e/data1:/e/data1 "$IMAGE" \
+         env "PYTHONPATH=$SERVEKIT_DIR/src" python3 -m servekit.cli bench "${BENCH_ARGS[@]}" \
+      || echo "[$(date -Is)] WARN: servekit bench failed; registering anyway" >&2
+  fi
   echo "[$(date -Is)] engine healthy — starting otela worker on $HEAD"
   srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$HEAD" \
        -J "$OTELA_STEP_NAME" bash "$RUNDIR/otela.sh" >"$RUNDIR/otela.log" 2>&1

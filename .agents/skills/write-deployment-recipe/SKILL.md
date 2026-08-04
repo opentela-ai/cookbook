@@ -52,6 +52,30 @@ heredoc helpers into `$RUNDIR` from inside the sbatch.
    topology differ per site. When porting, ask the user or run read-only
    probes (`sinfo`, `ip -o -4 addr`, `df -h`, checking `$SCRATCH`/quota) and
    record HOW each fact was learned in a comment.
+6. **Measurement is built in, not bolted on.** The measurement engine is
+   `servekit` (`github.com/eth-easl/servekit`, stdlib-only — runs via
+   `PYTHONPATH=<checkout>/src python3 -m servekit.cli`, so no-egress compute
+   nodes need only a checkout on the shared FS). Each recipe:
+   - exports `SERVEKIT_DIR` (default: a servekit checkout under $DEPLOY_DIR),
+     `SERVEKIT_BENCH=1`, `SERVEKIT_BENCH_REQUESTS=64`,
+     `SERVEKIT_BENCH_CONCURRENCY=16` knobs and documents them in Knobs;
+   - wraps the engine exec in `python3 -m servekit.cli profile --out
+     "$RUNDIR/coldstart.json" --timeout "$HEALTH_TIMEOUT" --` when the
+     checkout exists (per-node JSON, timeline of the cold start); missing
+     checkout → WARN with the exact `git clone --depth=1` staging command,
+     engine run unprofiled. Profile `--timeout` MUST equal the health
+     timeout: on timeout the profiler KILLS the engine;
+   - runs one verification bench (C=16, n=64) **after `/health` and before
+     otela registration** so mesh traffic never pollutes it; write the JSON
+     into `$RUNDIR` (`--into coldstart.node0.json` when profiling was active
+     so startup timeline and bench live in one artifact), non-fatal (WARN +
+     register anyway). `SERVEKIT_BENCH=0` must skip it entirely.
+   Canonical implementation: the kimi-k3 recipes
+   (`deployments/llm/clariden/kimi-k3/serve_kimi_k3_otela_clariden.sbatch`
+   enroot/EDF; `deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch`
+   Apptainer — note the explicit `env PYTHONPATH=...` inside the container
+   exec). Full protocol: `meta/bench/README.md` (C=1 trap, words-vs-tokens
+   input-len, reporting checklist).
 
 ## Recipe anatomy (in sbatch order)
 
@@ -67,7 +91,9 @@ heredoc helpers into `$RUNDIR` from inside the sbatch.
 5. Heredoc `$RUNDIR/engine.sh`: per-rank env (NCCL/GLOO iface, socket family,
    IB retry knobs, cache dirs), then `exec <container> serve ...`.
 6. Heredoc otela config + worker script; start the worker only **after**
-   `/health` answers, in the background, with a generous timeout.
+   `/health` answers, in the background, with a generous timeout — and run
+   the servekit verification bench between the health barrier and the worker
+   start (convention 6).
 7. `trap` on EXIT/TERM/INT to stop the otela worker with a **signal (TERM),
    never SIGKILL** — a killed peer stays `connected: true` in the registry and
    the head round-robins traffic into a dead endpoint. Wait for the graceful
@@ -97,6 +123,9 @@ Match `deployments/llm/beverin/glm47-flash/README.md`:
 ## Done checklist
 
 - [ ] `bash -n` passes; recipe ran end-to-end on the target site at defaults
+- [ ] servekit verification bench printed its throughput line before the
+      otela worker registered, and `$RUNDIR/coldstart.node*.json` exists
+      (or the missing-checkout WARN path was exercised instead)
 - [ ] every `#SBATCH` value and env default derived on-site, with HOW noted
 - [ ] each site workaround has a verbatim-error comment; cross-referenced from
       the README's numbered fixes

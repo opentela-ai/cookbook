@@ -37,9 +37,11 @@
 #   2. srun's one sglang engine rank per node INSIDE the kimi-k3-clariden
 #      container (enroot/EDF), forming a single distributed TP4 x PP<NNODES>
 #      engine. Only rank 0 (head) serves HTTP.
-#   3. once the head's /health answers, starts ONE otela WORKER — also inside
-#      the container, on the head node via srun --overlap --gres=none — which
-#      registers the `llm` service with the OpenTela mesh
+#   3. once the head's /health answers, runs the servekit verification bench
+#      (pre-registration, so mesh traffic can't pollute it; SERVEKIT_BENCH=0
+#      skips), then starts ONE otela WORKER — also inside the container, on
+#      the head node via srun --overlap --gres=none — which registers the
+#      `llm` service with the OpenTela mesh
 #   4. on job end / scancel, SIGTERM (never KILL) the otela step so it
 #      announces LEFT cleanly
 #
@@ -63,8 +65,10 @@
 # (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only supports RDMA
 # transport protocol"). See the README's fix 2 for the details.
 #
-# Verified performance (job 3000965, 2026-08-04, 8 nodes TP4xPP8, bench.py
-# protocol: 1024-in / 256-out, warmup discarded, HiCache OFF):
+# Verified performance (job 3000965, 2026-08-04, 8 nodes TP4xPP8; measured
+# with the legacy meta/bench/bench.py — the cookbook harness is now
+# meta/bench/cbench.sh (servekit bench), same protocol: 1024-in / 256-out,
+# warmup discarded, HiCache OFF):
 #   C=1  -> 34.7 tok/s   (single-request decode)
 #   C=16 -> 374.9 tok/s  aggregate
 #   C=32 -> 561.4 tok/s  aggregate  <- operating point; curve flattens here
@@ -224,9 +228,31 @@ OTELA_API_PORT="${OTELA_API_PORT:-18094}"
 # (UNBALANCED_MODEL_LOADING_TIMEOUT_S=3600) is what actually prevents the
 # load barrier from killing slow PP groups, but the health check must also
 # wait long enough for the server to answer.
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-9000}"
+export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-9000}"
 
-RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
+# ------------------------------------------------------------- servekit -----
+# servekit (github.com/eth-easl/servekit) provides two things here:
+#   1. cold-start profiling: engine.sh wraps `sglang serve` with
+#      `servekit profile`, which echoes the engine log unmodified into the
+#      job log and writes a per-phase startup breakdown to
+#      $RUNDIR/coldstart.node<RANK>.json when that node reports ready (the
+#      head's row lands at full readiness).
+#   2. verification bench: after /health answers and BEFORE otela
+#      registration (so mesh traffic can't pollute the numbers), a fixed
+#      servekit bench runs inside the container on the head and is merged
+#      into the profile report. Protocol: meta/bench/README.md.
+# Pure stdlib -> run module-style from this checkout (PYTHONPATH); no pip
+# install inside the image. Missing checkout: run unwrapped, skip the bench
+# (preflight prints the staging command).
+export SERVEKIT_DIR="${SERVEKIT_DIR:-$DEPLOY_DIR/servekit}"
+export SERVEKIT_BENCH="${SERVEKIT_BENCH:-1}"              # 0 skips the auto-bench
+export SERVEKIT_BENCH_REQUESTS="${SERVEKIT_BENCH_REQUESTS:-64}"
+export SERVEKIT_BENCH_CONCURRENCY="${SERVEKIT_BENCH_CONCURRENCY:-16}"
+export SERVEKIT_BENCH_IN="${SERVEKIT_BENCH_IN:-768}"      # words (~1024 tokens)
+export SERVEKIT_BENCH_OUT="${SERVEKIT_BENCH_OUT:-256}"    # tokens, ignore_eos
+export SERVEKIT_BENCH_CORRECTNESS="${SERVEKIT_BENCH_CORRECTNESS:-1}"
+
+export RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
 PATCH_DIR="$DEPLOY_DIR/patches"
 mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
          "$PATCH_DIR"
@@ -276,6 +302,13 @@ echo "[$(date -Is)] hicache: enable=$HICACHE_ENABLE ratio=$HICACHE_RATIO policy=
   echo "       Stage an arm64 build on a login node, e.g.:" >&2
   echo "         mkdir -p $OTELA_DIR && cp /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64 $OTELA_BIN && chmod +x $OTELA_BIN" >&2
   exit 1
+}
+# servekit is OPTIONAL (cold-start profile + pre-registration bench). Missing
+# checkout -> warn loudly and run unwrapped; never fail the job over it.
+[ -d "$SERVEKIT_DIR/src/servekit" ] || {
+  echo "WARN: servekit checkout not found: $SERVEKIT_DIR — no cold-start" >&2
+  echo "      profile, no auto-bench. Stage it once on a login node:" >&2
+  echo "        git clone --depth=1 https://github.com/eth-easl/servekit $SERVEKIT_DIR" >&2
 }
 
 # --- container preflight (1 node, no GPUs, ~20 s) -----------------------
@@ -354,6 +387,23 @@ export PYTHONPATH="${PATCH_DIR:-/capstor/scratch/cscs/xyao/kimi-k3/patches}:${PY
 # Verify the monkey-patch will take effect in this process tree
 python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_utils as m; print('[rank '$RANK'] UNBALANCED_MODEL_LOADING_TIMEOUT_S =', m.UNBALANCED_MODEL_LOADING_TIMEOUT_S)" 2>/dev/null || true
 
+# servekit profile wraps the engine: it echoes sglang's log unmodified below
+# and writes a per-phase cold-start breakdown to $RUNDIR/coldstart.node<RANK>.json
+# once THIS node reports ready (head: "The server is fired up..."; workers:
+# sglang's multi-node "Dummy health check server started" line — if a future
+# image stops printing it, workers stay unprofiled and the profiler would
+# terminate them at --timeout; check coldstart.node<R>.json after image
+# bumps). Timeout semantics: profile KILLS the engine on expiry, so
+# --timeout must track $HEALTH_TIMEOUT — never set it shorter.
+PROFILE=()
+if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
+  export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
+  PROFILE=(python3 -m servekit.cli profile --out "${RUNDIR}/coldstart.json"
+           --timeout "${HEALTH_TIMEOUT:-9000}" --)
+else
+  echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold start unprofiled" >&2
+fi
+
 HICACHE_ARGS=()
 if [ "${HICACHE_ENABLE:-0}" = "1" ]; then
   HICACHE_ARGS+=(--enable-hierarchical-cache
@@ -369,7 +419,7 @@ fi
 # FlashMLABackend imports only sgl_kernel.flash_mla and inherits prefill from
 # FlashInferMLAAttnBackend. Do NOT apply --mamba-ssm-dtype bfloat16: SM90 uses
 # float32 KDA state (FlashInfer GDN bf16 is SM100+ only).
-exec sglang serve \
+exec ${PROFILE[@]+"${PROFILE[@]}"} sglang serve \
   --trust-remote-code \
   --model-path "$MODEL_PATH" \
   --served-model-name "$SERVED_MODEL_NAME" \
@@ -496,6 +546,27 @@ trap 'stop_otela' EXIT TERM INT
     [ $SECONDS -ge $deadline ] && { echo "[$(date -Is)] health timeout; not registering" >&2; exit 1; }
     sleep 20
   done
+  # Verification bench BEFORE registration: otela traffic must not pollute
+  # the numbers. Stdlib-only servekit runs inside the container, module-style
+  # from the checkout (the EDF clears PYTHONPATH, hence the explicit env).
+  # When the head's cold-start profile report exists, the bench is merged
+  # into it (--into) as one verified artifact: profile + throughput.
+  if [ "${SERVEKIT_BENCH:-1}" = "1" ] && [ -d "$SERVEKIT_DIR/src/servekit" ]; then
+    echo "[$(date -Is)] engine healthy — servekit bench C=$SERVEKIT_BENCH_CONCURRENCY n=$SERVEKIT_BENCH_REQUESTS (SERVEKIT_BENCH=0 to skip)"
+    BENCH_ARGS=(--url "http://127.0.0.1:$SERVE_PORT"
+                --requests "$SERVEKIT_BENCH_REQUESTS" --concurrency "$SERVEKIT_BENCH_CONCURRENCY"
+                --input-len "$SERVEKIT_BENCH_IN" --output-len "$SERVEKIT_BENCH_OUT")
+    [ "${SERVEKIT_BENCH_CORRECTNESS:-1}" = "1" ] || BENCH_ARGS+=(--no-correctness)
+    if [ -f "$RUNDIR/coldstart.node0.json" ]; then
+      BENCH_ARGS+=(--into "$RUNDIR/coldstart.node0.json")
+    else
+      BENCH_ARGS+=(--out "$RUNDIR/bench.json")
+    fi
+    srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
+         -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+         env "PYTHONPATH=$SERVEKIT_DIR/src" python3 -m servekit.cli bench "${BENCH_ARGS[@]}" \
+      || echo "[$(date -Is)] WARN: servekit bench failed; registering anyway" >&2
+  fi
   echo "[$(date -Is)] engine healthy — starting otela worker on $HEAD"
   # Redirect INSIDE the container (not via srun's pipe) to avoid srun
   # output buffering that hides otela log lines until the buffer fills.
