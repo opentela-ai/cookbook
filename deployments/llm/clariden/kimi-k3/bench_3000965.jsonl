@@ -1,0 +1,8 @@
+{"tag": "warmup", "concurrency": 4, "n": 8, "note": "discarded"}
+{"tag": "warmup", "model": "moonshotai/Kimi-K3", "concurrency": 4, "n": 8, "wall_s": 22.2, "in_tok_avg": 1716, "out_tok_total": 2048, "agg_out_tok_s": 92.2, "per_req_out_tok_s": 24.0, "lat_p50_s": 13.2, "lat_max_s": 13.6}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 1, "n": 8, "wall_s": 59.0, "in_tok_avg": 1716, "out_tok_total": 2048, "agg_out_tok_s": 34.7, "per_req_out_tok_s": 34.7, "lat_p50_s": 7.4, "lat_max_s": 7.5}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 4, "n": 16, "wall_s": 39.5, "in_tok_avg": 1716, "out_tok_total": 4096, "agg_out_tok_s": 103.8, "per_req_out_tok_s": 25.9, "lat_p50_s": 9.9, "lat_max_s": 10.0}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 8, "n": 32, "wall_s": 41.4, "in_tok_avg": 1716, "out_tok_total": 8192, "agg_out_tok_s": 198.1, "per_req_out_tok_s": 24.8, "lat_p50_s": 10.4, "lat_max_s": 10.5}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 16, "n": 48, "wall_s": 32.8, "in_tok_avg": 1716, "out_tok_total": 12288, "agg_out_tok_s": 374.9, "per_req_out_tok_s": 23.4, "lat_p50_s": 10.9, "lat_max_s": 11.2}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 32, "n": 64, "wall_s": 29.2, "in_tok_avg": 1716, "out_tok_total": 16384, "agg_out_tok_s": 561.4, "per_req_out_tok_s": 17.6, "lat_p50_s": 14.6, "lat_max_s": 14.7}
+{"tag": "measured", "model": "moonshotai/Kimi-K3", "concurrency": 64, "n": 96, "wall_s": 43.9, "in_tok_avg": 1716, "out_tok_total": 24576, "agg_out_tok_s": 559.3, "per_req_out_tok_s": 11.7, "lat_p50_s": 29.2, "lat_max_s": 29.3}

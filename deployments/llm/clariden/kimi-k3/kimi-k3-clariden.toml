@@ -1,0 +1,49 @@
+# Kimi-K3 on clariden (GH200 / sm_90, aarch64). The image is
+# docker://lmsysorg/sglang:kimi-k3 (CUDA 13, sm_90 cubins present) imported to a
+# local .sqsh so an 8-node job does not re-pull per node. See build_kimi_k3_image.sbatch
+# (run once on a login node) to produce the .sqsh this points at.
+#
+# Why CUDA-13 variant: the SGLang Kimi-K3 image (lmsysorg/sglang:kimi-k3) is
+# CUDA 13, and CSCS ships the aws-ofi-ccl NCCL plugin in CUDA-major variants
+# under /opt/cscs/aws-ofi-ccl-plugin/{cuda12,cuda13}/libnccl-net.so. The
+# annotation below selects cuda13 to match the image; the CSCS Slurm enroot
+# hook injects that plugin + libfabric CXI provider into the container at start,
+# giving NCCL the native Slingshot transport (no InfiniBand verbs on clariden).
+image = "/capstor/scratch/cscs/xyao/kimi-k3/images/sglang-kimi-k3.aarch64.sqsh"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/kimi-k3"
+
+[env]
+# Per-rank HOME on /capstor (NOT /users — quota-limited NFS). otela writes a
+# libp2p identity + a badger DB under $HOME/.config/opentela / $HOME/.ocfcore;
+# a shared HOME across ranks/jobs collides, and a quota HOME eventually returns
+# ESTALE which freezes the CRDT (the JSC recipe documents this failure in
+# detail). The serve script overrides this per rank (SLURM_PROCID); the value
+# here is the base for rank 0 / single-rank runs.
+HOME = "/capstor/scratch/cscs/xyao/kimi-k3/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/kimi-k3/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/kimi-k3/cache/xdg"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/kimi-k3/cache/triton"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+PYTHONNOUSERSITE = "1"
+PYTHONPATH = ""
+NCCL_DEBUG = "WARN"
+
+[annotations]
+# com.hooks.aws_ofi_nccl is the CSCS Slurm/enroot hook that, at container start,
+# LD_PRELOAD's /opt/cscs/aws-ofi-ccl-plugin/<variant>/libnccl-net.so and wires
+# libfabric (CXI provider, /opt/cray/libfabric) so NCCL runs over Slingshot.
+# Without it NCCL falls back to TCP sockets over hsn0 — works for PP pipeline
+# P2P but is much slower and cannot do cross-node allreduce in a CUDA graph
+# (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only supports RDMA
+# transport protocol"). variant MUST match the image's CUDA major.
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda13"
