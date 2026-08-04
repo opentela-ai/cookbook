@@ -1,0 +1,3 @@
+# Runtime state (logs, otela config/pid, last_service.env, downloaded
+# binaries, pulled model blobs) — all created by the scripts under ./run/.
+/run/
