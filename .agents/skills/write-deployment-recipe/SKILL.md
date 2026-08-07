@@ -26,6 +26,11 @@ deployments/<service-kind>/<site>/<model>/
 └── README.md                     # why-this-site + workarounds + submit/verify/knobs
 ```
 
+If the cookbook already has an `rcc` profile for the site, also document how
+to submit/monitor the recipe with `rcc` in the README. Add a new
+`.rcc/config.toml` profile at the repository root when the site is new to the
+cookbook (see `manage-opentela-fleet/references/rcc-integration.md`).
+
 Sibling scripts are allowed only when the step genuinely cannot run in the
 job body (e.g. building an image needs a login node with egress). Otherwise
 heredoc helpers into `$RUNDIR` from inside the sbatch.
@@ -115,10 +120,42 @@ Match `deployments/llm/beverin/glm47-flash/README.md`:
 3. **Site-specific fixes (all baked into the sbatch)** — numbered list; each
    entry: symptom with the verbatim error, root cause, fix. This is the most
    valuable section; write it as you hit failures, not after.
-4. **Files** table. 5. **Submit** (copy-paste commands). 6. **Verify**
-   (commands that were actually executed, including log lines to look for and
-   what "requests are being routed in" looks like). 7. **Knobs** — every env
-   override with its default.
+4. **Files** table.
+5. **Submit** — copy-paste commands for the login node, plus a **"From your
+   local machine via `rcc`"** subsection when the site is in the cookbook's
+   `.rcc/config.toml`. The rcc subsection should include:
+   - `rcc --profile <site> push` (sync)
+   - `rcc --profile <site> job submit <path-to-sbatch>` (submit)
+   - `rcc --profile <site> job status <JOBID>` and `job tail <JOBID> -f`
+     (monitor)
+   - any site-specific `rcc --profile <site> run -- ...` commands needed
+     before submit (e.g. Euler's login-node relay).
+6. **Verify** — commands that were actually executed, including log lines to
+   look for and what "requests are being routed in" looks like. Add rcc
+   alternatives for log tailing and health checks where it is supported, so
+   users do not need a second SSH session.
+7. **Knobs** — every env override with its default.
+
+## `rcc` workflow for recipe authors
+
+When a recipe targets a site that already has an `rcc` profile:
+
+```bash
+# from the cookbook repository root
+rcc --profile <site> push
+rcc --profile <site> job submit deployments/<service-kind>/<site>/<model>/serve_<thing>.sbatch
+
+# monitor
+rcc --profile <site> job status <JOBID>
+rcc --profile <site> job tail <JOBID> -f
+
+# run a one-off command on the login node (e.g. inspect logs)
+rcc --profile <site> run -- tail -f <log-path>
+```
+
+When the site is new, add a `[profiles.<site>]` entry to the root
+`.rcc/config.toml` first, then exercise `rcc --profile <site> push` and
+`rcc --profile <site> run -- sinfo` before declaring the recipe done.
 
 ## Done checklist
 
@@ -131,3 +168,7 @@ Match `deployments/llm/beverin/glm47-flash/README.md`:
       the README's numbered fixes
 - [ ] failure paths print exact fix commands
 - [ ] README Verify commands were executed and output sanity-checked
+- [ ] if the site is in the cookbook `.rcc/config.toml`, README contains
+      a working "From your local machine via `rcc`" Submit/Verify section and
+      `rcc --profile <site> push` + `rcc --profile <site> job submit` were
+      tested end-to-end

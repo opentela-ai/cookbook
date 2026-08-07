@@ -328,4 +328,37 @@ for _rel, _adds in [
     open(_qp, "w").write(_qs[: len(_SPDX)] + "\n" + _block + _qs[len(_SPDX) :])
     print(f"quant-fix applied: {_rel}", flush=True)
 
+# --- patch 7: enable -D__Float4_e2m1fn_x2 on gfx942 (job 581813 lesson) ---
+# The AITER JIT framework (jit/core.py:881) deliberately EXCLUDES gfx942
+# from -D__Float4_e2m1fn_x2:
+#
+#     if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+#         flags_hip += ["-D__Float4_e2m1fn_x2"]
+#
+# This compiles out the fp4x2 output path in quant_kernels.cu (lines 788,
+# 823, 938, 1106, 1453, 1671, 1979), causing a runtime crash:
+#   "operator() not support output type: fp4x2"
+# when per_1x32_mx_quant_hip (K3 MXFP4 MoE activation quant) is called.
+#
+# The fix: remove the `get_gfx() != "gfx942"` condition so the flag is
+# added on ALL archs (including gfx942).  This is SAFE because:
+#   - The fp4x2 quant kernel (opus::fp4_t) does bit manipulation, not
+#     hardware MXFP4 instructions
+#   - --offload-arch=native still compiles for real gfx942 hardware
+#   - get_gfx_runtime() (used for runtime dispatch) is unaffected
+#   - Only affects JIT BUILD flags, not any runtime get_gfx() checks
+_JIT_REL = "jit/core.py"
+_jt = os.path.join(DST, _JIT_REL)
+_sh.copy(os.path.join(SRC, _JIT_REL), _jt)  # fresh copy -> deterministic
+_js = open(_jt).read()
+_OLD_JIT = '        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:'
+_NEW_JIT = '        if int(os.getenv("AITER_FP4x2", "1")) > 0:  # K3_gfx942_fp4x2: enable fp4x2 quant on all archs'
+if "K3_gfx942_fp4x2" in _js:
+    print("jit/core.py fp4x2 patch already applied", flush=True)
+else:
+    assert _OLD_JIT in _js, "expected get_gfx() != gfx942 condition in jit/core.py"
+    open(_jt, "w").write(_js.replace(_OLD_JIT, _NEW_JIT, 1))
+    ast.parse(open(_jt).read())
+    print("jit/core.py fp4x2 patch applied (K3_gfx942_fp4x2)", flush=True)
+
 print("PATCH_OK", flush=True)

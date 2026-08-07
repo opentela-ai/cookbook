@@ -133,6 +133,25 @@ Two integration patterns:
    change in the `otela-fleet` package; the cluster-config mapping is documented
    in [references/rcc-integration.md](references/rcc-integration.md).
 
+### Common `rcc` commands
+
+```bash
+# sync local project to the remote scratch directory
+rcc --profile <cluster> push
+
+# submit a self-contained recipe directly (no otela-fleet)
+rcc --profile <cluster> job submit deployments/llm/<site>/<model>/serve_*.sbatch
+
+# list, inspect, stream logs, cancel
+rcc --profile <cluster> job list
+rcc --profile <cluster> job status <JOBID>
+rcc --profile <cluster> job tail <JOBID> -f
+rcc --profile <cluster> job cancel <JOBID>
+
+# run an arbitrary command on the login node
+rcc --profile <cluster> run -- sinfo -p <partition>
+```
+
 See [references/rcc-integration.md](references/rcc-integration.md) for example
 `.rcc/config.toml` files per site and the exact command mapping.
 
