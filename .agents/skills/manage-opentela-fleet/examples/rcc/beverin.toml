@@ -1,0 +1,23 @@
+# rcc profile for CSCS Alps — Beverin (MI300A, x86_64, Slingshot, enroot/EDF).
+# Copy/edit this file into your project as .rcc/config.toml, or merge the
+# [profiles.beverin] block into an existing .rcc/config.toml.
+#
+# Beverin compute nodes have full outbound internet and reach the OpenTela
+# bootstrap directly; no relay is needed.
+
+default = "beverin"
+
+[profiles.beverin]
+host = "beverin-login"          # CHANGE: actual Beverin login hostname
+remote_dir = "/capstor/scratch/.../opentela-fleet"   # CHANGE: project scratch dir
+
+[profiles.beverin.env]
+HF_HOME = "/capstor/scratch/.../models"          # CHANGE
+TRITON_CACHE_DIR = "/capstor/scratch/.../cache/triton"   # CHANGE
+
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]

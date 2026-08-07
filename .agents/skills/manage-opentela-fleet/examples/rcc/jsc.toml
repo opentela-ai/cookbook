@@ -1,0 +1,26 @@
+# rcc profile for JSC Jupiter Booster (Juwels Booster).
+# Copy/edit this file into your project as .rcc/config.toml, or merge the
+# [profiles.jsc] block into an existing .rcc/config.toml.
+#
+# HOW TO DERIVE THE REAL VALUES:
+#   host        -> the JSC login node you SSH to (e.g. jureca.fz-juelich.de)
+#   remote_dir  -> a project path on JSC scratch that survives between jobs
+#   HF_HOME / TRITON_CACHE_DIR -> your JSC scratch model + cache paths
+
+default = "jsc"
+
+[profiles.jsc]
+host = "jsc-login"              # CHANGE: actual JSC login hostname
+remote_dir = "/p/project/.../opentela-fleet"   # CHANGE: project scratch dir
+
+[profiles.jsc.env]
+HF_HOME = "/p/scratch/.../models"              # CHANGE
+TRITON_CACHE_DIR = "/p/scratch/.../cache/triton"   # CHANGE
+
+# Job-owned paths that must survive `rcc push --delete` / `rcc push --mirror`.
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]

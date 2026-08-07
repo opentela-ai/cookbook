@@ -73,6 +73,8 @@ done manually unless tuning.
 
 ## Submit
 
+### From the login node (SSH)
+
 ```bash
 # default: 1 node, TP=4, served as zai-org/GLM-4.7-Flash
 sbatch serve_glm_47_flash_sglang.sbatch
@@ -81,19 +83,42 @@ sbatch serve_glm_47_flash_sglang.sbatch
 sbatch --nodes=4 serve_glm_47_flash_sglang.sbatch
 ```
 
+### From your local machine via `rcc`
+
+The repository ships a project-local `.rcc/config.toml` with a `beverin`
+profile that syncs to `/capstor/scratch/cscs/xyao/opentela-cookbook` and
+submits through the `beverin` SSH alias (configured in `~/.ssh/config`).
+
+```bash
+# one-time: sync local code and this recipe to Beverin
+rcc --profile beverin push
+
+# submit the GLM-4.7-Flash job
+rcc --profile beverin job submit deployments/llm/beverin/glm47-flash/serve_glm_47_flash_sglang.sbatch
+
+# monitor
+rcc --profile beverin job status <JOBID>
+rcc --profile beverin job tail <JOBID> -f
+
+# run commands on the login node, e.g. inspect logs
+rcc --profile beverin run -- tail -f /capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/logs/opentela-<JOBID>-0.log
+```
+
 First run pulls ~26 GiB into `$SCRATCH/.edf_imagestore` (shared, cached for
 every later job). To pre-warm from the login node:
 
 ```bash
-enroot import docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x
+rcc --profile beverin run -- bash -lc \
+  'enroot import -o $SCRATCH/.edf_imagestore/sglang+sglang+v0.5.16-rocm720-mi30x.x86_64.sqsh docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x'
 ```
 
 ## Verify
 
-This is a **local deployment on the Alps mesh** — the bootstrap
-`/ip4/148.187.108.178/...` is a peer running on Alps itself, not the public
-`api.opentela.ai`. The compute nodes' `:8080` is not routable from the login
-node, so health checks run from inside the allocation.
+This is a **local deployment on the OpenTela mesh** — the bootstrap
+`/ip4/140.238.223.116/...` is the public OpenTela bootstrap. The compute
+nodes' `:8080` is not routable from the login node, so health checks run from
+inside the allocation. Override `OPENTELA_BOOTSTRAP` to use the old Alps peer
+`/ip4/148.187.108.178/...` if needed.
 
 ```bash
 # job + per-rank OpenTela logs (look for: opentela_started, sglang_ready,
@@ -101,9 +126,15 @@ node, so health checks run from inside the allocation.
 # in from other peers on the mesh)
 tail -f /capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/logs/opentela-<JOB>-*.log
 
+# via rcc from your local machine:
+rcc --profile beverin run -- tail -f /capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/logs/opentela-<JOB>-0.log
+
 # direct SGLang health from inside the allocation (login node can't reach it):
-srun -p mi300 -A a-infra02 -N1 -n1 --time=00:02:00 --overlap \
-  bash -lc 'curl -s http://nid00XXXXX:8080/get_model_info | python3 -m json.tool'
+srun --jobid=<JOB> --overlap bash -lc 'curl -s http://127.0.0.1:8080/v1/models | python3 -m json.tool'
+
+# via rcc from your local machine (run on the compute node inside the job):
+rcc --profile beverin run -- bash -lc \
+  'srun --jobid=<JOB> --overlap bash -lc "curl -s http://127.0.0.1:8080/v1/models | python3 -m json.tool"'
 
 # once a peer is registered, other peers on the mesh route to it; test from
 # any peer that can reach the local OpenTela head:

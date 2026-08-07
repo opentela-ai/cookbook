@@ -9,7 +9,7 @@ is the cluster name used in every command. Canonical source:
 | Field | Purpose |
 |---|---|
 | `name` | cluster identifier |
-| `ssh.host` | SSH hostname for relay operations |
+| `ssh.host` | SSH hostname for relay operations (must match the `host` in the `rcc` profile when using `remote-cluster-controller` as transport) |
 | `arch` | `amd64` or `arm64` (which otela binary to deploy) |
 | `binary.local_path` | local path to the otela binary |
 | `binary.remote_path` | remote path to deploy the binary |
@@ -137,6 +137,12 @@ presets:
   `modules:` for the scheduler environment.
 - **`modules:`** lists environment modules to load on the cluster (e.g.
   `GCC`, `CUDA/12`); optional and cluster-specific.
+- **`remote_cluster_controller` / `rcc` transport**: instead of direct SSH,
+  `otela-fleet` can shell out to
+  [remote-cluster-controller](https://github.com/ResearchComputer/remote-cluster-controller).
+  Set `ssh.host` to the same host used by the `rcc` profile so the two tools
+  target the same login node. See [rcc-integration.md](rcc-integration.md) for
+  example `.rcc/config.toml` files and the native-backend mapping.
 
 When you add a brand-new cluster, derive every field on-site (partition,
 account, scratch paths, NIC names for `NCCL_SOCKET_IFNAME`, whether the relay

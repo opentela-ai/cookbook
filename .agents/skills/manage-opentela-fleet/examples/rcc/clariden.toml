@@ -1,0 +1,23 @@
+# rcc profile for CSCS Alps — Clariden (GH200, aarch64, Slingshot, enroot/EDF).
+# Copy/edit this file into your project as .rcc/config.toml, or merge the
+# [profiles.clariden] block into an existing .rcc/config.toml.
+#
+# Clariden compute nodes reach the public OpenTela bootstrap directly, so no
+# login-node relay is needed.
+
+default = "clariden"
+
+[profiles.clariden]
+host = "clariden-login"         # CHANGE: actual Clariden login hostname
+remote_dir = "/capstor/scratch/.../opentela-fleet"   # CHANGE: project scratch dir
+
+[profiles.clariden.env]
+HF_HOME = "/capstor/scratch/.../models"          # CHANGE
+TRITON_CACHE_DIR = "/capstor/scratch/.../cache/triton"   # CHANGE
+
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]

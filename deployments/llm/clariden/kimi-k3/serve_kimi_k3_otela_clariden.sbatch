@@ -79,9 +79,11 @@
 # -----------------------------------------------------------------------------
 # NO RELAY (direct mesh, like Beverin)
 # -----------------------------------------------------------------------------
-# Clariden compute nodes reach the Alps OpenTela bootstrap
-# /ip4/148.187.108.178/... directly (verified: `cat < /dev/null >
-# /dev/tcp/148.187.108.178/43905` succeeds from a compute node). So the worker
+# Clariden compute nodes reach the public OpenTela bootstrap
+# /ip4/140.238.223.116/... directly. (The previous Alps peer
+# /ip4/148.187.108.178/... was verified reachable from a compute node via
+# `cat < /dev/null > /dev/tcp/148.187.108.178/43905`; re-verify egress to
+# 140.238.223.116:43905 the same way before the first run.) So the worker
 # dials the bootstrap directly — no us-managed login-node relay (unlike JSC,
 # whose compute nodes have no outbound internet).
 #
@@ -160,10 +162,73 @@ export MEM_FRAC="${MEM_FRAC:-0.90}"
 # where SGLANG_HOST_IP is read from. The ofi plugin handles the data path over
 # CXI independently of this setting.
 export K3_NIC="${K3_NIC:-hsn0}"
-# PyTorch distributed init + Store.wait() timeout (seconds). NOT passed to
-# sglang by default — the proven run (2920471) had dist_timeout=None (torch
-# default 1800 s). Add to SGLANG_EXTRA_ARGS if you need a shorter one.
-export DIST_TIMEOUT="${DIST_TIMEOUT:-600}"
+# PyTorch distributed init + Store.wait() timeout (seconds), AND — via
+# sglang's --dist-timeout -> init_process_group(timeout=...) -> the default
+# for every ProcessGroupNCCL collective — the NCCL operation-watchdog floor.
+# That floor is what killed clariden job 3018155 (fix 12): a PP pipeline
+# SEND (SeqNum=3678376, NumelIn=3584) stalled at 16:08:43 after 5h20m of
+# healthy serving, and the ProcessGroupNCCL watchdog tripped at 600 s
+# (sglang's DEFAULT dist-timeout, which this recipe used to NOT pass) and
+# aborted every rank ~5.5 h before the sglang scheduler watchdog (fix 11,
+# 3600 s) could ride it out. Default now 3600 so the NCCL floor matches the
+# scheduler watchdog; the SOFT_WATCHDOG_TIMEOUT dump (600 s, no crash) is
+# the first diagnostic. SGLANG_EXTRA_ARGS="--dist-timeout N" (which comes
+# later on the cmdline) overrides this for a shorter collective failure.
+export DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
+
+# --- Scheduler watchdog: survive transient PP-broadcast stalls ------------
+# sglang's HARD scheduler watchdog (ServerArgs.watchdog_timeout, default 300 s,
+# soft=False) raises on any forward batch that runs longer than the limit, and
+# that raise KILLS the whole distributed engine. Verified the hard way on
+# clariden job 3002366 (1M, TP4xPP8): the engine served healthy 04:20->12:24
+# (steady decode ~100 tok/s, cuda graph True, POST /v1 200 OK through 12:23:53),
+# then at 12:29:35 EVERY PP stage tripped simultaneously:
+#     [2026-08-05 12:29:35 PP2 TP3 EP3] Scheduler watchdog timeout
+#        (self.watchdog_timeout=300, self.soft=False)
+#     ... (PP2 TP1, PP7 TP2, PP7 TP3, ...) -> 16 tracebacks total.
+# The blocked scheduler thread was in torch.distributed.broadcast_pyobj ->
+# _broadcast_reqs_across_ranks (scheduler_components/request_receiver.py) ->
+# recv_requests -> event_loop_pp, i.e. the per-iteration PP request-metadata
+# broadcast hung >300 s. The raise tore the engine down; otela could not
+# announce LEFT ("WARN: otela did not announce LEFT") -> stale registry row.
+# Root cause of THAT particular stall is TODO(unverified) (Slingshot/CXI
+# hiccup after 8 h? a specific request?), but a >5-min hard kill on a
+# healthy 8 h-serving engine is the same anti-pattern this recipe already
+# rejects for weight loading (see the UNBALANCED_MODEL_LOADING_TIMEOUT_S
+# 480->3600 patch + README op-notes: "transient pauses are normal — check
+# before killing").
+#
+# FIX (flags verified via `sglang serve --help` in this aarch64 image):
+#   --watchdog-timeout      HARD: "the server will crash to prevent hanging".
+#                           Raised to 3600 s so a transient distributed
+#                           stall rides out (1 h matches the load-barrier
+#                           precedent); a true permanent hang still dies in
+#                           finite time instead of leaving a zombie serving.
+#   --soft-watchdog-timeout SOFT: "the server will dump information for
+#                           debugging". At 600 s it dumps a stack trace (like
+#                           the one that diagnosed 3002366) WITHOUT crashing,
+#                           so the next stall is diagnosable even when the
+#                           engine survives it. Keep soft < hard.
+export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-3600}"
+export SOFT_WATCHDOG_TIMEOUT="${SOFT_WATCHDOG_TIMEOUT:-600}"
+
+# --- NCCL process-group watchdog (fix 12: clariden job 3018155) ------------
+# Fix 11 raised only sglang's SCHEDULER watchdog. 3018155 proved that is NOT
+# the only watchdog that can tear the engine down on the same transient PP
+# stall: PyTorch's ProcessGroupNCCL::Watchdog has its own timeout, taken
+# from init_process_group(timeout=...) == sglang --dist-timeout (default
+# 600 s). With the recipe not passing --dist-timeout, the NCCL floor sat at
+# 600 s and fired ~5.5 h before the scheduler watchdog (3600 s) would have.
+# Symptom: "Watchdog caught collective operation timeout: WorkNCALL(...,
+# OpType=SEND, NumelIn=3584, Timeout(ms)=600000) ran for 600003 milliseconds"
+# -> "Fatal Python error: Aborted" on every rank -> "Connection closed by
+# peer [172.28.46.x]" cascade -> "WARN: otela did not announce LEFT". The
+# DuplicateTimeseries/OSError lines that follow are red herrings (a sglang
+# HTTP restart dying on the already-registered prometheus registry + the
+# quota-/users tmpdir cleanup of fix 8). Fix: pass --dist-timeout
+# $DIST_TIMEOUT (default 3600 above) so the NCCL floor matches the
+# scheduler watchdog; a transient send/recv stall now rides out at 10 min
+# and the SOFT_WATCHDOG_TIMEOUT dump is the first signal, not a kill.
 
 # --- Weight-loading barrier tolerance (fixes clariden job 2999818) --------
 # sglang's dist_barrier_after_load calls dist.monitored_barrier(group=
@@ -192,8 +257,18 @@ export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
 # are confirmed present in this aarch64 image.
 #
 # HICACHE: off by default to match the proven run (2920471, HICACHE=0).
-# The upstream sglang default is 1, but HiCache=1 is UNTESTED for K3 on
-# Clariden -- re-enable only after a successful end-to-end cold start.
+#
+# HiCache is an OPT-IN on this image (verified 2026-08-05, jobs
+# 3008263/3009024/3010201). It boots cleanly, adds no measured throughput cost,
+# and uses ~59 GB/node LPDDR at ratio 1.0 with the default 3.73M-token HBM
+# pool. The host tier is an LRU extension of the radix cache: post-eviction
+# hits are dramatic with a capped pool (0.27 s vs 1.90 s), but at full scale a
+# large unique flood can LRU-flush even hot prefixes. Leave HICACHE_ENABLE=0
+# unless you need the extra cache headroom.
+#   - HICACHE_WRITE_POLICY=write_back is the ONLY working policy on this
+#     image: write_through_selective never backs up (hit-count trigger is
+#     dead in the UnifiedRadixCache hybrid-SSM path) -- do not use it.
+# Defaults below are ratio 1.0, policy write_back; enable with HICACHE_ENABLE=1.
 #
 # NOTE: weight loading from /capstor (Lustre) has WIDE within-node variance
 # (up to 1555 s observed in the proven run 2920471). If the slowest rank in a
@@ -201,8 +276,8 @@ export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
 # the job — see the UNBALANCED_MODEL_LOADING_TIMEOUT_S patch below. A job
 # that appears frozen at a shard is almost certainly still loading.
 export HICACHE_ENABLE="${HICACHE_ENABLE:-0}"
-export HICACHE_RATIO="${HICACHE_RATIO:-2.0}"
-export HICACHE_WRITE_POLICY="${HICACHE_WRITE_POLICY:-write_through_selective}"
+export HICACHE_RATIO="${HICACHE_RATIO:-1.0}"
+export HICACHE_WRITE_POLICY="${HICACHE_WRITE_POLICY:-write_back}"
 export HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
 
 # ------------------------------------------------------------------- otela ----
@@ -215,7 +290,7 @@ export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
 export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela-arm64}"
 # Shared alternative: /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64
 # Direct-mesh bootstrap (an Alps OpenTela peer). No relay needed.
-export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJkCfotDzbFE5uoTsXD4GRyPHjzZC1f2yAGLoeBMn9}"
+export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 export OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
 export OTELA_UDP_PORT="${OTELA_UDP_PORT:-59820}"
@@ -224,10 +299,10 @@ OTELA_SEED="${OTELA_SEED:-21}"
 OTELA_API_PORT="${OTELA_API_PORT:-18094}"
 # Cold start is ~105 min on a bad Lustre day (job 3000965: 17:29→19:14).
 # Weight loading from /capstor dominates (~80–132 s/shard × 96 shards).
-# 9000 s (150 min) gives 45 min margin; the --dist-timeout monkey-patch
-# (UNBALANCED_MODEL_LOADING_TIMEOUT_S=3600) is what actually prevents the
-# load barrier from killing slow PP groups, but the health check must also
-# wait long enough for the server to answer.
+# 9000 s (150 min) gives 45 min margin; the distributed-load-barrier
+# monkey-patch (UNBALANCED_MODEL_LOADING_TIMEOUT_S=3600) is what actually
+# prevents the load barrier from killing slow PP groups, but the health
+# check must also wait long enough for the server to answer.
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-9000}"
 
 # ------------------------------------------------------------- servekit -----
@@ -426,10 +501,12 @@ exec ${PROFILE[@]+"${PROFILE[@]}"} sglang serve \
   --tp-size "$TP_SIZE" --pp-size "$PP_SIZE" --ep-size "$EP_SIZE" \
   --nnodes "$NNODES" --node-rank "$RANK" \
   --dist-init-addr "$HEAD_IP:$DIST_PORT" \
+  --dist-timeout "$DIST_TIMEOUT" \
   --moe-runner-backend "$MOE_BACKEND" \
   --prefill-attention-backend flashmla --decode-attention-backend flashmla \
   --cuda-graph-backend-decode "$CG_DECODE" \
   --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC" \
+  --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT" \
   --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
   --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health \
   ${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"} \

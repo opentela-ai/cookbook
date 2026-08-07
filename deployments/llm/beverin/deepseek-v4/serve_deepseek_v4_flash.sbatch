@@ -38,9 +38,10 @@
 #          serve_deepseek_v4_flash.sbatch
 #
 # HOW IT WORKS (why no relay, unlike the JSC recipe):
-#   beverin compute nodes have full outbound internet and reach the bootstrap
-#   /ip4/148.187.108.178/... directly. So each rank runs one
-#   `otela start --mode node --subprocess <sglang-wrapper>` that
+#   beverin compute nodes have full outbound internet and reach the public
+#   OpenTela bootstrap /ip4/140.238.223.116/... directly (the old Alps peer
+#   /ip4/148.187.108.178/... is kept as an overrideable fallback). So each rank
+#   runs one `otela start --mode node --subprocess <sglang-wrapper>` that
 #     1. starts SGLang on 0.0.0.0:${SGLANG_PORT},
 #     2. bootstraps to the given peer, and
 #     3. registers the `llm` service with label
@@ -139,7 +140,7 @@ SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-0}"
 # x86-64 build. The worker (not a relay) uses the release directly.
 OPENTELA_DIR="${OPENTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
 OPENTELA_BIN="${OPENTELA_BIN:-${OPENTELA_DIR}/otela}"
-OPENTELA_BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJkCfotDzbFE5uoTsXD4GRyPHjzZC1f2yAGLoeBMn9}"
+OPENTELA_BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 OPENTELA_TCP_PORT="${OPENTELA_TCP_PORT:-43905}"
 OPENTELA_UDP_PORT="${OPENTELA_UDP_PORT:-59820}"
 OPENTELA_SERVICE_NAME="${OPENTELA_SERVICE_NAME:-llm}"

@@ -162,6 +162,8 @@ YAML
 
 ## Run
 
+### From the login node (SSH)
+
 ```bash
 # 1. Start the relay on a login node (writes relay.multiaddr automatically)
 bash start_relay_euler.sh
@@ -172,6 +174,33 @@ sbatch serve_qwen36_otela_euler.sbatch
 # 3. Watch it come up
 squeue -u $USER
 tail -f /cluster/scratch/$USER/otela-qwen36/logs/qwen36-*.out
+```
+
+### From your local machine via `rcc`
+
+The repository ships a project-local `.rcc/config.toml` with an `euler`
+profile that syncs to `/cluster/scratch/xiayao/opentela-cookbook` and submits
+through the `euler` SSH alias (configured in `~/.ssh/config`). The profile
+also forwards `http_proxy`/`https_proxy` so the login-node relay can reach
+OpenTela bootstraps through `eth_proxy`.
+
+```bash
+# one-time: sync local code and this recipe to Euler
+rcc --profile euler push
+
+# start the login-node relay (kept running in a tmux session by the script)
+rcc --profile euler run -- bash -lc \
+  'bash /cluster/scratch/xiayao/opentela-cookbook/deployments/llm/euler/qwen36-35b-a3b/start_relay_euler.sh'
+
+# submit the serving job
+rcc --profile euler job submit deployments/llm/euler/qwen36-35b-a3b/serve_qwen36_otela_euler.sbatch
+
+# monitor
+rcc --profile euler job status <JOBID>
+rcc --profile euler job tail <JOBID> -f
+
+# inspect logs from your local machine
+rcc --profile euler run -- tail -f /cluster/scratch/xiayao/otela-qwen36/logs/qwen36-<JOBID>.out
 ```
 
 ## Verify
@@ -187,6 +216,9 @@ curl -s http://127.0.0.1:30000/v1/chat/completions \
 
 # otela worker joined the mesh (look for "Updating peer" and no LEFT line)
 tail -f /cluster/scratch/$USER/otela-qwen36/run-*/otela.log
+
+# via rcc from your local machine:
+rcc --profile euler run -- tail -f /cluster/scratch/xiayao/otela-qwen36/run-<JOBID>/otela.log
 
 # Routed request through the gateway (from anywhere with internet)
 curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \

@@ -1,0 +1,68 @@
+default = "beverin"
+
+# Remote-owned paths to protect from --delete/--mirror.
+keep_remote_defaults = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]
+
+[profiles.beverin]
+host = "beverin"
+remote_dir = "/capstor/scratch/cscs/xyao/opentela-cookbook"
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]
+
+[profiles.beverin.env]
+HF_HOME = "/capstor/scratch/cscs/xyao/models"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/cache/triton"
+
+[profiles.clariden]
+host = "clariden"
+remote_dir = "/capstor/scratch/cscs/xyao/opentela-cookbook"
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]
+
+[profiles.clariden.env]
+HF_HOME = "/capstor/scratch/cscs/xyao/models"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/cache/triton"
+
+[profiles.euler]
+host = "euler"
+remote_dir = "/cluster/scratch/xiayao/opentela-cookbook"
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]
+
+[profiles.euler.env]
+HF_HOME = "/cluster/scratch/xiayao/models"
+TRITON_CACHE_DIR = "/cluster/scratch/xiayao/cache/triton"
+# Euler login nodes (where rcc lands and where the relay runs) need eth_proxy.
+http_proxy = "http://proxy.ethz.ch:3128"
+https_proxy = "http://proxy.ethz.ch:3128"
+
+[profiles.jsc]
+host = "jsc"
+remote_dir = "/e/scratch/reformo/yao4/opentela-cookbook"
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]
+
+[profiles.jsc.env]
+HF_HOME = "/e/scratch/reformo/yao4/models"
+TRITON_CACHE_DIR = "/e/scratch/reformo/yao4/cache/triton"

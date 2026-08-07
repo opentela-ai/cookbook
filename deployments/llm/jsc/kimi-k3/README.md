@@ -223,6 +223,8 @@ default `~/.deep_ep`) — the recipe makes that rank-local too for the same reas
 
 ## Submit
 
+### From the login node (SSH)
+
 ```bash
 # 0. one-time prep (login node): build image + (optional) stage SHARP
 bash deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh
@@ -240,11 +242,44 @@ SHARP_PLUGIN_DIR=/e/scratch/reformo/$USER/otela-llm/sharp-plugin-only \
   deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
 ```
 
+### From your local machine via `rcc`
+
+The repository ships a project-local `.rcc/config.toml` with a `jsc`
+profile that syncs to `/e/scratch/reformo/yao4/opentela-cookbook` and submits
+through the `jsc` SSH alias (`login01.jupiter.fz-juelich.de`, configured in
+`~/.ssh/config`).
+
+```bash
+# one-time: sync local code and this recipe to JSC
+rcc --profile jsc push
+
+# build image + (optional) stage SHARP
+rcc --profile jsc run -- bash -lc \
+  'bash /e/scratch/reformo/yao4/opentela-cookbook/deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh && \
+   bash /e/scratch/reformo/yao4/opentela-cookbook/deployments/llm/jsc/kimi-k3/stage_sharp_plugin.sh'
+
+# production default: Kimi-K3, 8 nodes, TP4×PP8
+rcc --profile jsc job submit deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
+
+# experiment: TP32/EP32/PP1 with SHARP
+rcc --profile jsc job submit --sbatch-args='--export=ALL,IMAGE=/e/scratch/reformo/yao4/kimi-k3/images/sglang-kimi-k3-cu12.sif,TP_SIZE=32,EP_SIZE=32,PP_SIZE=1,NNODES=8,SHARP_PLUGIN_DIR=/e/scratch/reformo/yao4/otela-llm/sharp-plugin-only' \
+  deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
+
+# monitor
+rcc --profile jsc job status <JOBID>
+rcc --profile jsc job tail <JOBID> -f
+```
+
 ## Verify
 
 The login node **cannot reach** the compute endpoint (`curl` → connection
 refused; JSC firewalls login↔compute). Health checks must run from inside the
-allocation:
+allocation. With `rcc` you can run those commands from your local machine by
+prefixing them with `rcc --profile jsc run -- bash -lc '...'`:
+
+```bash
+rcc --profile jsc run -- bash -lc 'JOB=<JOBID>; HEAD=$(grep SERVICE_HEAD_NODE /e/scratch/reformo/yao4/kimi-k3/last_service.env | cut -d= -f2); srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" curl -s http://127.0.0.1:30000/health ; echo'
+```
 
 ```bash
 JOB=<jobid>; HEAD=$(grep SERVICE_HEAD_NODE .../last_service.env | cut -d= -f2)

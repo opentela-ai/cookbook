@@ -20,9 +20,10 @@ Slurm Container Engine (EDF + enroot + Pyxis), and register it on OpenTela.
 
 Like the sibling [`glm47-flash/`](../glm47-flash/) GLM-4.7-Flash recipe and unlike the
 JSC one, **no relay is needed**: Beverin compute nodes have full outbound
-internet and reach the bootstrap `/ip4/148.187.108.178/...` directly, so each
-rank runs `otela start --mode node --subprocess <sglang-wrapper>` on the same
-node as SGLang.
+internet and reach the public OpenTela bootstrap `/ip4/140.238.223.116/...`
+directly (the old Alps peer `/ip4/148.187.108.178/...` is kept as an
+overrideable fallback), so each rank runs `otela start --mode node --subprocess
+<sglang-wrapper>` on the same node as SGLang.
 
 > **Read the GLM recipe first if you are new to Beverin.**
 > [`../glm47-flash/README.md`](../glm47-flash/README.md) documents the MI300A basics
@@ -441,6 +442,8 @@ Three things it is deliberate about:
 
 ## Submit
 
+### From the login node (SSH)
+
 ```bash
 # ALWAYS probe first on a new image — it is a 1-node job and it catches the
 # expensive-to-debug kernel problems before you burn N nodes.
@@ -453,11 +456,36 @@ sbatch serve_deepseek_v4_flash.sbatch
 sbatch --nodes=4 serve_deepseek_v4_flash.sbatch
 ```
 
+### From your local machine via `rcc`
+
+The repository ships a project-local `.rcc/config.toml` with a `beverin`
+profile that syncs to `/capstor/scratch/cscs/xyao/opentela-cookbook` and
+submits through the `beverin` SSH alias (configured in `~/.ssh/config`).
+
+```bash
+# one-time: sync local code and this recipe to Beverin
+rcc --profile beverin push
+
+# ALWAYS probe first on a new image
+rcc --profile beverin job submit deployments/llm/beverin/deepseek-v4/probe_sglang.sbatch
+
+# serve DeepSeek-V4-Flash
+rcc --profile beverin job submit deployments/llm/beverin/deepseek-v4/serve_deepseek_v4_flash.sbatch
+
+# monitor
+rcc --profile beverin job status <JOBID>
+rcc --profile beverin job tail <JOBID> -f
+
+# inspect logs from your local machine
+rcc --profile beverin run -- tail -f /capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/logs/opentela-<JOBID>-0.log
+```
+
 The image is already in `$SCRATCH/.edf_imagestore` (66 GiB). To warm it on a
 fresh account, from a login node:
 
 ```bash
-enroot import docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x
+rcc --profile beverin run -- bash -lc \
+  'enroot import -o $SCRATCH/.edf_imagestore/sglang+sglang+v0.5.16-rocm720-mi30x.x86_64.sqsh docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x'
 ```
 
 Weights are pre-staged at
@@ -466,15 +494,19 @@ Weights are pre-staged at
 
 ## Verify
 
-This is a **local deployment on the Alps mesh** — the bootstrap
-`/ip4/148.187.108.178/...` is a peer running on Alps itself, not the public
-`api.opentela.ai`. Compute-node `:8080` is not routable from the login node, so
-health checks run from inside the allocation.
+This is a **local deployment on the OpenTela mesh** — the bootstrap
+`/ip4/140.238.223.116/...` is the public OpenTela bootstrap. Compute-node
+`:8080` is not routable from the login node, so health checks run from inside
+the allocation. Override `OPENTELA_BOOTSTRAP` to use the old Alps peer
+`/ip4/148.187.108.178/...` if needed.
 
 ```bash
 # job + per-rank OpenTela logs (look for: opentela_started, aiter_jit_dir=…,
 # sglang_ready, a Peer ID: line)
 tail -f /capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/logs/opentela-<JOB>-*.log
+
+# via rcc from your local machine:
+rcc --profile beverin run -- tail -f /capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/logs/opentela-<JOB>-0.log
 
 # engine-side milestones
 grep -E "Load weight end|Memory pool end|ready to roll" \
@@ -483,6 +515,10 @@ grep -E "Load weight end|Memory pool end|ready to roll" \
 # direct SGLang health from inside the allocation (login node can't reach it)
 srun --jobid=<JOB> --overlap -N1 -n1 \
   bash -lc 'curl -s http://$(hostname -i | awk "{print \$1}"):8080/get_model_info | python3 -m json.tool'
+
+# via rcc from your local machine:
+rcc --profile beverin run -- bash -lc \
+  'srun --jobid=<JOB> --overlap bash -lc "curl -s http://127.0.0.1:8080/get_model_info | python3 -m json.tool"'
 ```
 
 `/get_model_info` returns, on a healthy server:

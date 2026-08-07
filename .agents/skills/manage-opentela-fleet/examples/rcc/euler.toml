@@ -1,0 +1,27 @@
+# rcc profile for ETH Zürich Euler.
+# Copy/edit this file into your project as .rcc/config.toml, or merge the
+# [profiles.euler] block into an existing .rcc/config.toml.
+#
+# Euler compute nodes have HTTP(S)-only outbound via eth_proxy, so the
+# OpenTela worker usually needs a login-node relay. rcc submits to the
+# login node; the recipe handles the relay.
+
+default = "euler"
+
+[profiles.euler]
+host = "euler-login"            # CHANGE: actual Euler login hostname
+remote_dir = "/cluster/scratch/.../opentela-fleet"   # CHANGE: project scratch dir
+
+[profiles.euler.env]
+HF_HOME = "/cluster/scratch/.../models"          # CHANGE
+# WHY: the login node (where rcc lands and where a relay may run) needs the
+# ETH proxy env just like the compute nodes.
+http_proxy = "http://proxy.ethz.ch:3128"
+https_proxy = "http://proxy.ethz.ch:3128"
+
+keep_remote = [
+  "logs/",
+  "*.safetensors",
+  "last_service.env",
+  ".rcc-runs/",
+]

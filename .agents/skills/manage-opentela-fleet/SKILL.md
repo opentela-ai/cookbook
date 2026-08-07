@@ -1,6 +1,6 @@
 ---
 name: manage-opentela-fleet
-description: Launch, inspect, and reconcile serving workloads across SLURM-backed clusters with the otela-fleet CLI (pip package or contrib/fleet_manager). Use when starting LLM serving on SLURM without writing an sbatch by hand, defining a multi-cluster fleet YAML of desired state, or scaling/removing running deployments.
+description: Launch, inspect, and reconcile OpenTela serving workloads across SLURM-backed clusters with otela-fleet (direct SSH) or remote-cluster-controller/rcc as the local transport. Use when starting LLM serving on SLURM from a fleet YAML, scaling deployments, or wiring rcc job submit into an OpenTela workflow.
 ---
 
 # Manage OpenTela with `otela-fleet`
@@ -113,16 +113,40 @@ Reconciliation model: too few replicas → submit more; too many → cancel the
 **newest** excess first; correct → no-op. To remove a deployment, set
 `replicas: 0` (or drop the entry) and re-apply.
 
+## `remote-cluster-controller` (`rcc`) transport
+
+`otela-fleet` normally SSHes directly to each cluster login node. You can also
+use [ResearchComputer/remote-cluster-controller](https://github.com/ResearchComputer/remote-cluster-controller)
+(`rcc`) as the local-to-cluster transport: keep per-cluster config in
+`.rcc/config.toml`, sync the project with `rcc push`, and submit/manage SLURM
+jobs with `rcc job submit/status/cancel` while keeping the control loop on your
+laptop.
+
+Two integration patterns:
+
+1. **`rcc` + `otela-fleet` together (works today)** — configure `rcc` for the
+   cluster, push the `otela-fleet` cluster config to the remote, then run
+   `otela-fleet` with `ssh.host` matching the `rcc` profile host. `rcc` owns the
+   sync/project directory; `otela-fleet` owns the OpenTela/SLURM orchestration.
+2. **`rcc` native job backend (future)** — replace the direct-SSH calls inside
+   `otela-fleet` with `rcc job submit/list/status/cancel`. This needs a code
+   change in the `otela-fleet` package; the cluster-config mapping is documented
+   in [references/rcc-integration.md](references/rcc-integration.md).
+
+See [references/rcc-integration.md](references/rcc-integration.md) for example
+`.rcc/config.toml` files per site and the exact command mapping.
+
 ## When to use this vs the recipe skill
 
 - **`manage-opentela-fleet`** (this) — operate a known set of SLURM clusters
-  quickly via a Python CLI and YAML. Best when `otela-fleet` is already
-  configured for the cluster and you want repeatable, reconciled deploys.
+  quickly via a Python CLI and YAML (direct SSH or via `rcc`). Best when the
+  tooling is already configured for the cluster and you want repeatable,
+  reconciled deploys.
 - **`write-deployment-recipe`** — author a single self-contained sbatch under
   `deployments/<kind>/<site>/<model>/` in this repo, carrying the
   site-specific details (firewall, runtime quirks, why-this-setting) that are
   hard to rediscover. Best for a brand-new site whose facts must be recorded,
-  or where `otela-fleet` isn't set up.
+  or where `otela-fleet`/`rcc` isn't set up.
 
-Both produce LLM serving on OpenTela; `otela-fleet` is the higher-level lever,
-the recipe is the durable artifact.
+Both produce LLM serving on OpenTela; `otela-fleet`/`rcc` are the higher-level
+levers, the recipe is the durable artifact.

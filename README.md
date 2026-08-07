@@ -13,7 +13,43 @@ deployments/<service-kind>/<site>/<model>/          # one self-contained recipe 
 deployments/<service-kind>/local/<site>/<model>/    # no scheduler: single-box, hand-run scripts
 conventions/                                       # cross-recipe rules (LLM served-model naming, …)
 meta/bench/                                        # benchmark harness shared by all recipes
+.rcc/config.toml                                   # project-local rcc profiles for remote submit
 ```
+
+## Submitting recipes from your local machine with `rcc`
+
+Most recipes can be submitted without SSH-ing into the login node by using
+[`rcc`](https://github.com/eth-easl/remote-cluster-controller) (install:
+`uv tool install remote-cluster-controller`). The repository root contains a
+project-local `.rcc/config.toml` with one profile per site:
+
+```toml
+[profiles.beverin]
+host = "beverin"                                # SSH alias from ~/.ssh/config
+remote_dir = "/capstor/scratch/cscs/xyao/opentela-cookbook"
+```
+
+Supported profiles: `beverin`, `clariden`, `euler`, `jsc`.
+
+```bash
+# sync local changes to the remote scratch directory
+rcc --profile <site> push
+
+# submit a recipe
+rcc --profile <site> job submit deployments/llm/<site>/<model>/serve_*.sbatch
+
+# monitor
+rcc --profile <site> job status <JOBID>
+rcc --profile <site> job tail <JOBID> -f
+
+# run an arbitrary command on the login node (e.g. tail logs)
+rcc --profile <site> run -- tail -f /path/to/log
+```
+
+Each recipe's README has a "From your local machine via `rcc`" subsection
+with the exact commands for that site. Profiles for CSCS Alps sites
+(Beverin/Clariden) share `/capstor`, so a `rcc --profile beverin push` also
+updates the files visible from Clariden.
 
 ## Compute substrates
 
