@@ -10,6 +10,14 @@
 # not eligible" and kills ranks. 1 task/node x 288 cpus = whole node.
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
+# Request the whole node's memory, not DefMemPerNode (~450 GiB on clariden).
+# servekit launch stages this rank's pre-sharded weights to /dev/shm (tmpfs),
+# and tmpfs pages are charged to the step's cgroup. At TP4xPP8 kimi-k3 stages
+# ~190 GiB/node on top of the ranks (~100 GiB); DefMemPerNode fits but leaves
+# little headroom. 850 GB < the node's RealMemory (870 GB), so the job still
+# schedules, and --exclusive keeps /dev/shm free of other tenants.
+#SBATCH --mem=850000
+#SBATCH --exclusive
 # B:TERM@120 signals the BATCH SHELL (B:) 120 s before wall-time, giving the
 # stop_otela trap below a window to scancel the otela step with TERM. Without
 # B: the signal goes to the job steps, the batch-shell trap never runs, and the
@@ -54,7 +62,7 @@
 # the head registering the single head HTTP endpoint.
 #
 #   clariden compute (host netns; enroot container shares it)
-#     rank 0 (HEAD)  -> sglang serve (HTTP on 0.0.0.0:$SERVE_PORT) + otela worker
+#     rank 0 (HEAD)  -> sglang launch_server (HTTP on 0.0.0.0:$SERVE_PORT) + otela
 #     rank 1..N      -> sglang workers (no HTTP; pipeline P2P to neighbours)
 #
 # TP4 keeps tensor-parallel all-reduce INSIDE one node's 4-GH200 NVLink domain.
@@ -157,6 +165,14 @@ export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
+# Pre-sharded checkpoint (mxfp4->bf16), cut offline once with `servekit prepare
+# --format presharded` and keyed by the FULL tp/pp/ep+quant config: a serve job
+# whose parallel sizes differ from the dump's checksum.json takes a cache MISS
+# (a full source load + re-dump into /dev/shm). Each PP stage reads a DIFFERENT
+# file set out of the dump's own checksum.json (not a glob). Path tracks TP/PP:
+# /capstor/.../kimi-k3-presharded-tp4pp8/TP-4-sig-<hash>/.
+export PRESHARDED_ROOT_BASE="${PRESHARDED_ROOT_BASE:-/capstor/store/cscs/swissai/infra01/cold-start-experiments/kimi-k3-presharded}"
+export PRESHARDED_ROOT="${PRESHARDED_ROOT:-${PRESHARDED_ROOT_BASE}-tp${TP_SIZE}pp${PP_SIZE}}"
 # CUDA graph for DECODE only. TP4 x PP8 keeps every captured collective
 # intra-node on NVLink, so `full` works. If you switch to TP32 flat you MUST
 # set CG_DECODE=disabled (cross-node allreduce cannot be captured on CXI).
@@ -324,19 +340,21 @@ OTELA_API_PORT="${OTELA_API_PORT:-18094}"
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-9000}"
 
 # ------------------------------------------------------------- servekit -----
-# servekit (github.com/eth-easl/servekit) provides two things here:
-#   1. cold-start profiling: engine.sh wraps `sglang serve` with
-#      `servekit profile`, which echoes the engine log unmodified into the
-#      job log and writes a per-phase startup breakdown to
-#      $RUNDIR/coldstart.node<RANK>.json when that node reports ready (the
-#      head's row lands at full readiness).
+# servekit (github.com/eth-easl/servekit, BRANCH multinode-pp) provides:
+#   1. presharded launch: engine.sh wraps `python -m sglang.launch_server`
+#      with `servekit launch --overlap`, which stages this rank's pre-cut
+#      shard set (read out of the dump's own checksum.json, not a glob — PP
+#      stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to
+#      /dev/shm, rewrites --model-loader-extra-config to the staged copy,
+#      profiles each cold-start phase, and writes $RUNDIR/run.node<RANK>.json
+#      when the node reports ready (the head's row lands at full readiness).
 #   2. verification bench: after /health answers and BEFORE otela
 #      registration (so mesh traffic can't pollute the numbers), a fixed
 #      servekit bench runs inside the container on the head and is merged
-#      into the profile report. Protocol: meta/bench/README.md.
+#      into the head's report. Protocol: meta/bench/README.md.
 # Pure stdlib -> run module-style from this checkout (PYTHONPATH); no pip
-# install inside the image. Missing checkout: run unwrapped, skip the bench
-# (preflight prints the staging command).
+# install inside the image. Missing checkout: run unwrapped from $MODEL_PATH
+# (no preshard, no profile, slower cold start).
 export SERVEKIT_DIR="${SERVEKIT_DIR:-$DEPLOY_DIR/servekit}"
 export SERVEKIT_BENCH="${SERVEKIT_BENCH:-1}"              # 0 skips the auto-bench
 export SERVEKIT_BENCH_REQUESTS="${SERVEKIT_BENCH_REQUESTS:-64}"
@@ -396,12 +414,13 @@ echo "[$(date -Is)] hicache: enable=$HICACHE_ENABLE ratio=$HICACHE_RATIO policy=
   echo "         mkdir -p $OTELA_DIR && cp /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64 $OTELA_BIN && chmod +x $OTELA_BIN" >&2
   exit 1
 }
-# servekit is OPTIONAL (cold-start profile + pre-registration bench). Missing
-# checkout -> warn loudly and run unwrapped; never fail the job over it.
+# servekit is OPTIONAL (presharded staging + cold-start profile +
+# pre-registration bench). Missing checkout -> warn loudly and run unwrapped
+# from $MODEL_PATH (slower cold load, no profile); never fail the job.
 [ -d "$SERVEKIT_DIR/src/servekit" ] || {
-  echo "WARN: servekit checkout not found: $SERVEKIT_DIR — no cold-start" >&2
-  echo "      profile, no auto-bench. Stage it once on a login node:" >&2
-  echo "        git clone --depth=1 https://github.com/eth-easl/servekit $SERVEKIT_DIR" >&2
+  echo "WARN: servekit checkout not found: $SERVEKIT_DIR — no preshard," >&2
+  echo "      no cold-start profile, no auto-bench. Stage it once on a login node:" >&2
+  echo "        git clone --depth=1 -b multinode-pp https://github.com/eth-easl/servekit $SERVEKIT_DIR" >&2
 }
 
 # --- container preflight (1 node, no GPUs, ~20 s) -----------------------
@@ -484,22 +503,28 @@ export PYTHONPATH="${PATCH_DIR:-/capstor/scratch/cscs/xyao/kimi-k3/patches}:${PY
 # Verify the monkey-patch will take effect in this process tree
 python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_utils as m; print('[rank '$RANK'] UNBALANCED_MODEL_LOADING_TIMEOUT_S =', m.UNBALANCED_MODEL_LOADING_TIMEOUT_S)" 2>/dev/null || true
 
-# servekit profile wraps the engine: it echoes sglang's log unmodified below
-# and writes a per-phase cold-start breakdown to $RUNDIR/coldstart.node<RANK>.json
-# once THIS node reports ready (head: "The server is fired up..."; workers:
-# sglang's multi-node "Dummy health check server started" line — if a future
-# image stops printing it, workers stay unprofiled and the profiler would
-# terminate them at --timeout; check coldstart.node<R>.json after image
-# bumps). Timeout semantics: profile KILLS the engine on expiry, so
-# --timeout must track $HEALTH_TIMEOUT — never set it shorter.
-PROFILE=()
-if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
-  export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
-  PROFILE=(python3 -m servekit.cli profile --out "${RUNDIR}/coldstart.json"
-           --timeout "${HEALTH_TIMEOUT:-9000}" --)
-else
-  echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold start unprofiled" >&2
-fi
+# servekit launch wraps the engine: it stages this rank's pre-sharded slice
+# (read out of the dump's own checksum.json — a glob can't express that PP
+# stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to /dev/shm,
+# rewrites --model-loader-extra-config to the staged copy, profiles each
+# cold-start phase, and writes $RUNDIR/run.node<RANK>.json when this node
+# reports ready (head: "The server is fired up..."; workers: sglang's
+# multi-node "Dummy health check server started" line — if a future image
+# stops printing it, workers stay unprofiled and the profiler would
+# terminate them at --timeout; check run.node<R>.json after image bumps).
+# --overlap is SAFE for presharded (unlike sharded_state): the loader will
+# not touch a dump without its READY sentinel, written last and only on a
+# clean stage — an engine that looks too early takes a cache MISS (a full
+# source load + re-dump into /dev/shm), not zeros; check overlap_gate in
+# run.node<R>.json before trusting a timing. servekit forwards SIGTERM to
+# the engine child and exits on child exit, so the batch shell's
+# --signal=B:TERM@120 + stop_otela trap still fire unchanged. --timeout
+# KILLS the engine on expiry, so it must track $HEALTH_TIMEOUT — never less.
+# ulimit -c 0 + unset BASH_ENV: the stager forks subshells; BASH_ENV would
+# run an nvidia-smi init in every one (16.89 -> 0.41 GB/s) and a 1.5 TB core
+# dump is never useful.
+ulimit -c 0
+unset BASH_ENV
 
 HICACHE_ARGS=()
 if [ "${HICACHE_ENABLE:-0}" = "1" ]; then
@@ -516,24 +541,46 @@ fi
 # FlashMLABackend imports only sgl_kernel.flash_mla and inherits prefill from
 # FlashInferMLAAttnBackend. Do NOT apply --mamba-ssm-dtype bfloat16: SM90 uses
 # float32 KDA state (FlashInfer GDN bf16 is SM100+ only).
-exec ${PROFILE[@]+"${PROFILE[@]}"} sglang serve \
-  --trust-remote-code \
-  --model-path "$MODEL_PATH" \
-  --served-model-name "$SERVED_MODEL_NAME" \
-  --tp-size "$TP_SIZE" --pp-size "$PP_SIZE" --ep-size "$EP_SIZE" \
-  --nnodes "$NNODES" --node-rank "$RANK" \
-  --dist-init-addr "$HEAD_IP:$DIST_PORT" \
-  --dist-timeout "$DIST_TIMEOUT" \
-  --moe-runner-backend "$MOE_BACKEND" \
-  --prefill-attention-backend flashmla --decode-attention-backend flashmla \
-  --cuda-graph-backend-decode "$CG_DECODE" \
-  --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC" \
-  --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT" \
-  --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
-  --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health \
-  ${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"} \
-  $SGLANG_EXTRA_ARGS \
-  --host 0.0.0.0 --port "$SERVE_PORT"
+# `python -m sglang.launch_server` (not `sglang serve`): the entry point
+# servekit's detect_framework + the presharded loader are validated against,
+# and the one the multinode-pp reference runs. The checkpoint's own
+# config.json (still read from --model-path) supplies the architecture.
+ENGINE_CMD=(python -m sglang.launch_server
+  --trust-remote-code
+  --model-path "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --tp-size "$TP_SIZE" --pp-size "$PP_SIZE" --ep-size "$EP_SIZE"
+  --nnodes "$NNODES" --node-rank "$RANK"
+  --dist-init-addr "$HEAD_IP:$DIST_PORT"
+  --dist-timeout "$DIST_TIMEOUT"
+  --moe-runner-backend "$MOE_BACKEND"
+  --prefill-attention-backend flashmla --decode-attention-backend flashmla
+  --cuda-graph-backend-decode "$CG_DECODE"
+  --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC"
+  --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT"
+  --reasoning-parser kimi_k3 --tool-call-parser kimi_k3
+  --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health
+  --host 0.0.0.0 --port "$SERVE_PORT")
+ENGINE_CMD+=(${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"})
+ENGINE_CMD+=($SGLANG_EXTRA_ARGS)
+
+if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
+  export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
+  # --load-format presharded + presharded_path (the ROOT holding the
+  # TP-<tp>-sig-<hash>/ subdir): servekit stages to /dev/shm and rewrites
+  # this to the staged copy. Left off the fallback below — without staging
+  # the engine reads straight from $MODEL_PATH on Lustre (slow, unverified).
+  ENGINE_CMD+=(--load-format presharded
+               --model-loader-extra-config "{\"presharded_path\": \"$PRESHARDED_ROOT\"}")
+  exec python3 -m servekit.cli launch \
+    --out "$RUNDIR/run.json" \
+    --timeout "${HEALTH_TIMEOUT:-9000}" \
+    --overlap \
+    -- "${ENGINE_CMD[@]}"
+else
+  echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold load from $MODEL_PATH (no preshard, no profile)" >&2
+  exec "${ENGINE_CMD[@]}"
+fi
 ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
@@ -648,16 +695,19 @@ trap 'stop_otela' EXIT TERM INT
   # Verification bench BEFORE registration: otela traffic must not pollute
   # the numbers. Stdlib-only servekit runs inside the container, module-style
   # from the checkout (the EDF clears PYTHONPATH, hence the explicit env).
-  # When the head's cold-start profile report exists, the bench is merged
-  # into it (--into) as one verified artifact: profile + throughput.
+  # When the head's servekit-launch report has landed (same ready event the
+  # curl loop above waited on), the bench is merged into it (--into) as one
+  # verified artifact: cold-start profile + throughput. A small race is
+  # harmless: servekit writes run.node0.json at ready, and if it has not
+  # landed yet the bench writes a standalone bench.json instead.
   if [ "${SERVEKIT_BENCH:-1}" = "1" ] && [ -d "$SERVEKIT_DIR/src/servekit" ]; then
     echo "[$(date -Is)] engine healthy — servekit bench C=$SERVEKIT_BENCH_CONCURRENCY n=$SERVEKIT_BENCH_REQUESTS (SERVEKIT_BENCH=0 to skip)"
     BENCH_ARGS=(--url "http://127.0.0.1:$SERVE_PORT"
                 --requests "$SERVEKIT_BENCH_REQUESTS" --concurrency "$SERVEKIT_BENCH_CONCURRENCY"
                 --input-len "$SERVEKIT_BENCH_IN" --output-len "$SERVEKIT_BENCH_OUT")
     [ "${SERVEKIT_BENCH_CORRECTNESS:-1}" = "1" ] || BENCH_ARGS+=(--no-correctness)
-    if [ -f "$RUNDIR/coldstart.node0.json" ]; then
-      BENCH_ARGS+=(--into "$RUNDIR/coldstart.node0.json")
+    if [ -f "$RUNDIR/run.node0.json" ]; then
+      BENCH_ARGS+=(--into "$RUNDIR/run.node0.json")
     else
       BENCH_ARGS+=(--out "$RUNDIR/bench.json")
     fi

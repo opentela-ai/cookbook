@@ -40,7 +40,7 @@ deterministic. Run inside the container on the head (nid007464) against
 *Benchmark* below and `meta/bench/README.md`. The sbatch also runs a single
 verification level (C=16, n=64) automatically after health, before OpenTela
 registration, and writes a per-node cold-start profile
-(`$RUNDIR/coldstart.node<RANK>.json`). Reproduce the table with the standard
+(`$RUNDIR/run.node<RANK>.json`). Reproduce the table with the standard
 sweep `1:8 4:16 8:32 16:48 32:64 64:96`. Note: servekit measures prompt
 length in **words** (~1.4 tokens/word), so its 768-word default ≈ the
 1024-token prompt protocol used here — not identical, quote which you ran.
@@ -232,7 +232,8 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
     `--soft-watchdog-timeout 600` (dumps a stack trace at 10 min **without
     crashing**, so the next stall is diagnosable even when the engine survives
     it). Both are env knobs (`WATCHDOG_TIMEOUT` / `SOFT_WATCHDOG_TIMEOUT`) and
-    were verified via `sglang serve --help` in this image.
+    were verified via `sglang serve --help`; `python -m sglang.launch_server`
+    (now used here, wrapped by `servekit launch`) shares the same `ServerArgs`.
 
 12. **NCCL process-group watchdog killed a healthy 5 h20 m-serving engine
     (job 3018155) — the very stall fix 11 tried to survive.** Fix 11 raised
@@ -266,7 +267,7 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
 
 | File | Purpose |
 |------|---------|
-| `serve_kimi_k3_otela_clariden.sbatch` | One self-contained sbatch: distributed SGLang engine (enroot, TP4×PP8, wrapped in `servekit profile` for cold-start JSON) + pre-registration servekit verification bench + one otela worker on the head + lifecycle trap. Defaults: 8 nodes, TP4×PP8. |
+| `serve_kimi_k3_otela_clariden.sbatch` | One self-contained sbatch: distributed SGLang engine (enroot, TP4×PP8, wrapped in `servekit launch --overlap` for presharded staging + cold-start JSON) + pre-registration servekit verification bench + one otela worker on the head + lifecycle trap. Defaults: 8 nodes, TP4×PP8. |
 | `kimi-k3-clariden.toml` | EDF: image (local .sqsh), mounts, caches, `com.hooks.aws_ofi_nccl` (cuda13) for Slingshot NCCL. |
 | `build_kimi_k3_image.sbatch` | One-time: import `docker://lmsysorg/sglang:kimi-k3` to the local arm64 .sqsh (on a `debug` node, with /dev/shm enroot scratch). |
 | `bench.py` | Legacy vendored throughput harness (`--input-len` counts tokens here, unlike servekit's words). New default: `meta/bench/cbench.sh` + `cbench_report.py` (servekit bench); the 3000965 numbers still come from this script. |
@@ -391,9 +392,9 @@ srun --jobid=$JOB --overlap --gres=none --nodes=1 -n1 -w "$SERVICE_HEAD_NODE" \
 ```
 
 Already done for you on every launch: the sbatch benches C=16 n=64 **before**
-registering on OpenTela (merged into `$RUNDIR/coldstart.node0.json`, or
+registering on OpenTela (merged into `$RUNDIR/run.node0.json`, or
 `$RUNDIR/bench.json` if profiling was unavailable), and the engine runs
-under `servekit profile`, so `$RUNDIR/coldstart.node<RANK>.json` captures
+under `servekit launch`, so `$RUNDIR/run.node<RANK>.json` captures
 every node's startup timeline (weight-load/compile/CG phases, `ready_wait_s`).
 Set `SERVEKIT_BENCH=0` to skip the automatic bench.
 
@@ -522,8 +523,9 @@ step (or point `/proc/sys/kernel/core_pattern` at `|/bin/false` site-wide).
 | `UNBALANCED_MODEL_LOADING_TIMEOUT_S` | `3600` | sglang weight-load barrier (fix 10); patched via `$DEPLOY_DIR/patches/sitecustomize.py` |
 | `WATCHDOG_TIMEOUT` | `3600` | sglang HARD scheduler watchdog (s) — raises & kills the engine on a forward batch longer than this. Default 300 killed job 3002366 after 8 h of healthy serving on a >300 s PP request-broadcast stall; raised to 3600 (fix 11) so transient distributed stalls ride out, a true permanent hang still dies in 1 h |
 | `SOFT_WATCHDOG_TIMEOUT` | `600` | sglang SOFT watchdog (s) — dumps a stack trace at 600 s WITHOUT crashing (fix 11). Keep < `WATCHDOG_TIMEOUT` |
-| `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `sglang serve` line |
-| `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout (stdlib-only, runs via `PYTHONPATH` — no install). Stage once with egress: `git clone --depth=1 https://github.com/eth-easl/servekit $DEPLOY_DIR/servekit`. Missing → WARN, engine runs unprofiled, auto-bench skipped. |
+| `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `python -m sglang.launch_server` command (array; word-split) |
+| `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout (**BRANCH multinode-pp**, stdlib-only, runs via `PYTHONPATH` — no install). Stage once with egress: `git clone --depth=1 -b multinode-pp https://github.com/eth-easl/servekit $DEPLOY_DIR/servekit`. Missing → WARN, engine runs unwrapped from `$MODEL_PATH` (no preshard, no profile), auto-bench skipped. |
+| `PRESHARDED_ROOT_BASE` | `/capstor/store/cscs/swissai/infra01/cold-start-experiments/kimi-k3-presharded` | root of the offline pre-sharded dump; `-tp${TP}pp${PP}` is appended (→ `kimi-k3-presharded-tp4pp8/TP-4-sig-<hash>/`). Each PP stage stages its OWN file set (read from the dump's `checksum.json`) to `/dev/shm` via `servekit launch --overlap`. A config mismatch is a cache MISS (full re-load + re-dump), not a silent wrong-shape serve. |
 | `SERVEKIT_BENCH` | `1` | `0` skips the post-health, pre-registration verification bench |
 | `SERVEKIT_BENCH_REQUESTS` / `SERVEKIT_BENCH_CONCURRENCY` | `64` / `16` | single-level verification bench size (pp=8 ↔ max_running_requests=32; keep C≤32) |
 | `SERVEKIT_BENCH_CORRECTNESS` | `1` | attach the greedy correctness probe (non-gating) to the verification bench |
