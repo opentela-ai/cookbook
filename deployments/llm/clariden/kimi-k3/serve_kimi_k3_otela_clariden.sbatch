@@ -10,14 +10,11 @@
 # not eligible" and kills ranks. 1 task/node x 288 cpus = whole node.
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
-# Request the whole node's memory, not DefMemPerNode (~450 GiB on clariden).
-# servekit launch stages this rank's pre-sharded weights to /dev/shm (tmpfs),
-# and tmpfs pages are charged to the step's cgroup. At TP4xPP8 kimi-k3 stages
-# ~190 GiB/node on top of the ranks (~100 GiB); DefMemPerNode fits but leaves
-# little headroom. 850 GB < the node's RealMemory (870 GB), so the job still
-# schedules, and --exclusive keeps /dev/shm free of other tenants.
-#SBATCH --mem=850000
-#SBATCH --exclusive
+# No --mem/--exclusive: clariden normal has OverSubscribe=EXCLUSIVE
+# (jobs get dedicated whole nodes via 288 cpus + 4 gpus/node), and /dev/shm
+# is a fixed 334 GiB tmpfs per node — enough for servekit's ~190 GiB/rank
+# presharded staging with headroom. (Reserving 850 GiB/node was too close
+# to the 870 GiB RealMemory for the scheduler to place reliably.)
 # B:TERM@120 signals the BATCH SHELL (B:) 120 s before wall-time, giving the
 # stop_otela trap below a window to scancel the otela step with TERM. Without
 # B: the signal goes to the job steps, the batch-shell trap never runs, and the
@@ -173,6 +170,18 @@ export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
 # /capstor/.../kimi-k3-presharded-tp4pp8/TP-4-sig-<hash>/.
 export PRESHARDED_ROOT_BASE="${PRESHARDED_ROOT_BASE:-/capstor/store/cscs/swissai/infra01/cold-start-experiments/kimi-k3-presharded}"
 export PRESHARDED_ROOT="${PRESHARDED_ROOT:-${PRESHARDED_ROOT_BASE}-tp${TP_SIZE}pp${PP_SIZE}}"
+# PRESHARDED_ENABLE=0 (default): load directly from $MODEL_PATH on Lustre via
+# the engine.sh fallback path (exec ENGINE_CMD, no servekit launch). The
+# presharded dump at $PRESHARDED_ROOT is currently UNREADABLE by xyao — the
+# .safetensors carry ACL mask::--- (owner yboughizane only; group infra01 /
+# csstaff / infra01adm all effective ---), so servekit's dd staging fails
+# with "Permission denied" and the engine's cache-MISS re-dump crashes
+# (FileNotFoundError in _tmp_presharding). Set PRESHARDED_ENABLE=1 once
+# yboughizane fixes the ACLs: setfacl -R -m m::r $PRESHARDED_ROOT
+# (or setfacl -R -m u:xyao:r ...). Without staging the full 1.5 TB model
+# cannot be copied to /dev/shm (334 GiB/node), so the fallback (Lustre load,
+# ~57 min) is the only working path until then.
+export PRESHARDED_ENABLE="${PRESHARDED_ENABLE:-0}"
 # CUDA graph for DECODE only. TP4 x PP8 keeps every captured collective
 # intra-node on NVLink, so `full` works. If you switch to TP32 flat you MUST
 # set CG_DECODE=disabled (cross-node allreduce cannot be captured on CXI).
@@ -564,12 +573,33 @@ ENGINE_CMD=(python -m sglang.launch_server
 ENGINE_CMD+=(${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"})
 ENGINE_CMD+=($SGLANG_EXTRA_ARGS)
 
-if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
+# servekit launch (PRESHARDED_ENABLE=1): stages this rank's pre-sharded slice
+# (read out of the dump's own checksum.json — a glob can't express that PP
+# stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to /dev/shm,
+# rewrites --model-loader-extra-config to the staged copy, profiles each
+# cold-start phase, and writes $RUNDIR/run.node<RANK>.json when this node
+# reports ready (head: "The server is fired up..."; workers: sglang's
+# multi-node "Dummy health check server started" line — if a future image
+# stops printing it, workers stay unprofiled and the profiler would
+# terminate them at --timeout; check run.node<R>.json after image bumps).
+# --overlap is SAFE for presharded (unlike sharded_state): the loader will
+# not touch a dump without its READY sentinel, written last and only on a
+# clean stage — an engine that looks too early takes a cache MISS (a full
+# source load + re-dump into /dev/shm), not zeros; check overlap_gate in
+# run.node<R>.json before trusting a timing. servekit forwards SIGTERM to
+# the engine child and exits on child exit, so the batch shell's
+# --signal=B:TERM@120 + stop_otela trap still fire unchanged. --timeout
+# KILLS the engine on expiry, so it must track $HEALTH_TIMEOUT — never less.
+#
+# PRESHARDED_ENABLE=0 (default): skip servekit launch entirely and exec the
+# engine directly. The presharded dump is currently UNREADABLE by xyao (ACL
+# mask::---), so servekit staging fails and the re-dump crashes (see
+# PRESHARDED_ENABLE above). Loading directly from $MODEL_PATH on Lustre is
+# the proven path (jobs 3000965/3002366/3018155/3035026 each served ~970
+# requests before the PP-pipeline stall). srun forwards SIGTERM to the
+# engine child, so the --signal=B:TERM@120 + stop_otela trap still fire.
+if [ -d "${SERVEKIT_DIR:-}/src/servekit" ] && [ "${PRESHARDED_ENABLE:-0}" = "1" ]; then
   export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
-  # --load-format presharded + presharded_path (the ROOT holding the
-  # TP-<tp>-sig-<hash>/ subdir): servekit stages to /dev/shm and rewrites
-  # this to the staged copy. Left off the fallback below — without staging
-  # the engine reads straight from $MODEL_PATH on Lustre (slow, unverified).
   ENGINE_CMD+=(--load-format presharded
                --model-loader-extra-config "{\"presharded_path\": \"$PRESHARDED_ROOT\"}")
   exec python3 -m servekit.cli launch \
@@ -578,7 +608,11 @@ if [ -d "${SERVEKIT_DIR:-}/src/servekit" ]; then
     --overlap \
     -- "${ENGINE_CMD[@]}"
 else
-  echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold load from $MODEL_PATH (no preshard, no profile)" >&2
+  if [ "${PRESHARDED_ENABLE:-0}" != "1" ]; then
+    echo "[rank $RANK] PRESHARDED_ENABLE=0: cold load from $MODEL_PATH on Lustre (no servekit launch, no preshard, no profile). Set PRESHARDED_ENABLE=1 once the dump ACLs are fixed." >&2
+  else
+    echo "[rank $RANK] WARN: servekit not at ${SERVEKIT_DIR:-<unset>} — cold load from $MODEL_PATH (no preshard, no profile)" >&2
+  fi
   exec "${ENGINE_CMD[@]}"
 fi
 ENGINE
