@@ -3,12 +3,15 @@
 # local .sqsh so an 8-node job does not re-pull per node. See build_kimi_k3_image.sbatch
 # (run once on a login node) to produce the .sqsh this points at.
 #
-# Why CUDA-13 variant: the SGLang Kimi-K3 image (lmsysorg/sglang:kimi-k3) is
-# CUDA 13, and CSCS ships the aws-ofi-ccl NCCL plugin in CUDA-major variants
-# under /opt/cscs/aws-ofi-ccl-plugin/{cuda12,cuda13}/libnccl-net.so. The
-# annotation below selects cuda13 to match the image; the CSCS Slurm enroot
-# hook injects that plugin + libfabric CXI provider into the container at start,
-# giving NCCL the native Slingshot transport (no InfiniBand verbs on clariden).
+# Netstack selection (CSCS docs: software/container-engine/resource-hook/
+# #hpe-slingshot-interconnect): the Clariden vCluster defaults to
+# com.hooks.netstack.source="artifact", so the aws_ofi_nccl hook bind-mounts a
+# standalone, dynamically-linked (+dl) netstack (libfabric + aws-ofi-ccl plugin)
+# from /capstor/store/cscs/cscs/public/containers/netstack/. The default aarch64
+# artifact is gpu:cuda13,cxi:12.0.1,ofi:2.5.1,aws:1.18.0+dl — the +dl plugin is
+# CUDA-version-portable, so it matches this CUDA-13 image. On artifact source
+# the com.hooks.aws_ofi_nccl.variant annotation is IGNORED; on the rare
+# source=host, the docs' recommended variant is cuda-dl (not static cuda13).
 image = "/capstor/scratch/cscs/xyao/kimi-k3/images/sglang-kimi-k3.aarch64.sqsh"
 
 mounts = [
@@ -39,11 +42,14 @@ NCCL_DEBUG = "WARN"
 
 [annotations]
 # com.hooks.aws_ofi_nccl is the CSCS Slurm/enroot hook that, at container start,
-# LD_PRELOAD's /opt/cscs/aws-ofi-ccl-plugin/<variant>/libnccl-net.so and wires
-# libfabric (CXI provider, /opt/cray/libfabric) so NCCL runs over Slingshot.
+# bind-mounts the netstack artifact's libfabric + dynamically-linked (+dl)
+# libnccl-net.so and sets the CXI/NCCL env that gives NCCL the native Slingshot
+# transport and helps prevent application stalls (per CSCS resource-hook docs).
+# The hook implicitly enables the CXI hook, so it need not be set separately.
 # Without it NCCL falls back to TCP sockets over hsn0 — works for PP pipeline
 # P2P but is much slower and cannot do cross-node allreduce in a CUDA graph
 # (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only supports RDMA
-# transport protocol"). variant MUST match the image's CUDA major.
+# transport protocol"). SCOPE: this hook configures the NCCL DATA plane only;
+# it does NOT cover Gloo, which carries the PP control plane over TCP (hsn0) —
+# see README fix #11/#12 for the Gloo peer-disconnect stalls.
 com.hooks.aws_ofi_nccl.enabled = "true"
-com.hooks.aws_ofi_nccl.variant = "cuda13"

@@ -114,16 +114,27 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
 1. **No InfiniBand → NCCL over Slingshot.** Clariden has no `/dev/infiniband`
    and no IB verbs (`ibv_devinfo` empty); the high-speed fabric is Slingshot
    (NICs `hsn0`..`hsn3`, `/opt/cray/libfabric` CXI provider). NCCL's built-in
-   IB transport is therefore unused. **Fix:** the EDF
-   (`kimi-k3-clariden.toml`) carries the annotation
-   `com.hooks.aws_ofi_nccl.enabled=true` / `variant=cuda13` — the CSCS
-   Slurm/enroot hook that, at container start, `LD_PRELOAD`s
-   `/opt/cscs/aws-ofi-ccl-plugin/cuda13/libnccl-net.so` and wires libfabric's
-   CXI provider. The engine.sh adds the verified `NCCL_NET="AWS Libfabric"`,
-   `NCCL_CROSS_NIC=1`, `FI_CXI_DISABLE_HOST_REGISTER=1`,
-   `FI_CXI_DEFAULT_CQ_SIZE=131072`, `FI_CXI_RDZV_THRESHOLD=0`,
-   `FI_CXI_RDZV_GET_MIN=0`, `FI_MR_CACHE_MONITOR=userfaultfd`. `NCCL_SOCKET_IFNAME=hsn0`
-   is for the TCP bootstrap path only (the ofi plugin carries data).
+   IB transport is therefore unused. **Fix:** the EDF (`kimi-k3-clariden.toml`)
+   carries `com.hooks.aws_ofi_nccl.enabled=true`. Per the CSCS resource-hook
+   docs (software/container-engine/resource-hook/#hpe-slingshot-interconnect),
+   the Clariden vCluster defaults to `com.hooks.netstack.source="artifact"`, so
+   at container start the hook bind-mounts a standalone, **dynamically-linked
+   (`+dl`) aws-ofi-ccl plugin + libfabric CXI provider** (default aarch64
+   artifact: `gpu:cuda13,cxi:12.0.1,ofi:2.5.1,aws:1.18.0+dl`) and sets the
+   CXI/NCCL env that helps prevent application stalls. On artifact source the
+   `com.hooks.aws_ofi_nccl.variant` annotation is **ignored** (all artifacts are
+   `+dl`); it would only apply on `source=host`, where the docs' recommended
+   variant is `cuda-dl`, not the statically-linked `cuda13` the EDF previously
+   set. The engine.sh now adds those `NCCL_*`/`FI_CXI_*` values as `:=`
+   fallbacks that **yield to whatever the hook sets** (reconciled 2026-08);
+   `NCCL_SOCKET_IFNAME=hsn0` is for the TCP bootstrap path only (the ofi plugin
+   carries data). **Scope caveat — important:** this hook configures the NCCL
+   **data plane only**. It does NOT touch Gloo, which carries the PP
+   **control plane** over TCP (`hsn0`). The fix-11/12 PP-broadcast stalls
+   (`Connection closed by peer` in `gloo/transport/tcp/pair.cc`, observed on
+   3002366/3018155/3029640) are Gloo peer-disconnects the aws-ofi-nccl hook
+   cannot prevent; that needs a separate Gloo-level lever (timeout/retry or a
+   non-TCP PP control transport).
 2. **Cross-node collectives cannot be captured on CXI (TP32 flat).** Under
    `TP_SIZE=32 PP_SIZE=1`, the cross-node MoE all-reduces fail CUDA-graph
    capture with `cudaErrorStreamCaptureInvalidated` (job 2914910), and the OFI
@@ -463,6 +474,25 @@ soft-watchdog dump at 600 s is the first diagnostic on the next stall.
 figures came from a different harness on a first-boot run and are superseded
 by the **Verified benchmarks** table above (job 3000965), which matches the
 JSC recipe's curve on identical hardware and protocol.
+
+**Crash cores accumulate in `DEPLOY_DIR` — clean them after a successful
+bring-up.** Linux's `core_pattern` writes each crashing process's dump to its
+cwd (the engine runs in `DEPLOY_DIR`) as `core_<host>_<pid>`; the recipe
+deliberately does **not** set `ulimit -c 0`, so every hard-crash drops 1-8
+cores per node (one ~18-20 GB apparent per crashed rank, though they are
+largely *sparse* — real block usage is ~28%). Over the Jul 28 → Aug 7 bring-up
+this piled up to **71 stale cores, ~199 GB actual / 704 GiB apparent**, all
+removed 2026-08-08 (verified none newer than the serving job, all PIDs gone):
+the TP32-shape CUDA-graph crashes (job 2914910 family), the 1M-context runs,
+and the PP-stall fixes 11/12 (3002366 hard watchdog @300 s, 3018155 NCCL
+watchdog @600 s, and 3029640 whose Gloo `Connection closed by peer` first
+surfaced the real control-plane cause — that one's four newest cores at
+Aug 7 20:51 were the last removed). **The cores were diagnostically
+redundant:** every PP-stall root-cause came from the *live* log tracebacks +
+the fix-11 soft-watchdog dump, never the binary cores. They're kept enabled
+only so a *novel* future failure (not the known PP-stall family) can still
+yield one; if scratch pressure recurs, add `ulimit -c 0` to the engine srun
+step (or point `/proc/sys/kernel/core_pattern` at `|/bin/false` site-wide).
 
 ## Knobs (env, all overridable)
 

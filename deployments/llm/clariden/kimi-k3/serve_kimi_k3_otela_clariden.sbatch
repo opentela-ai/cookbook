@@ -92,30 +92,48 @@
 # -----------------------------------------------------------------------------
 # Image is docker://lmsysorg/sglang:kimi-k3 (CUDA 13) imported to a local
 # .sqsh (build_kimi_k3_image.sbatch). The EDF (kimi-k3-clariden.toml, found via
-# EDF_PATH below) carries the annotation com.hooks.aws_ofi_nccl.enabled=true
-# (variant cuda13), which is the CSCS Slurm/enroot hook that LD_PRELOADs
-# /opt/cscs/aws-ofi-ccl-plugin/cuda13/libnccl-net.so + wires libfabric's CXI
-# provider at container start. That gives NCCL the native Slingshot transport —
-# clariden has NO InfiniBand verbs, so NCCL's built-in IB transport is unused.
-# The per-rank engine.sh below adds the FI_CXI_* / NCCL_* tunables that were
-# verified on clariden for K3 multi-node.
+# EDF_PATH below) carries com.hooks.aws_ofi_nccl.enabled=true. Clariden defaults
+# to netstack source=artifact, so the hook bind-mounts the dynamically-linked
+# (+dl) aws-ofi-ccl plugin + libfabric CXI provider at container start (the
+# com.hooks.aws_ofi_nccl.variant annotation is ignored on artifact source).
+# That gives NCCL the native Slingshot transport — clariden has NO InfiniBand
+# verbs, so NCCL's built-in IB transport is unused. The per-rank engine.sh
+# below adds FI_CXI_* / NCCL_* tunables as := fallbacks that yield to whatever
+# the hook sets (reconciled with CSCS resource-hook docs, 2026-08).
 # =============================================================================
 
 set -uo pipefail
 
 # ----------------------------------------------------- script + deploy dirs --
-# SCRIPT_DIR is where this sbatch + kimi-k3-clariden.toml live, so the EDF is
-# found via EDF_PATH regardless of where the checkout is copied. Also keep
-# ~/.edf in the path so the pre-existing ~/.edf/kimi-k3.toml remains usable
-# (override with OTELA_EDF_NAME=kimi-k3).
-#
-# NOTE: Slurm copies the sbatch to /var/spool/slurmd/job<id>/ and runs it from
-# there, so ${BASH_SOURCE[0]} is the SPOOL copy (not the submit dir) and
-# EDF_PATH would miss the EDF. SLURM_SUBMIT_DIR is the real submit dir; fall
-# back to BASH_SOURCE for non-Slurm (manual) runs.
-SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-export EDF_PATH="${SCRIPT_DIR}:${EDF_PATH:-${HOME}/.edf}"
+# Locate the EDF ($OTELA_EDF_NAME.toml) regardless of the submit working
+# directory, so both submit styles work:
+#   - manual:  `cd <deploy-dir> && sbatch serve_*.sbatch`  (SLURM_SUBMIT_DIR
+#     is the deploy dir, so the EDF is a sibling there)
+#   - rcc:     `rcc job submit deployments/.../serve_*.sbatch` runs sbatch from
+#     the repo root (remote_dir), so SLURM_SUBMIT_DIR is the ROOT and the EDF
+#     lives in the deployments/llm/clariden/kimi-k3 subdirectory.
+# Without this search pyxis fails at the preflight srun with "failed to find a
+# readable environment file" (observed 2026-08-08 on jobs 3032795/3034577,
+# submitted from the root; the prior successful runs were submitted manually
+# from the subdir). Slurm copies the sbatch to /var/spool/slurmd/job<id>/ and
+# runs it from there, so ${BASH_SOURCE[0]} is the SPOOL copy and is NOT the
+# EDF dir — BASH_SOURCE is only a last-resort fallback for non-Slurm runs.
+# Keep ~/.edf on EDF_PATH so the pre-existing ~/.edf/kimi-k3.toml remains
+# usable (override with OTELA_EDF_NAME=kimi-k3).
 OTELA_EDF_NAME="${OTELA_EDF_NAME:-kimi-k3-clariden}"
+_edf_dir=""
+for _cand in \
+    "${SLURM_SUBMIT_DIR:-}" \
+    "${SLURM_SUBMIT_DIR:-}/deployments/llm/clariden/kimi-k3" \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+  [ -n "$_cand" ] && [ -f "$_cand/${OTELA_EDF_NAME}.toml" ] && { _edf_dir="$_cand"; break; }
+done
+if [ -z "$_edf_dir" ]; then
+  echo "FATAL: cannot locate ${OTELA_EDF_NAME}.toml (searched SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-<unset>} and the BASH_SOURCE dir). Submit from the deploy dir, or set EDF_PATH explicitly." >&2
+  exit 1
+fi
+export EDF_PATH="${_edf_dir}:${EDF_PATH:-${HOME}/.edf}"
+unset _edf_dir _cand
 
 # ---------------------------------------------------------------- deployment --
 # Reuses the existing /capstor/scratch/cscs/xyao/kimi-k3 tree: the imported
@@ -434,19 +452,23 @@ export NCCL_SOCKET_IFNAME="$IFACE" GLOO_SOCKET_IFNAME="$IFACE"
 SGLANG_HOST_IP="$(ip -o -4 addr show "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
 [ -z "$SGLANG_HOST_IP" ] && SGLANG_HOST_IP="$(hostname -I | awk '{print $1}')"
 export SGLANG_HOST_IP
-# --- Slingshot NCCL tunables (verified on clariden for K3 multi-node) -------
-# NCCL_NET selects the aws-ofi libfabric external plugin (LD_PRELOAD'd by the
-# EDF hook). The FI_CXI_* knobs were tuned on clariden for cross-node pipeline
-# P2P; do not drop them without re-verifying. FI_MR_CACHE_MONITOR=userfaultfd
-# avoids the default monitor that mishandles CXI-registered memory.
-export NCCL_NET="AWS Libfabric"
-export NCCL_CROSS_NIC=1
-export FI_CXI_DISABLE_HOST_REGISTER=1
-export FI_CXI_DEFAULT_CQ_SIZE=131072
-export FI_CXI_RDZV_THRESHOLD=0
-export FI_CXI_RDZV_GET_MIN=0
-export FI_MR_CACHE_MONITOR=userfaultfd
+# --- Slingshot NCCL tunables (reconciled with CSCS netstack hook) -----------
+# The EDF's com.hooks.aws_ofi_nccl hook (Clariden netstack source=artifact) sets
+# CXI/NCCL env at container start "to help prevent application stalls" (per
+# resource-hook docs). engine.sh runs INSIDE the container after the hook, so an
+# unconditional export would clobber those curated values. Use := so the hook's
+# values win when present; our values (tuned on clariden for K3 multi-node,
+# 2026-08) are only the fallback when the hook sets nothing. FI_MR_CACHE_MONITOR=
+# userfaultfd avoids the default monitor that mishandles CXI-registered memory.
+: "${NCCL_NET:=AWS Libfabric}" "${NCCL_CROSS_NIC:=1}" \
+  "${FI_CXI_DISABLE_HOST_REGISTER:=1}" "${FI_CXI_DEFAULT_CQ_SIZE:=131072}" \
+  "${FI_CXI_RDZV_THRESHOLD:=0}" "${FI_CXI_RDZV_GET_MIN:=0}" \
+  "${FI_MR_CACHE_MONITOR:=userfaultfd}"
+export NCCL_NET NCCL_CROSS_NIC FI_CXI_DISABLE_HOST_REGISTER \
+  FI_CXI_DEFAULT_CQ_SIZE FI_CXI_RDZV_THRESHOLD FI_CXI_RDZV_GET_MIN \
+  FI_MR_CACHE_MONITOR
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+echo "[rank $RANK] netstack: NCCL_NET=$NCCL_NET NCCL_CROSS_NIC=$NCCL_CROSS_NIC FI_CXI_DCQ=$FI_CXI_DEFAULT_CQ_SIZE FI_MR_CACHE_MONITOR=$FI_MR_CACHE_MONITOR"
 # Force IPv4 for bootstrap sockets (inherited from the JSC recipe; clariden hsn
 # interfaces are IPv4 so this is a safe no-op there).
 export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-IPv4}" GLOO_SOCKET_FAMILY="${GLOO_SOCKET_FAMILY:-IPv4}"
