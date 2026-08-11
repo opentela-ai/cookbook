@@ -25,6 +25,14 @@ HF_HOME = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache/huggingfa
 HF_HUB_OFFLINE = "1"
 TRANSFORMERS_OFFLINE = "1"
 TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache/triton"
+# TMPDIR on scratch (project 2161, unlimited).  AITER_JIT_DIR intentionally NOTs
+# outer-shell `export TMPDIR` is lost when srun uses --environment=$OTELA_EDF_NAME
+# (the EDF replaces, not merges, the inherited env).  Without this, Triton/LLVM
+# defaults to /tmp on the enroot overlay (tmpfs, competes with model memory)
+# causing "LLVM ERROR: IO failure on output stream: Disk quota exceeded"
+# (jobs 585851, 585992).
+TMPDIR = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.tmp"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache"
 NCCL_DEBUG = "WARN"
 PIP_BREAK_SYSTEM_PACKAGES = "1"
 

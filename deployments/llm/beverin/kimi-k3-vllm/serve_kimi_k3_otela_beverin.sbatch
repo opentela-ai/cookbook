@@ -2,11 +2,17 @@
 #SBATCH --job-name=k3-vllm-beverin
 #SBATCH --account=a-infra02
 #SBATCH --partition=mi300
-#SBATCH --nodes=4
+#SBATCH --nodes=6
 #SBATCH --ntasks-per-node=1
-# MI300A: 4 GPUs/node, 192 CPUs. No --cpus-per-task shrink: vLLM's ROCm
-# engine does not pin TP ranks to host NUMA cpus the way the sglang image
-# does (that caveat is GLM-4.7-Flash specific), so the whole node is fine.
+# MI300A APU (UMA): 4 GPUs/node, ~501 GiB system RAM.  6 nodes x 4 GPUs
+# = 24 GPUs (TP8 PP3).  Each GPU holds ~71 GiB dummy weights (896/8=112
+# experts), leaving ~57 GiB HBM free for activations + JIT.  Per-worker
+# system RAM ~99.5 GiB (71 weights + ~28.5 overhead); 4 workers/node =>
+# 398 < 478 GiB available (80 GiB margin).  K3_NO_CACHING=0 (default):
+# keep PyTorch caching allocator so torch.cuda.memory_allocated() works
+# correctly for vLLM's internal memory management.
+# AITER MLA constraint (job 585845): num_attention_heads=96, heads/GPU
+# must be in [1,15] or mult of 16.  TP=8 -> 12 heads OK; TP=4 -> 24 INVALID.
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=1-00:00:00
@@ -31,15 +37,7 @@
 #                          max-model-len 131072 / 128K):
 #   sbatch serve_kimi_k3_otela_beverin.sbatch
 #
-# Submit via remote-cluster-controller (rcc) from your laptop:
-#   rcc -p beverin push
-#   rcc -p beverin job submit serve_kimi_k3_otela_beverin.sbatch
-#   rcc -p beverin job status <JOBID>
-#   rcc -p beverin job tail <JOBID> -f
-#   rcc -p beverin job cancel <JOBID>
-#   rcc -p beverin pull logs/
-#
-# Override context length / shape (must satisfy TP*PP == nodes*4):
+# Override context length / shape (must satisfy TP*PP == nodes*GPUS_PER_NODE):
 #   sbatch --export=ALL,CTX_LEN=1048576 serve_kimi_k3_otela_beverin.sbatch
 #   sbatch --nodes=2 --export=ALL,TP_SIZE=4,PP_SIZE=2 serve_kimi_k3_otela_beverin.sbatch
 #
@@ -115,6 +113,13 @@ set -uo pipefail
 # NOT the submit dir — SLURM_SUBMIT_DIR is.
 export SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 export EDF_PATH="${SCRIPT_DIR}:${EDF_PATH:-${HOME}/.edf}"
+
+# Job temp is set to $RUNDIR/tmp (per-job, on scratch, auto-cleaned) AFTER
+# RUNDIR is defined below. Job 583899 died when TMPDIR defaulted to
+# $HOME/.tmp (22 GiB stale enroot UUID dirs); job 585851 hit
+# "Disk quota exceeded" (LLVM ERROR on Triton JIT) when TMPDIR was on
+# /capstor/store (project 7659 ~90% full). Scratch (project 2161) is
+# unlimited with 37 PB free -- see TRITON_CACHE_DIR below for same fix.
 OTELA_EDF_NAME="${OTELA_EDF_NAME:-kimi-k3-vllm}"
 
 # ---------------------------------------------------------------- deployment --
@@ -128,18 +133,32 @@ export MODEL_PATH="${MODEL_PATH:-/capstor/store/cscs/swissai/infra01/hf_models/m
 # sglang K3 registration (both advertise model=moonshotai/Kimi-K3; the mesh
 # round-robins them as additive capacity). Override to `kimi-k3` to match the
 # original bring-up probe script.
-export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3}"
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-SwissAI-Research/moonshot/kimi-k3-rocm}"
 
 # ------------------------------------------------------------------- shape ----
-# TP8 x PP2 (default): verified to reach full init on k3-eng11. world = TP*PP
-# must equal nodes*4 (4 GPUs/node) so vLLM can place world/4 ranks per node.
+# TP8 x PP3 (default): world = TP*PP = 24 must equal nodes*GPUS_PER_NODE.
+# MI300A APU: 4 workers/node * ~99.5 GiB/worker (dummy weights) = 398 < 478
+# GiB node RAM available.  TP=8 spans 2 nodes (4 GPUs/node * 2 = 8) for
+# allreduce over Slingshot Socket — the verified bring-up path (k3-eng8/11).
+# PP=3 stages 93/3 = 31 layers each.  896/8 = 112 experts/GPU.
+#
+# AITER MLA constraint (job 585845): num_attention_heads=96, so heads/GPU
+# must be in [1,15] or a multiple of 16.  TP=4 gives 96/4=24 heads/GPU —
+# INVALID (neither range).  TP=8 gives 96/8=12 heads/GPU — OK.
+#
+# GPU HBM: previous TP8 x PP2 on 16 GPUs (8 nodes x 2 GPUs) held ~106.5
+# GiB weights/GPU, leaving only ~21 GiB -> HSA OOM during _dummy_run
+# (job 585844).  With 24 GPUs (6 nodes x 4), each GPU holds ~71 GiB,
+# leaving ~57 GiB free for activations + JIT.
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 export TP_SIZE="${TP_SIZE:-8}"
-export PP_SIZE="${PP_SIZE:-2}"
-if [ "$(( TP_SIZE * PP_SIZE ))" -ne "$(( NNODES * 4 ))" ]; then
-  echo "FATAL: TP*PP=$((TP_SIZE*PP_SIZE)) != nodes*4=$((NNODES*4)). Examples:" >&2
-  echo "       4 nodes -> TP=8 PP=2 (default) or TP=4 PP=4" >&2
-  echo "       2 nodes -> TP=4 PP=2 or TP=8 PP=1" >&2
+export PP_SIZE="${PP_SIZE:-3}"
+if [ "$(( TP_SIZE * PP_SIZE ))" -ne "$(( NNODES * GPUS_PER_NODE ))" ]; then
+  echo "FATAL: TP*PP=$((TP_SIZE*PP_SIZE)) != nodes*GPUS_PER_NODE=$((NNODES*GPUS_PER_NODE)). Examples:" >&2
+  echo "       6 nodes x 4 GPUs -> TP=8 PP=3 (default)" >&2
+  echo "       8 nodes x 2 GPUs -> TP=8 PP=2 (GPU HBM OOM, see header notes)" >&2
+  echo "       6 nodes x 4 GPUs -> TP=4 PP=6 (AITER MLA: 24 heads/GPU INVALID)" >&2
   exit 1
 fi
 # Request-length bound. Kimi-K3 supports up to max_position_embeddings=1048576
@@ -199,6 +218,11 @@ export GEN_PROBE_TIMEOUT="${GEN_PROBE_TIMEOUT:-600}"
 export GEN_CORRECTNESS_MAX_TOKENS="${GEN_CORRECTNESS_MAX_TOKENS:-64}"
 export GEN_CORRECTNESS_MIN_PASS="${GEN_CORRECTNESS_MIN_PASS:-5}"
 export GEN_CORRECTNESS_PER_REQ_TIMEOUT="${GEN_CORRECTNESS_PER_REQ_TIMEOUT:-180}"
+# GEN_CORRECTNESS_SMOKE=1: with --load-format dummy (random weights), the
+# probe checks each prompt yields a NON-EMPTY continuation instead of factual
+# correctness. Verifies the full pipeline (load -> JIT -> forward -> HTTP)
+# without requiring real weights. Exit 0 iff all 6 prompts return tokens.
+export GEN_CORRECTNESS_SMOKE="${GEN_CORRECTNESS_SMOKE:-0}"
 
 export RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
 export PATCH_MARKER="$K3/home/pylib/.k3_patch_done"
@@ -206,16 +230,23 @@ mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/home/pylib" \
          "$DEPLOY_DIR/home/.cache/huggingface" \
          "$DEPLOY_DIR/home/.cache/triton"
 
+# Per-job TMPDIR on scratch (see comment above).  Triton/LLVM writes
+# intermediate .o/.ll during JIT; enroot writes UUID dirs here.  Being
+# under $RUNDIR, it is cleaned at job end -- no accumulation across runs.
+export TMPDIR="${TMPDIR:-$RUNDIR/tmp}"
+export TMP="$TMPDIR"
+mkdir -p "$TMPDIR" 2>/dev/null || true
+
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 export HEAD="${NODES[0]}"
 export HEAD_IP="$(getent hosts "$HEAD" | awk '{print $1}' | head -1)"
 
 echo "[$(date -Is)] job=$SLURM_JOB_ID nodes=$SLURM_JOB_NODELIST nnodes=$NNODES"
-echo "[$(date -Is)] head=$HEAD ($HEAD_IP)  tp=$TP_SIZE pp=$PP_SIZE  (world=$((TP_SIZE*PP_SIZE)) gpus=$((NNODES*4)))"
+echo "[$(date -Is)] head=$HEAD ($HEAD_IP)  tp=$TP_SIZE pp=$PP_SIZE  (world=$((TP_SIZE*PP_SIZE)) gpus=$((NNODES*GPUS_PER_NODE)) gpus_per_node=$GPUS_PER_NODE)"
 echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME  ctx=$CTX_LEN  max_seqs=$MAX_NUM_SEQS  gpu_mem=$GPU_MEM_UTIL"
 echo "[$(date -Is)] edf=$OTELA_EDF_NAME  image=$IMAGE"
 echo "[$(date -Is)] otela=$OTELA_BIN  bootstrap=$OTELA_RELAY_ADDR  serve_port=$SERVE_PORT  master_port=$MASTER_PORT"
-echo "[$(date -Is)] gen_probe=$GEN_PROBE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  health_timeout=$HEALTH_TIMEOUT"
+echo "[$(date -Is)] gen_probe=$GEN_PROBE  smoke=$GEN_CORRECTNESS_SMOKE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  health_timeout=$HEALTH_TIMEOUT"
 echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
 
 # ----------------------------------------------------------------- preflight --
@@ -288,9 +319,9 @@ if [ "$RANK" = "0" ]; then
   echo "[rank 0] PATCH_DONE marker=$PATCH_MARKER rc=$?"
 else
   echo "[rank $RANK] waiting for patch marker $PATCH_MARKER ..."
-  for i in $(seq 1 360); do
+  for i in $(seq 1 1800); do
     [ -f "$PATCH_MARKER" ] && break
-    sleep 10
+    sleep 2
   done
 fi
 [ -f "$PATCH_MARKER" ] || { echo "[rank $RANK] FATAL: patch marker missing after 1 h" >&2; exit 1; }
@@ -304,9 +335,89 @@ export PYTHONPATH="${K3}/home/pylib:${PYTHONPATH:-}"
 # --- vLLM + AITER environment ----------------------------------------------
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MOE=1
+# K3 on MI300A (gfx942): AITER MLA decode uses mla_gluon, a gfx950
+# (CDNA4) hardware feature.  No valid TP for 24 GPUs produces a head
+# count that is a multiple of 16 (persistent decode), so ALL valid
+# TPs select the Gluon path and fail with: mla_gluon requires gfx950
+# (job 586002).  Disable AITER MLA and fall back to TRITON_MLA (pure
+# Triton, no arch dependency).  AITER MoE (VLLM_ROCM_USE_AITER_MOE=1
+# above) remains enabled for MXFP4 expert GEMMs.
+export VLLM_ROCM_USE_AITER_MLA=0
+# gfx942: vLLM custom ROCm skinny GEMM (wvSplitKrc_ in csrc/rocm/skinny_gemms.hip)
+# fires Device-side assertion on M=10,7168x1536-class shapes and poisons the
+# device queue (async server: /health stays 200 but all forwards hang - jobs
+# 586723, 588129).  Fall back to torch/hipBLAS for those GEMMs.
+export VLLM_ROCM_USE_SKINNY_GEMM=0
+# K3_SKIP_FLYDSL_PATCHES=1: the TRITON_UNFUSED MoE backend (sitecustomize.py)
+# does not use the AITER FlyDSL kernels, so skip the time-consuming
+# MLIR/kernel patches in k3_patch.py (steps 3-6). K3_NO_ASYNC=1 disables
+# hardcoded use_async_copy in fused_moe.py on gfx942.
 export K3_NO_ASYNC=1
+export K3_SKIP_FLYDSL_PATCHES=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+# Shared Triton cache on /capstor/scratch (project 2161, unlimited quota,
+# 37 PB free).  Was on /capstor/store (project 7659 ~90% full) -- job
+# 585851 hit "LLVM ERROR: IO failure on output stream: Disk quota
+# exceeded" when 24 workers JIT-compiled batched_gemm_a16wfp4_ and the
+# clang++ output hit the project block/inode quota, crashing every
+# worker (segfault).  All workers load compiled kernels from the same
+# dir here so only the first run pays the LLVM cost.
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DEPLOY_DIR/triton_cache}"
+mkdir -p "$TRITON_CACHE_DIR" 2>/dev/null || true
+# TMPDIR on scratch (project 2161, unlimited).  AITER_JIT_DIR intentionally NOTs
+# outer-shell `export TMPDIR` is lost when srun uses
+# --environment=$OTELA_EDF_NAME (the EDF replaces, not merges, the
+# inherited env).  Without this, Triton/LLVM defaults to /tmp on the
+# enroot overlay (tmpfs, competes with model memory) causing
+# "LLVM ERROR: IO failure on output stream: Disk quota exceeded"
+# (jobs 585851, 585992).  K3 == DEPLOY_DIR (on /capstor/scratch).
+export TMPDIR="${TMPDIR:-$K3/home/.tmp}"
+export TMP="$TMPDIR"
+mkdir -p "$TMPDIR" 2>/dev/null || true
+# Debug: log actual cache/scratch dirs at startup to diagnose JIT failures.
+echo "[rank $RANK] dirs: TRITON_CACHE_DIR=$TRITON_CACHE_DIR TMPDIR=$TMPDIR HOME=$HOME"
+# Limit OMP threads per worker to reduce CPU memory during JIT compilation.
+# With 4 workers/node and ~69 GB system RAM free after load_model, each
+# worker's LLVM/Triton compilation must stay under ~17 GB.  OMP_NUM_THREADS=1
+# (single-threaded LLVM) keeps per-worker JIT memory at ~5-8 GB instead of
+# ~15 GB, giving a comfortable margin for 4× simultaneous compilation during
+# profile_run().
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# K3_NO_CACHING=0 (default): keep the PyTorch CUDA caching allocator so
+# torch.cuda.memory_allocated() works correctly on ROCm (with caching
+# disabled it returns 0, causing vLLM to report "Model loading took 0.0
+# GiB" and potentially malfunctioning in internal memory management).
+# The ~28.5 GiB/worker overhead is from CUDA context, Mamba state, and
+# attention setup — NOT from the caching allocator (confirmed in job
+# 585840: per-worker identical with/without caching).  With TP4 PP6,
+# per-worker is ~99.5 GiB (71 weights + 28.5 overhead); 4x99.5 = 398 < 478.
+# Set K3_NO_CACHING=1 only if system RAM OOM recurs and you accept the
+# broken memory_allocated() tradeoff.
+if [ "${K3_NO_CACHING:-0}" = "1" ]; then
+  export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+  echo "[rank $RANK] PYTORCH_NO_CUDA_MEMORY_CACHING=1 — caching allocator disabled (saves ~10-15 GiB/worker on UMA)"
+fi
+# MALLOC_TRIM_THRESHOLD_: cause glibc malloc to return freed heap to the OS
+# more aggressively (default 128 KiB).  With 4 workers/node each freeing
+# Python objects after load_model, this prevents the heap from retaining
+# several GiB of fragmented but unreserved address space.
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-65536}"
+# K3 JIT stagger: only 1 worker per node starts at a time (delay =
+# local_rank * K3_JIT_STAGGER_DELAY) so weight allocation (~108 GB/worker,
+# ~26s) happens one at a time instead of 4× simultaneously OOM'ing the
+# node (jobs 584773/584789/584984).  60s is enough for each worker's
+# load_model to finish before the next starts.
+export K3_JIT_STAGGER="${K3_JIT_STAGGER:-1}"
+export K3_JIT_STAGGER_DELAY="${K3_JIT_STAGGER_DELAY:-60}"
+# Memory monitor: log free -m every 5s to /tmp/k3_mem_monitor.log on
+# each node, so we can diagnose the OOM root cause.
+( while true; do
+    echo "$(date +%H:%M:%S) free=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)kB comm=$(awk '/Committed_AS/{print $2}' /proc/meminfo 2>/dev/null)kB"
+    sleep 5
+  done ) &
+_MEM_MON_PID=$!
+trap 'kill $_MEM_MON_PID 2>/dev/null' EXIT
 
 # --- RCCL networking: drop the EDF's CUDA-built OFI plugin, use Socket ------
 # The EDF com.hooks.aws_ofi_nccl hook LD_PRELOADs a CUDA libnccl-net.so that
@@ -318,6 +429,10 @@ unset NCCL_NET_PLUGIN NCCL_NET
 export NCCL_SOCKET_IFNAME="${K3_NIC:-hsn0}"
 export NCCL_IB_DISABLE=1
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Prevent RCCL socket bootstrap race when peers start with slight delay
+# (job 584844: nid002668 workers 18s late -> "Message truncated" cascade).
+# NCCL_SOCKET_NTHREADS=1 serialises socket I/O to avoid interleaved messages.
+export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-1}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
 echo "[rank $RANK] launching vLLM (head=$([ "$RANK" = 0 ] && echo api_server || echo headless))"
@@ -342,6 +457,12 @@ fi
 
 exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
 ENGINE
+
+# K3_DISABLE_KDA: EDF replaces inherited env, so embed outer-shell value
+# here (double-quoted heredoc IS expanded by the sbatch outer shell).
+cat >> "${RUNDIR}/engine.sh" <<EOFA
+export K3_DISABLE_KDA="${K3_DISABLE_KDA:-0}"
+EOFA
 chmod +x "$RUNDIR/engine.sh"
 
 # ============================================================ otela worker ====
@@ -435,7 +556,7 @@ trap 'stop_otela' EXIT TERM INT
   echo "[$(date -Is)] engine healthy (head=$HEAD:$SERVE_PORT) after ~$((HEALTH_TIMEOUT - (deadline - SECONDS)))s"
 
   if [ "$GEN_PROBE" = "1" ]; then
-    echo "[$(date -Is)] generation correctness probe (model=$SERVED_MODEL_NAME, max_tokens=$GEN_CORRECTNESS_MAX_TOKENS, min_pass=$GEN_CORRECTNESS_MIN_PASS, budget=${GEN_PROBE_TIMEOUT}s) ..."
+    echo "[$(date -Is)] generation ${GEN_CORRECTNESS_SMOKE:+smoke }probe (model=$SERVED_MODEL_NAME, max_tokens=$GEN_CORRECTNESS_MAX_TOKENS, min_pass=$GEN_CORRECTNESS_MIN_PASS, budget=${GEN_PROBE_TIMEOUT}s) ..."
     PROBE_OUT="$RUNDIR/gen_correctness_${SLURM_JOB_ID}.json"
     # Run INSIDE the kimi-k3-vllm container on the head (same
     # --overlap --environment=$OTELA_EDF_NAME launch as the otela worker): the
@@ -449,6 +570,7 @@ trap 'stop_otela' EXIT TERM INT
     # $PROBE_OUT. The `timeout` backstop guards a hung request past per-req.
     GEN_CORRECTNESS_TIMEOUT="$GEN_PROBE_TIMEOUT" \
     GEN_CORRECTNESS_PER_REQ_TIMEOUT="$GEN_CORRECTNESS_PER_REQ_TIMEOUT" \
+    GEN_CORRECTNESS_SMOKE="$GEN_CORRECTNESS_SMOKE" \
       timeout "$((GEN_PROBE_TIMEOUT + 300))" \
       srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
            -w "$HEAD" --environment="$OTELA_EDF_NAME" \
