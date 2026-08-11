@@ -470,26 +470,27 @@ VLLM_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
 )
-# --enable-prefix-caching: gated by K3_PREFIX_CACHE (default 1 = on, the
-# production setting). On this image, prefix caching routes the KV cache
-# manager to HybridKVCacheCoordinator (kv_cache_coordinator.py:886, selected
-# whenever len(kv_cache_groups) > 1). Kimi-K3's attention layers all share
-# ONE KV cache spec (the Mamba layers' recurrent state is managed
-# separately, not via kv_cache_groups), so verify_and_split_kv_cache_groups
-# collapses every group into a single SpecGroup and then asserts
-#   "HybridKVCacheCoordinator requires at least two attention groups"
-# (kv_cache_coordinator.py:627). This crashes BOTH the eager path (589044)
-# and the PIECEWISE path (589322) at scheduler init, BEFORE any cudagraph
-# work — so the prefix-cache change (commit 9f3177e) silently masked the
-# original FULL-decode-cudagraph deadlock (588153/588156, which ran WITHOUT
-# prefix caching and reached the deadlock).
-# K3_PREFIX_CACHE=0 opts out -> KVCacheCoordinatorNoPrefixCache (no
-# assertion), the SAME path 588153/588156 took, so K3_PIECEWISE=1 can be
-# tested in isolation (only the cudagraph_mode changes vs the known
-# deadlock baseline). The HybridKVCacheCoordinator assertion is a real
-# upstream bug (selection should key on distinct-spec count, not raw group
-# count) to fix separately via sitecustomize.py for production-with-prefix.
-export K3_PREFIX_CACHE="${K3_PREFIX_CACHE:-1}"
+# --enable-prefix-caching: gated by K3_PREFIX_CACHE (default 0 = OFF).
+# Prefix caching is UNCONDITIONALLY BROKEN on this image for Kimi-K3:
+# with --enable-prefix-caching, the KV cache manager selects
+# HybridKVCacheCoordinator (kv_cache_coordinator.py:886, whenever
+# len(kv_cache_groups) > 1). Kimi-K3 has >1 kv_cache_groups (Mamba +
+# attention) but they all share ONE KV cache spec (Mamba recurrent state
+# is managed separately, not via kv_cache_groups), so
+# verify_and_split_kv_cache_groups collapses every group into a single
+# SpecGroup and asserts 'HybridKVCacheCoordinator requires at least two
+# attention groups' (kv_cache_coordinator.py:627). This fires for ANY
+# config with prefix caching ON — eager (589044), PIECEWISE (589322), and
+# the FULL-decode-cudagraph path alike — at scheduler init, BEFORE any
+# cudagraph work. The commit that added --enable-prefix-caching (9f3177e)
+# thus REGRESSED the only proven-working path (ENFORCE_EAGER=1, no prefix
+# caching; 10+ jobs 588302-588856, up to 415 tok/s). K3_PREFIX_CACHE=0
+# (-> KVCacheCoordinatorNoPrefixCache, no assertion) restores that
+# known-good config. Set K3_PREFIX_CACHE=1 ONLY after the upstream
+# HybridKVCacheCoordinator selection bug is fixed (it should key on
+# distinct-spec count, not raw group count, and fall back to
+# UnitaryKVCacheCoordinator when all groups share one spec).
+export K3_PREFIX_CACHE="${K3_PREFIX_CACHE:-0}"
 if [ "$K3_PREFIX_CACHE" = "1" ]; then
   VLLM_ARGS+=(--enable-prefix-caching)
 fi
@@ -528,10 +529,24 @@ fi
 # ops, keeping the PP recv/send (which run eagerly in the worker driver,
 # outside the model forward) out of the captured graph pieces. splitting_ops
 # omitted from the JSON so vLLM auto-populates from _attention_ops
-# (compilation.py:1144). UNTESTED for Kimi-K3 on this image — the model does
-# not carry @support_torch_compile (the auto-enable comment calls breakable
-# "the supported PIECEWISE path"), so mode=VLLM_COMPILE may fail fast. Use
-# with LOAD_FORMAT=dummy and DISTRIBUTED_TIMEOUT_SECONDS=300 for iteration.
+# (compilation.py:1144). CONFIRMED NOT VIABLE on this image (job 589322):
+# vLLM accepts mode=VLLM_COMPILE + cudagraph_mode=PIECEWISE and
+# auto-populates 15 splitting_ops, but KimiK3ForConditionalGeneration
+# carries NO @support_torch_compile, so compilation_counter.num_models_seen
+# is never incremented — vllm.py:2410 only WARNS ("torch.compile is turned
+# on, but the model ... does not support it") and never wraps the model, so
+# NO FX graph is produced to split. At init (gpu_model_runner.py:5442),
+# is_breakable_cudagraph_enabled()=False (we set VLLM_USE_BREAKABLE=0)
+# skips BreakableCUDAGraphWrapper, and PIECEWISE.has_full_cudagraphs()=False
+# (PIECEWISE is a simple enum, not a FULL/PIECEWISE tuple, compilation.py:83)
+# skips CUDAGraphWrapper(FULL). Net: NO wrapper is installed -> the model
+# runs EAGER, identical runtime to ENFORCE_EAGER=1. So K3_PIECEWISE=1 does
+# NOT validate the PIECEWISE cudagraph hypothesis — it is blocked by the
+# missing upstream @support_torch_compile on Kimi-K3 (requires vLLM/model
+# work). The REAL correctness gate is ENFORCE_EAGER=1 K3_PREFIX_CACHE=0
+# (cudagraph_mode=NONE -> no wrapper -> no FULL decode graph -> no
+# recv_object deadlock). Use with LOAD_FORMAT=dummy and
+# DISTRIBUTED_TIMEOUT_SECONDS=300 for iteration.
 if [ "${K3_PIECEWISE:-0}" = "1" ]; then
   # ENFORCE_EAGER=1 forces mode=NONE + cudagraph_mode=NONE at config time
   # (vllm.py:~1190), silently overriding the PIECEWISE experiment. Warn and
