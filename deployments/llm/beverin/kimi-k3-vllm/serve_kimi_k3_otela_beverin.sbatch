@@ -183,13 +183,13 @@ fi
 # Kimi-K3 is a hybrid reasoning model: its chat template emits a <think>...</think>
 # (reasoning) block and supports OpenAI-style tool calls. vLLM exposes
 # reasoning_content + tool_calls on /v1/chat/completions ONLY with
-# --enable-auto-tool-choice + --tool-parser + --reasoning-parser. Clariden/JSC
-# (sglang) spell the tool flag --tool-call-parser; vLLM spells it --tool-parser.
-# The `kimi_k3` parser ships in the custom vllm-openai-rocm:kimi-k3 image; if an
-# image bump drops it, startup errors "Unknown tool parser: kimi_k3" first --
-# set K3_ENABLE_PARSERS=0 to recover without editing this file. The
-# /v1/completions probe below is unaffected (no chat template / tools applied),
-# so parsing stays out of the mandatory correctness gate.
+# --enable-auto-tool-choice + --tool-call-parser + --reasoning-parser. This
+# kimi-k3 vLLM fork spells the tool flag --tool-call-parser, same as Clariden/
+# JSC (sglang). The `kimi_k3` parser ships in the custom vllm-openai-rocm:kimi-k3
+# image; if an image bump drops it, startup errors "invalid tool call parser:
+# kimi_k3" first -- set K3_ENABLE_PARSERS=0 to recover without editing this
+# file. The /v1/completions probe below is unaffected (no chat template / tools
+# applied), so parsing stays out of the mandatory correctness gate.
 export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
 
 # ------------------------------------------------------------------- otela ----
@@ -463,13 +463,13 @@ VLLM_ARGS=(
   --enable-prefix-caching
 )
 # Reasoning + tool-call parsing (mirrors Clariden/JSC sglang --reasoning-parser
-# kimi_k3 --tool-call-parser kimi_k3). vLLM uses --tool-parser, not
-# --tool-call-parser. Gated: set K3_ENABLE_PARSERS=0 if the image lacks the
-# kimi_k3 parser (startup errors "Unknown tool parser" first).
+# kimi_k3 --tool-call-parser kimi_k3). This kimi-k3 vLLM fork uses the same
+# --tool-call-parser spelling. Gated: set K3_ENABLE_PARSERS=0 if the image
+# lacks the kimi_k3 parser (startup errors "invalid tool call parser" first).
 if [ "${K3_ENABLE_PARSERS:-1}" = "1" ]; then
   VLLM_ARGS+=(
     --enable-auto-tool-choice
-    --tool-parser kimi_k3
+    --tool-call-parser kimi_k3
     --reasoning-parser kimi_k3
   )
 fi

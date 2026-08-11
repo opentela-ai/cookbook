@@ -258,18 +258,18 @@ Kimi-K3 is a hybrid reasoning model: its chat template emits a `<think>`
 (reasoning) block before the answer and supports OpenAI-style tool calls.
 vLLM splits these into the `reasoning_content` and `tool_calls` response
 fields **only** when launched with `--enable-auto-tool-choice` + a
-`--reasoning-parser` + `--tool-parser`. This recipe adds all three (parser
-`kimi_k3`, shipped by the `vllm-openai-rocm:kimi-k3` image) plus
+`--reasoning-parser` + `--tool-call-parser`. This recipe adds all three
+(parser `kimi_k3`, shipped by the `vllm-openai-rocm:kimi-k3` image) plus
 `--enable-prefix-caching`, mirroring the Clariden/JSC sglang launch
-(`--reasoning-parser kimi_k3 --tool-call-parser kimi_k3`) — note vLLM spells
-the tool flag `--tool-parser`, not sglang's `--tool-call-parser`.
+(`--reasoning-parser kimi_k3 --tool-call-parser kimi_k3`); this kimi-k3 vLLM
+fork spells the tool flag `--tool-call-parser`, the same as sglang.
 
 The whole group is gated by `K3_ENABLE_PARSERS` (default `1`). If an image
-bump drops the `kimi_k3` parser, vLLM errors `Unknown tool parser: kimi_k3`
-at startup; set `K3_ENABLE_PARSERS=0` to launch without parsing while the
-parser is restored. The mandatory correctness probe sends plain
-`/v1/completions` (no chat template, no tools), so parsing does not gate
-registration.
+bump drops the `kimi_k3` parser, vLLM errors `invalid tool call parser:
+kimi_k3 (chose from ...)` at startup; set `K3_ENABLE_PARSERS=0` to launch
+without parsing while the parser is restored. The mandatory correctness probe
+sends plain `/v1/completions` (no chat template, no tools), so parsing does
+not gate registration.
 
 ```bash
 # /v1/chat/completions surfaces reasoning_content + tool_calls:
@@ -336,7 +336,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `GEN_CORRECTNESS_MIN_PASS` | `5` | Min correct of 6; all 3 crisp must also pass. Set `6` for a strict baseline match. |
 | `GEN_CORRECTNESS_PER_REQ_TIMEOUT` | `180` | Per-request urllib timeout (s); the first request may trigger CUDA-graph capture. |
 | `ENFORCE_EAGER` | `0` | Set `1` to add `--enforce-eager` (skip CUDA-graph capture; try if capture is unstable). |
-| `K3_ENABLE_PARSERS` | `1` | Adds `--enable-prefix-caching --enable-auto-tool-choice --tool-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `Unknown tool parser` first). |
+| `K3_ENABLE_PARSERS` | `1` | Adds `--enable-prefix-caching --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64, sai-v0.0.6 (`--bootstrap.static`, `--label`). |
 | `OTELA_RELAY_ADDR` | `/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJk…` | Alps OpenTela bootstrap peer (direct, no relay). |
