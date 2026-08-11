@@ -42,11 +42,19 @@ forces `compilation_config.mode = NONE`. With `mode=NONE` and empty
 the gloo `recv_object` on the PP boundary (`parallel_state.py:838`), which
 cannot be replayed, deadlocking at the first real decode.
 
-**Workaround:** Use `ENFORCE_EAGER=1` (no CUDA graphs). PROVEN: 10+ jobs
-(588302–588856) served real tokens at up to 415 tok/s aggregate; the
-confirming run 589456 (`ENFORCE_EAGER=1 K3_PREFIX_CACHE=0`, dummy weights,
-smoke probe) passed 6/6 prompts at ~6 tok/s single-request. Single-request
-decode is 7.3 tok/s; aggregate throughput scales via batching (see below).
+**Workaround:** Use `ENFORCE_EAGER=1` (no CUDA graphs). The dummy-weight
+table below (jobs 588302–588856, `--load-format dummy`) characterizes
+throughput up to 415 tok/s aggregate (max_num_seqs 1–256); dummy weights
+exercise the identical compute path, so throughput/latency are real (see
+Caveats). Real-weight *correctness* is proven separately by job 588856
+(`ENFORCE_EAGER=1`, no prefix caching, `CTX_LEN=131072`, `max_num_seqs=8`,
+real safetensors): the factual probe returned correct answers —
+"Paris" for the capital, "2, 3, 5, 7, 11, …" for the primes — at
+6–7 tok/s single-request (matching the dummy single-request rate, confirming
+the throughput parity). The confirming smoke run 589456 (`ENFORCE_EAGER=1
+K3_PREFIX_CACHE=0`, dummy, 6/6 non-empty) verified the recipe after the
+prefix-cache gating fix. Run 589458 (this benchmark) combines real weights
++ the correctness gate + a concurrent throughput sweep.
 
 **`K3_PIECEWISE=1` is CONFIRMED NOT VIABLE** (job 589322). The recipe knob
 opts out of breakable (`VLLM_USE_BREAKABLE_CUDAGRAPH=0`) and sets
@@ -86,6 +94,14 @@ distinct-spec count, not raw group count, and fall back to
 `UnitaryKVCacheCoordinator` when all groups share one spec).
 
 ## Batching benchmark (ENFORCE_EAGER=1)
+
+> **Weights:** the table below is from `--load-format dummy` runs (jobs
+> 588302–588856). Dummy weights exercise the identical compute path, so the
+> throughput/latency numbers are real (see Caveats). Real-weight
+> *correctness* is proven separately by job 588856 (Paris, primes, 6–7
+> tok/s single-request); a live real-weight + concurrent-throughput run
+> (job 589458) supersedes this table once it completes — see the
+> "Live real-weight benchmark" section below.
 
 All runs use `max_num_batched_tokens=2048–4096`, `--kv-cache-memory-bytes`
 matching `max_num_seqs` (1–16 GiB). Prompt length ≈ 30 tokens (short,
