@@ -152,9 +152,12 @@ cp -n /capstor/store/cscs/swissai/infra01/hf_models/models/moonshotai/Kimi-K3/* 
 `/health` returning 200 does **not** prove the engine can run a forward
 pass (the deepseek-v4 recipe registered on `/health` and 502'd every
 request), and a non-empty chat response does **not** prove the MoE compute
-path is correct. K3 has never generated a token on this GPU family, so this
-recipe runs a **mandatory** factual-correctness probe (`GEN_PROBE=1`,
-default) before registration.
+path is correct. K3 has generated tokens on this GPU family **only** with
+`ENFORCE_EAGER=1` (no cudagraph); a non-cudagraph launch has served real
+tokens at up to 415 tok/s aggregate (10+ jobs, `BENCHMARK.md`). A
+cudagraph launch deadlocks on PP3 decode (full-decode graph captures the
+gloo `recv_object`), so this recipe runs a **mandatory** factual-correctness
+probe (`GEN_PROBE=1`, default) before registration.
 
 `gen_correctness.py` sends the **same six greedy `/v1/completions` prompts
 the Clariden sglang servekit bench uses** (temperature 0, `max_tokens` 64 —
@@ -271,6 +274,14 @@ without parsing while the parser is restored. The mandatory correctness probe
 sends plain `/v1/completions` (no chat template, no tools), so parsing does
 not gate registration.
 
+`--enable-prefix-caching` is gated **separately** by `K3_PREFIX_CACHE`
+(default `0` = OFF) — it is **unconditionally broken** on this image for
+Kimi-K3 (the KV cache manager selects `HybridKVCacheCoordinator` whenever
+`len(kv_cache_groups) > 1`, but K3's Mamba+attention groups all share one
+KV cache spec, so it asserts *"requires at least two attention groups"*
+(`kv_cache_coordinator.py:627`) at scheduler init, for ANY config). See
+`BENCHMARK.md` for the full root-cause and the regression history.
+
 ```bash
 # /v1/chat/completions surfaces reasoning_content + tool_calls:
 curl -s http://<HEAD>:8080/v1/chat/completions \
@@ -336,8 +347,9 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `GEN_CORRECTNESS_MIN_PASS` | `5` | Min correct of 6; all 3 crisp must also pass. Set `6` for a strict baseline match. |
 | `GEN_CORRECTNESS_PER_REQ_TIMEOUT` | `180` | Per-request urllib timeout (s); the first request may trigger CUDA-graph capture. |
 | `ENFORCE_EAGER` | `0` | Set `1` to add `--enforce-eager` (skip CUDA-graph capture; the proven path on gfx942+PP3 per `BENCHMARK.md`). |
-| `K3_ENABLE_PARSERS` | `1` | Adds `--enable-prefix-caching --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
-| `K3_PIECEWISE` | `0` | **Experimental.** Set `1` to opt into the "textbook fix" for the gfx942 PP3 decode deadlock: `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'` so `torch.compile` splits the forward at attention ops, keeping the gloo `recv_object` (PP comm, runs eagerly in the worker driver) out of the captured graph. **Untested** for Kimi-K3 (no `@support_torch_compile` — `mode=VLLM_COMPILE` may fail fast). Pair with `LOAD_FORMAT=dummy` + `DISTRIBUTED_TIMEOUT_SECONDS=300` for a fast (≤30 min) iteration; see `BENCHMARK.md` for the deadlock root cause. |
+| `K3_PREFIX_CACHE` | `0` | Set `1` to add `--enable-prefix-caching`. **Default `0` because prefix caching is unconditionally broken on this image** (HybridKVCacheCoordinator assertion at `kv_cache_coordinator.py:627`; K3's Mamba+attention groups share one KV cache spec). `0` selects `KVCacheCoordinatorNoPrefixCache` and restores the proven-working `ENFORCE_EAGER=1` path. Set `1` only after the upstream selection bug is fixed. |
+| `K3_ENABLE_PARSERS` | `1` | Adds `--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
+| `K3_PIECEWISE` | `0` | **Confirmed NOT viable** (job 589322). Sets `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'`, but `KimiK3ForConditionalGeneration` carries NO `@support_torch_compile`, so `mode=VLLM_COMPILE` only warns (`vllm.py:2410`) and at init (`gpu_model_runner.py:5442`) `is_breakable=False` + `PIECEWISE.has_full_cudagraphs()=False` installs NO wrapper — the model runs EAGER, identical to `ENFORCE_EAGER=1`. Real PIECEWISE cudagraph requires upstream `@support_torch_compile` on Kimi-K3. |
 | `LOAD_FORMAT` | _unset_ | Override weight loading (e.g. `dummy` for a 5-min cold start without real weights — used with `K3_PIECEWISE=1`). |
 | `DISTRIBUTED_TIMEOUT_SECONDS` | _unset_ | Override the gloo/NCCL init+recv timeout (vLLM default 3600 s). Set low (e.g. `300`) with `K3_PIECEWISE=1` so a decode deadlock fails in 5 min, not 1 h. |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
