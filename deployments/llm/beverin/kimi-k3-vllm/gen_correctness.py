@@ -84,6 +84,18 @@ def _train(text):
     return ("40" in head) and ("km" in head or "kilometer" in head)
 
 
+def _nonempty(text):
+    """Smoke-test matcher: ANY non-empty continuation passes.
+
+    Used with --load-format dummy (GEN_CORRECTNESS_SMOKE=1): the model serves
+    random weights, so tokens are garbage but the full pipeline (weight load ->
+    JIT compile -> forward pass -> /v1/completions -> HTTP response) is
+    exercised end-to-end. A non-empty response proves the AITER/Triton MoE path
+    does not crash, NaN, or 502 — the real question on first gfx942 bring-up.
+    """
+    return len(text.strip()) > 0
+
+
 # (prompt_index, label, matcher, crisp?)
 #  matchers receive the raw continuation (choices[0].text).
 CASES = [
@@ -140,6 +152,12 @@ def main():
     min_pass = int(sys.argv[5]) if len(sys.argv) > 5 else int(os.environ.get("GEN_CORRECTNESS_MIN_PASS", "5"))
     per_req = float(os.environ.get("GEN_CORRECTNESS_PER_REQ_TIMEOUT", "180"))
     overall = float(os.environ.get("GEN_CORRECTNESS_TIMEOUT", "600"))
+    smoke = int(os.environ.get("GEN_CORRECTNESS_SMOKE", "0"))
+    if smoke:
+        # --load-format dummy: verify the PIPELINE (load + JIT + forward +
+        # HTTP) produces non-empty tokens, NOT factual correctness. All
+        # prompts are equal (no crisp gate); every one must be non-empty.
+        min_pass = len(CORRECTNESS_PROMPTS)
 
     by_idx = {c[0]: c for c in CASES}
     t_start = time.time()
@@ -147,7 +165,7 @@ def main():
     ok = 0
     crisp_ok = 0
 
-    print(f"[CORRECTNESS] probing {base_url.rstrip('/')}/v1/completions "
+    print(f"[{'SMOKE' if smoke else 'CORRECTNESS'}] probing {base_url.rstrip('/')}/v1/completions "
           f"model={model} max_tokens={max_tokens} min_pass={min_pass} "
           f"crisp={CRISP_TOTAL} budget={overall:g}s")
 
@@ -169,10 +187,13 @@ def main():
             entry["elapsed_s"] = round(dt, 3)
             txt = _text(resp)
             entry["text"] = txt
-            entry["ok"] = bool(matcher(txt))
+            if smoke:
+                entry["ok"] = _nonempty(txt)
+            else:
+                entry["ok"] = bool(matcher(txt))
             if entry["ok"]:
                 ok += 1
-                if crisp:
+                if crisp and not smoke:
                     crisp_ok += 1
         except Exception as exc:  # noqa: BLE001 -- record + continue so the
             # operator sees EVERY prompt's status, not just the first failure.
@@ -185,8 +206,11 @@ def main():
         print(f"[CORRECTNESS] {idx + 1}/{len(CORRECTNESS_PROMPTS)} {flag}{mark} "
               f"{label:<34} | {preview}")
 
-    verdict = (crisp_ok == CRISP_TOTAL) and (ok >= min_pass)
-    print(f"[CORRECTNESS] pass={ok}/{len(CORRECTNESS_PROMPTS)} "
+    if smoke:
+        verdict = ok == len(CORRECTNESS_PROMPTS)
+    else:
+        verdict = (crisp_ok == CRISP_TOTAL) and (ok >= min_pass)
+    print(f"[{'SMOKE' if smoke else 'CORRECTNESS'}] pass={ok}/{len(CORRECTNESS_PROMPTS)} "
           f"crisp={crisp_ok}/{CRISP_TOTAL} "
           f"verdict={'PASS' if verdict else 'FAIL'} "
           f"(model={model}, max_tokens={max_tokens}, min_pass={min_pass}, "
