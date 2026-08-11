@@ -156,8 +156,10 @@ path is correct. K3 has generated tokens on this GPU family **only** with
 `ENFORCE_EAGER=1` (no cudagraph); a non-cudagraph launch has served real
 tokens — up to 415 tok/s aggregate under concurrent load
 (dummy-weight sweep, `BENCHMARK.md`; identical compute path, so throughput
-is real), and real-weight *correctness* is proven by job 588856 ("Paris",
-"2, 3, 5, 7, 11" at 6–7 tok/s single-request). A cudagraph launch
+is real), and real-weight *correctness* is confirmed by job 589458 (6/6 PASS:
+"Paris", "Rayleigh scattering", "2, 3, 5, 7", "40 km/h", fibonacci,
+entropy) and scales to 179 tok/s aggregate at 64-way concurrency
+(`BENCHMARK.md`). A cudagraph launch
 deadlocks on PP3 decode (full-decode graph captures the gloo `recv_object`),
 so this recipe runs a **mandatory** factual-correctness probe (`GEN_PROBE=1`,
 default) before registration, and an optional concurrent throughput sweep

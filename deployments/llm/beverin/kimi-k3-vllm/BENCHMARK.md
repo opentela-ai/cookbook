@@ -46,12 +46,12 @@ cannot be replayed, deadlocking at the first real decode.
 table below (jobs 588302–588856, `--load-format dummy`) characterizes
 throughput up to 415 tok/s aggregate (max_num_seqs 1–256); dummy weights
 exercise the identical compute path, so throughput/latency are real (see
-Caveats). Real-weight *correctness* is proven separately by job 588856
-(`ENFORCE_EAGER=1`, no prefix caching, `CTX_LEN=131072`, `max_num_seqs=8`,
-real safetensors): the factual probe returned correct answers —
-"Paris" for the capital, "2, 3, 5, 7, 11, …" for the primes — at
-6–7 tok/s single-request (matching the dummy single-request rate, confirming
-the throughput parity). The confirming smoke run 589456 (`ENFORCE_EAGER=1
+Caveats). Real-weight *correctness* is confirmed by job 589458 (6/6 PASS:
+"Paris", "Rayleigh scattering", "2, 3, 5, 7", "40 km/h", fibonacci,
+entropy) and 588856 (5/6) at 6–7 tok/s single-request; the live run 589458
+ALSO scaled to 179 tok/s aggregate at 64-way concurrency (`benchmark.py`,
+see "Live real-weight benchmark" below), reproducing the dummy numbers
+almost exactly. The confirming smoke run 589456 (`ENFORCE_EAGER=1
 K3_PREFIX_CACHE=0`, dummy, 6/6 non-empty) verified the recipe after the
 prefix-cache gating fix. Run 589458 (this benchmark) combines real weights
 + the correctness gate + a concurrent throughput sweep.
@@ -158,6 +158,78 @@ run.
 | Balanced | 16 | 512 | 87 tok/s | ~94 s |
 | High throughput | 64 | 512 | 207 tok/s | ~159 s |
 | Maximum throughput | 256 | 512 | 415 tok/s | ~315 s |
+
+## Live real-weight benchmark (job 589458)
+
+The dummy-weight table above characterizes throughput (identical compute
+path). This section is the first end-to-end benchmark of the current fix
+**with real weights**: `ENFORCE_EAGER=1`, `K3_PREFIX_CACHE=0` (no prefix
+caching), `CTX_LEN=131072`, `max_num_seqs=64`, `--kv-cache-memory-bytes
+8589934592` (8 GiB), `--max-num-batched-tokens 2048`, `--skip-mm-profiling`,
+real safetensors (1.5 T, 96 shards, ~78-min cold start across 6 nodes).
+`BENCHMARK=1` ran a `/v1/completions` concurrency sweep (`benchmark.py`:
+`ignore_eos`, `temperature 0`, `out_tok=256`, `in_tok≈50`, warmup discarded)
+after the mandatory correctness probe passed.
+
+### Correctness — 6/6 PASS (real weights)
+
+All three CRISP prompts (Paris, primes, 40 km/h) AND all three SOFT prompts
+(Rayleigh, fibonacci, entropy) returned correct, coherent continuations —
+*better* than the earlier real-weight run 588856 (which had prompt 2 fail).
+The model serves genuine factual output on gfx942, not just non-empty
+tokens. Samples (temperature 0, max_tokens 64):
+
+| # | prompt | expects | sample output |
+|---|---|---|---|
+| 1 | `The capital of France is` | Paris ✓crisp | ` Paris." … The Eiffel Tower is located in Paris. … The Louvre Museum is in Paris. The Seine River flows through Paris.` |
+| 2 | `Explain … why the sky is blue.` | Rayleigh ✓soft | ` (Rayleigh scattering: shorter wavelengths scatter more strongly in the atmosphere.)` |
+| 3 | `List the first 10 prime numbers.` | 2,3,5,7,11 ✓crisp | ` 2, 3, 5, 7, 11, 13, 17, 19, 23, 29` |
+| 4 | `… train travels 60 km in 1.5 h …` | 40 km/h ✓crisp | ` 40 km/h. … A car travels 120 km in 2 hours … 60 km/h.` |
+| 5 | `def fibonacci(n):` | return ✓soft | ` if n == 0: return 0 elif n == 1: return 1 else: return fibonacci(n-1) + fibonacci(n-2)` |
+| 6 | `The three laws of thermodynamics are:` | entropy ✓soft | ` (1) Energy cannot be created or destroyed … (2) The entropy of an isolated system always increases … (3) As temperature approaches absolute zero …` |
+
+verdict=PASS, pass=6/6, crisp=3/3, elapsed=103.5 s.
+
+### Throughput — real weights scale to 179 tok/s
+
+Warmup (C=4 N=8, discarded) reached 24.3 tok/s aggregate (6.6 per-req
+median, p50 45.2 s) so every measured level saw warm Triton kernels.
+
+| Concurrency | N reqs | ok | wall (s) | out_tok/req | agg (tok/s) | per-req (med tok/s) | lat p50 (s) | lat max (s) | speedup |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 16 | 16 | 621.3 | 256 | **6.6** | 6.6 | 38.8 | 39.9 | 1.0× |
+| 8 | 32 | 32 | 164.9 | 256 | **49.7** | 6.3 | 40.8 | 42.9 | 7.5× |
+| 32 | 64 | 64 | 133.7 | 256 | **122.5** | 4.0 | 69.6 | 69.6 | 18.5× |
+| 64 | 64 | 64 | 91.5 | 256 | **179.1** | 2.8 | 91.1 | 91.5 | 27.1× |
+
+peak=**179.1 tok/s** at concurrency 64; full sweep elapsed 1095.5 s.
+
+### Real-vs-dummy throughput parity (confirmed)
+
+The real-weight numbers reproduce the dummy table almost exactly,
+validating the "identical compute path → real throughput" caveat:
+
+| Concurrency | real (589458) | dummy table | match |
+|:---:|:---:|:---:|:---:|
+| 1 | 6.6 tok/s | 7.32 tok/s (1×128) | ✓ (within warmup variance) |
+| 8 | 49.7 tok/s | 50.91 tok/s (8×512) / 43.00 (8×128) | ✓ in range |
+| 32 | 122.5 tok/s | 122.43 tok/s (32×512) | ✓ exact |
+| 64 | 179.1 tok/s | 178.09 tok/s (64×256) | ✓ exact |
+
+The dummy table's higher points (207 tok/s @ max_num_seqs=64 out=512; 415
+tok/s @ max_num_seqs=256) used a larger `max_num_seqs`/output budget than
+this sweep's `max_num_seqs=64 out=256`; they remain the best available
+estimates for those higher-concurrency operating points (compute path is
+identical). To reproduce them on real weights, raise `MAX_NUM_SEQS` and
+`BENCH_SPEC` (e.g. `128:128 256:128`).
+
+**Conclusion:** the current fix — `ENFORCE_EAGER=1` (no cudagraph) +
+`K3_PREFIX_CACHE=0` (no prefix caching, dodges the HybridKVCacheCoordinator
+assertion) — is validated end-to-end on real Kimi-K3 weights on gfx942:
+correct factual output (6/6) at 6–7 tok/s single-request, scaling to
+**179 tok/s aggregate** at 64-way concurrency. This is the configuration to
+serve until upstream fixes `@support_torch_compile` (cudagraph) and the
+`HybridKVCacheCoordinator` selection bug (prefix caching).
 
 ## Caveats
 
