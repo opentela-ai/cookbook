@@ -191,13 +191,17 @@ fi
 # file. The /v1/completions probe below is unaffected (no chat template / tools
 # applied), so parsing stays out of the mandatory correctness gate.
 export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
-# K3_PIECEWISE=1: opt into the "textbook fix" for the gfx942 PP=3 decode
-# deadlock — VLLM_USE_BREAKABLE_CUDAGRAPH=0 + --compilation-config with
-# mode=VLLM_COMPILE/cudagraph_mode=PIECEWISE, so torch.compile splits the
-# forward at attention ops and keeps the gloo recv_object (which runs
-# eagerly in the worker driver, outside the model forward) out of the
-# captured graph pieces. See the full mechanism comment in engine.sh below.
-# UNTESTED for Kimi-K3 on this image — default 0 = unchanged (enforce_eager
+# K3_PIECEWISE=1: was the "textbook fix" hypothesis for the gfx942 PP=3
+# decode deadlock (VLLM_USE_BREAKABLE_CUDAGRAPH=0 + --compilation-config
+# mode=VLLM_COMPILE/cudagraph_mode=PIECEWISE, so torch.compile would split
+# the forward at attention ops and keep the gloo recv_object out of the
+# captured graph pieces). CONFIRMED NOT VIABLE (job 589322): Kimi-K3
+# carries NO @support_torch_compile, so mode=VLLM_COMPILE only warns
+# (vllm.py:2410) and at init (gpu_model_runner.py:5442)
+# is_breakable=False + PIECEWISE.has_full_cudagraphs()=False installs NO
+# wrapper — the model runs EAGER, identical to ENFORCE_EAGER=1. It does
+# NOT validate the PIECEWISE cudagraph hypothesis. Real PIECEWISE needs
+# upstream @support_torch_compile. Default 0 = unchanged (ENFORCE_EAGER=1
 # is the proven path per BENCHMARK.md).
 export K3_PIECEWISE="${K3_PIECEWISE:-0}"
 
