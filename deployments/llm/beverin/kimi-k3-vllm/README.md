@@ -271,10 +271,12 @@ tail -f /capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/run-<JOB>/otela.log
 
 # direct vLLM health + a generation from inside the allocation
 srun -p mi300 -A a-infra02 -N1 -n1 --time=00:05:00 --overlap \
-  bash -lc 'curl -s http://<HEAD>:8080/v1/models | python3 -m json.tool; \
-            curl -s http://<HEAD>:8080/v1/chat/completions \
-              -H "Content-Type: application/json" \
-              -d "{\"model\":\"moonshotai/Kimi-K3\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":16}"'
+  curl -s http://<HEAD>:8080/v1/models | python3 -m json.tool
+
+srun -p mi300 -A a-infra02 -N1 -n1 --time=00:05:00 --overlap \
+  curl -s http://<HEAD>:8080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 
 # once a peer is registered, route to it through any reachable OpenTela head:
 curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
