@@ -304,11 +304,11 @@ _SPDX = "// SPDX-License-Identifier: MIT\n"
 _QUANT_SENTINEL = "/* K3-gfx942-quant-fix */"
 for _rel, _adds in [
     (
-        "kernels/quant_kernels.cu",
+        "csrc/kernels/quant_kernels.cu",
         ["#include <cstring>  // K3-gfx942-quant-fix: host ::memset for rocprim texture_cache_iterator"],
     ),
     (
-        "kernels/quant_mxfp4.cu",
+        "csrc/kernels/quant_mxfp4.cu",
         [
             "#include <cstring>  // K3-gfx942-quant-fix: host ::memset for rocprim texture_cache_iterator",
             "#ifdef __HIP_NO_HALF_CONVERSIONS__",
@@ -328,7 +328,72 @@ for _rel, _adds in [
     open(_qp, "w").write(_qs[: len(_SPDX)] + "\n" + _block + _qs[len(_SPDX) :])
     print(f"quant-fix applied: {_rel}", flush=True)
 
-# --- patch 7: enable -D__Float4_e2m1fn_x2 on gfx942 (job 581813 lesson) ---
+
+
+# --- patch 8: hip_flag_checker must strip PYTHONPATH (job 582964 lesson) ---
+# hip_flag_checker (jit/core.py:492) runs:
+#   subprocess.check_output([hipcc, flag, "-x", "hip", "-E", "-P",
+#                             "/dev/null", "-o", "/dev/null"], stderr=DEVNULL)
+# It INHERITS the full environment, including PYTHONPATH=$K3/home/pylib.
+# hipcc is an ELF binary but its device-libs linking step spawns a Python
+# subprocess that picks up PYTHONPATH, imports `aiter`, and triggers JIT
+# module import -- which writes "[aiter] import [module_aiter_core] ..." to
+# stderr and returns non-zero.  hip_flag_checker sees CalledProcessError and
+# returns False -> EVERY flag is "not supported" and filtered out, INCLUDING
+# -D__Float4_e2m1fn_x2 (the fp4x2 quant enable flag we need on gfx942).
+#
+# Confirmed: with PYTHONPATH absent, hip_flag_checker("-D__Float4_e2m1fn_x2")
+# returns True.  With PYTHONPATH present (any value), it returns False.
+#
+# FIX: pass a minimal env (PATH + HOME only, i.e. strip PYTHONPATH) to the
+# hipcc subprocess.  This mirrors what a clean shell would do and is the
+# minimal change that makes hip_flag_checker work.
+_HFC_OLD = '''@functools.lru_cache()
+def hip_flag_checker(flag_hip: str) -> bool:
+    import subprocess
+
+    cmd = (
+        [executable_path("hipcc")]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
+        return False
+    return True'''
+_HFC_NEW = '''@functools.lru_cache()
+def hip_flag_checker(flag_hip: str) -> bool:
+    import subprocess
+
+    cmd = (
+        [executable_path("hipcc")]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    # K3_hip_flag_clean_env: strip PYTHONPATH so hipcc's device-libs linker
+    # subprocess does not import `aiter` (which triggers JIT and returns
+    # non-zero, causing EVERY flag to be "not supported").  PATH + HOME are
+    # sufficient for the preprocessor-only probe.
+    _env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL, env=_env)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
+        return False
+    return True'''
+_jt = os.path.join(DST, "jit/core.py")
+_js = open(_jt).read()
+if "K3_hip_flag_clean_env" in _js:
+    print("hip_flag_checker patch already applied", flush=True)
+else:
+    assert _HFC_OLD in _js, "expected hip_flag_checker body in jit/core.py"
+    open(_jt, "w").write(_js.replace(_HFC_OLD, _HFC_NEW, 1))
+    ast.parse(open(_jt).read())
+    print("hip_flag_checker patch applied (K3_hip_flag_clean_env)", flush=True)
+
+# --- patch 9: enable -D__Float4_e2m1fn_x2 on gfx942 (job 581813 lesson) ---
 # The AITER JIT framework (jit/core.py:881) deliberately EXCLUDES gfx942
 # from -D__Float4_e2m1fn_x2:
 #
@@ -347,18 +412,170 @@ for _rel, _adds in [
 #   - --offload-arch=native still compiles for real gfx942 hardware
 #   - get_gfx_runtime() (used for runtime dispatch) is unaffected
 #   - Only affects JIT BUILD flags, not any runtime get_gfx() checks
-_JIT_REL = "jit/core.py"
-_jt = os.path.join(DST, _JIT_REL)
-_sh.copy(os.path.join(SRC, _JIT_REL), _jt)  # fresh copy -> deterministic
+_FP4_OLD = '        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:'
+_FP4_NEW = '        if md_name == "module_quant" and int(os.getenv("AITER_FP4x2", "1")) > 0:  # K3_gfx942_fp4x2_quant_only: enable fp4x2 quant on all archs'
 _js = open(_jt).read()
-_OLD_JIT = '        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:'
-_NEW_JIT = '        if int(os.getenv("AITER_FP4x2", "1")) > 0:  # K3_gfx942_fp4x2: enable fp4x2 quant on all archs'
 if "K3_gfx942_fp4x2" in _js:
     print("jit/core.py fp4x2 patch already applied", flush=True)
 else:
-    assert _OLD_JIT in _js, "expected get_gfx() != gfx942 condition in jit/core.py"
-    open(_jt, "w").write(_js.replace(_OLD_JIT, _NEW_JIT, 1))
+    assert _FP4_OLD in _js, "expected get_gfx() != gfx942 condition in jit/core.py"
+    open(_jt, "w").write(_js.replace(_FP4_OLD, _FP4_NEW, 1))
     ast.parse(open(_jt).read())
     print("jit/core.py fp4x2 patch applied (K3_gfx942_fp4x2)", flush=True)
+
+# --- patch 10: FlyDSL MoE LDS limit fix for gfx942 (jobs 583297 + 583591) ---
+# The heuristic FlyDSL fallback in fused_moe.py (lines 2244-2251) picks
+# stage-1 tile_m from a token tier. EMPIRICAL: the LDS of moe_gemm1_0 is set
+# by the TILE GEOMETRY encoded in the kernel name (t{m}x128x256), NOT by the
+# _w/_bnt suffix:
+#   job 583297: kn1=...t128x128x256_w2_bnt0 -> LDS 131072 > 65536 (crash)
+#   job 583591: kn1=...t128x128x256 (suffix stripped) -> LDS 131272... same
+#   131072 > 65536 (crash)  => tile_m=128 itself does not fit gfx942.
+# gfx942 (MI300A) has 64KB LDS per workgroup.  v3 measurement (thread of
+# jobs): t32x128x256 alone -> LDS 82944 = A-tile bf16 dbuf (32*256*2*2
+# 32768) + W-tile fp4 packed dbuf (256*128/2*2 32768) + scales + misc.
+# So clamping tile_m is NOT enough; the gfx942 name must also shrink
+# tile_n and tile_k.  m=32, n=64, k=128 -> ~27KB base + overhead: fits the
+# 65536 B limit with wide margin (~2x headroom under estimation error).
+# The error signature:
+#   "local memory (82944) exceeds limit (65536) in function 'moe_gemm1_0'"
+# Fix: on gfx942, clamp stage-1 tile_m to 32, rename stage-1 geometry to
+# t32x64x128, and drop the stage-1 suffix (waves_per_eu=1).  Stage 2 is
+# unchanged: its t{m}x128x{tk} tile fits (jobs only ever errored on
+# moe_gemm1_0).
+_flydsl_t = os.path.join(DST, "fused_moe.py")
+_flydsl_src = open(_flydsl_t).read()
+if "K3_gfx942_lds_clamp" in _flydsl_src:
+    print("fused_moe.py LDS tile-clamp patch already applied", flush=True)
+else:
+    _LDS_OLD = '''        if token < 2048:
+            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
+        elif token < 4096:
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
+        elif token < 16384:
+            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
+        else:
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""'''
+    _LDS_NEW = '''        if token < 2048:
+            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
+        elif token < 4096:
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
+        elif token < 16384:
+            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
+        else:
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        # K3_gfx942_lds_clamp: gfx942 (MI300A) has 64KB LDS per CU.  Jobs
+        # 583845/583929/583949 ALL fell back to base ...t32x{128,64}x256
+        # (wpe=1, bnt=2, kw=1 from dict) and ALL report LDS 82944.
+        # Explicit allocations are only 32768 (2 x tile_m*lds_stride*2,
+        # tile_n-insensitive); 50176 is implicit pipeline LDS.  The base
+        # already has waves_per_eu=1 (NO _w1 suffix -- wpe=1 is default,
+        # confirmed by probe_knames.py).  Remaining levers: b_nt 2->0 and
+        # k_wave 1->4 (K=256 sliced 4x64, smaller resident state/wave).
+        # _bnt0_kw4 is a direct key in _KERNEL_PARAMS (probe-verified).
+        if get_gfx() == "gfx942":
+            _tile_m = min(_tile_m, 32)
+            _s1_sfx = "_bnt0_kw4"
+            _s2_sfx = ""'''
+    assert _LDS_OLD in _flydsl_src, "expected token-tier block in fused_moe.py"
+    _flydsl_src = _flydsl_src.replace(_LDS_OLD, _LDS_NEW, 1)
+    open(_flydsl_t, "w").write(_flydsl_src)
+    ast.parse(open(_flydsl_t).read())
+    print("fused_moe.py LDS tile-clamp patch applied (K3_gfx942_lds_clamp)", flush=True)
+
+# --- patch 10b: gfx942 stage-1 kernel geometry t{m}x64x256 (fits 64KB) ---
+# v2 (tile_m clamp alone, job 583845) still produced LDS 82944 > 65536 in
+# moe_gemm1_0; the W-tile (k*n packed-fp4, double-buffered) dominates at
+# n=128, k=256.  moe_kernels.py grammar for fp4-weight moe1 at tm=32:
+#   tile_ns = [32, 64, 128], tile_ks = [256]  (!! k is fixed at 256)
+# Job 583860 tried t32x64x128 -> ValueError (k must be 256).
+# Job 583915 tried t32x32x256 -> LDS OK but hot_loop_scheduler ZeroDiv:
+#   num_acc_n = (tile_n // num_waves) // 16 = 0 for tile_n=32; VALID minimum
+#   tile_n is 64 (num_acc_n = 16//16 = 1).
+# Exact-fit LDS model from two measured anchors (err <= 0.8 KB):
+#   LDS ~= A(m*k*2) + W_dbuf(k*n) + scales(k/32*n*4) + ~28.7K
+#   t128x128x256: 65536+32768+4096+28672  = 131072 (= measured, EXACT)
+#   t32x128x256 : 16384+32768+4096+28928  =  83176 (~ measured 82944)
+#   t32x64x256  : 16384+16384+2048+28928  =  63744  <= 65536  -> FITS
+_G1_OLD = '''        _base_kn1 = flydsl_kernel_name(
+            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+        )'''
+_G1_NEW = '''        _base_kn1 = flydsl_kernel_name(
+            1, _a_type, _w_type, _out_type, _tile_m,
+            (64 if get_gfx() == "gfx942" else 128),   # K3-G1-N tile_n
+            256,
+        )'''
+_flydsl_src = open(_flydsl_t).read()
+if "(64 if get_gfx()" in _flydsl_src:
+    print("fused_moe.py gemm1-geometry patch already applied", flush=True)
+else:
+    assert _G1_OLD in _flydsl_src, "expected _base_kn1 call in fused_moe.py"
+    _flydsl_src = _flydsl_src.replace(_G1_OLD, _G1_NEW, 1)
+    open(_flydsl_t, "w").write(_flydsl_src)
+    ast.parse(open(_flydsl_t).read())
+    print("fused_moe.py gemm1-geometry patch applied (t32x64x256 on gfx942)", flush=True)
+
+
+# --- patch 8: enable Triton SW MXFP4 GEMM (batched_gemm_a16wfp4_) on gfx942 ---
+# arch_info.is_fp4_avail() returns True only for gfx950/gfx1250, but the A16WFP4
+# GEMM kernels are PURE TRITON (tl.load/tl.dot/_mxfp4_quant_op software dequant).
+# The guard is overly conservative.  On Kimi-K3 the ATTENTION weights are
+# A16WFP4, so the forward pass hits this assert in every self_attn (linear.py:564
+# -> batched_gemm_a16wfp4.py:104).  Adding gfx942 lets the Triton kernel compile
+# and run.  is_gluon_avail stays False (real hardware MLA, not Triton).  See job
+# 585846 AssertionError: "MXFP4 is not available on your device".
+_ARCH_REL = "ops/triton/utils/_triton/arch_info.py"
+_at = os.path.join(DST, _ARCH_REL)
+_sh.copy(os.path.join(SRC, _ARCH_REL), _at)
+_asrc = open(_at).read()
+_OLD_FP4 = 'def is_fp4_avail():\n    return get_arch() in ("gfx950", "gfx1250")'
+_NEW_FP4 = ('def is_fp4_avail():\n'
+    '    return get_arch() in ("gfx950", "gfx1250", "gfx942")  '
+    '# K3_gfx942_fp4_avail: Triton SW MXFP4 GEMM works on gfx942')
+if "K3_gfx942_fp4_avail" in _asrc:
+    print("arch_info.py is_fp4_avail patch already applied", flush=True)
+else:
+    assert _asrc.count(_OLD_FP4) == 1, ("expected 1 is_fp4_avail def",)
+    open(_at, "w").write(_asrc.replace(_OLD_FP4, _NEW_FP4, 1))
+    ast.parse(open(_at).read())
+    print("arch_info.py is_fp4_avail patch applied (K3_gfx942_fp4_avail)", flush=True)
+
+# --- patch 9: create gfx942 A16WFP4 GEMM config files (job 585991) ---
+# Patch 8 enabled is_fp4_avail() for gfx942, so the A16WFP4 Triton GEMM
+# kernels are now selected.  But AITER's get_gemm_config() requires a per-
+# arch default tuning JSON (fpath_should_exist=True) and gfx942 has none:
+#   AssertionError: Required config file doesn't exist:
+#     .../gfx942-BATCHED_GEMM-A16WFP4.json
+# (linear.py:580 forward_attn_residual -> batched_gemm_a16wfp4.py:112 ->
+# get_gemm_config("BATCHED_GEMM-A16WFP4", ...)).  We clone from gfx950 (MI350,
+# closest CDNA arch with a tuned A16WFP4 config) as a stopgap.  No
+# PRESHUFFLED variant needed (is_mx_scale_preshuffling_avail() is False on
+# gfx942, not patched).
+import json as _json9
+_CFG_DIR = os.path.join(DST, "ops/triton/configs/gemm")
+_CFG_NOTE = (
+    "gfx942 stopgap: cloned from gfx950 (MI350, closest CDNA arch with a "
+    "tuned A16WFP4 config). Created by k3_patch.py patch 9 to satisfy AITER "
+    "get_gemm_config() which requires a per-arch default tuning file "
+    "(fpath_should_exist=True). NOT tuned for gfx942 (MI300A) -> potential "
+    "perf and precision-validation risk; revisit if accuracy checks fail. "
+    "K3_gfx942_a16wfp4_cfg"
+)
+for _src9, _dst9 in [
+    ("gfx950-BATCHED_GEMM-A16WFP4.json", "gfx942-BATCHED_GEMM-A16WFP4.json"),
+    ("gfx950-GEMM-A16WFP4.json", "gfx942-GEMM-A16WFP4.json"),
+]:
+    _dpath = os.path.join(_CFG_DIR, _dst9)
+    _spath = os.path.join(_CFG_DIR, _src9)
+    if os.path.exists(_spath):
+        _cfg9 = _json9.load(open(_spath))
+        if os.path.exists(_dpath) and "K3_gfx942_a16wfp4_cfg" in open(_dpath).read():
+            print(f"{_dst9} already present (K3_gfx942_a16wfp4_cfg)", flush=True)
+        else:
+            _cfg9["_note"] = _CFG_NOTE
+            _json9.dump(_cfg9, open(_dpath, "w"), indent=4)
+            print(f"created {_dst9} (cloned from {_src9})", flush=True)
+    else:
+        print(f"WARN: {_src9} not found in {_CFG_DIR}", flush=True)
 
 print("PATCH_OK", flush=True)
