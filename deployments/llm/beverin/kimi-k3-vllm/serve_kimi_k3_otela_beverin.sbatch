@@ -469,8 +469,30 @@ VLLM_ARGS=(
   --max-model-len "$CTX_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
-  --enable-prefix-caching
 )
+# --enable-prefix-caching: gated by K3_PREFIX_CACHE (default 1 = on, the
+# production setting). On this image, prefix caching routes the KV cache
+# manager to HybridKVCacheCoordinator (kv_cache_coordinator.py:886, selected
+# whenever len(kv_cache_groups) > 1). Kimi-K3's attention layers all share
+# ONE KV cache spec (the Mamba layers' recurrent state is managed
+# separately, not via kv_cache_groups), so verify_and_split_kv_cache_groups
+# collapses every group into a single SpecGroup and then asserts
+#   "HybridKVCacheCoordinator requires at least two attention groups"
+# (kv_cache_coordinator.py:627). This crashes BOTH the eager path (589044)
+# and the PIECEWISE path (589322) at scheduler init, BEFORE any cudagraph
+# work — so the prefix-cache change (commit 9f3177e) silently masked the
+# original FULL-decode-cudagraph deadlock (588153/588156, which ran WITHOUT
+# prefix caching and reached the deadlock).
+# K3_PREFIX_CACHE=0 opts out -> KVCacheCoordinatorNoPrefixCache (no
+# assertion), the SAME path 588153/588156 took, so K3_PIECEWISE=1 can be
+# tested in isolation (only the cudagraph_mode changes vs the known
+# deadlock baseline). The HybridKVCacheCoordinator assertion is a real
+# upstream bug (selection should key on distinct-spec count, not raw group
+# count) to fix separately via sitecustomize.py for production-with-prefix.
+export K3_PREFIX_CACHE="${K3_PREFIX_CACHE:-1}"
+if [ "$K3_PREFIX_CACHE" = "1" ]; then
+  VLLM_ARGS+=(--enable-prefix-caching)
+fi
 # --load-format: override weight loading (e.g. LOAD_FORMAT=dummy for fast
 # iteration without real weights — a 5-min cold start instead of 3 h).
 if [ -n "${LOAD_FORMAT:-}" ]; then
