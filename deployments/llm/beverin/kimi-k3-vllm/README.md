@@ -154,10 +154,14 @@ pass (the deepseek-v4 recipe registered on `/health` and 502'd every
 request), and a non-empty chat response does **not** prove the MoE compute
 path is correct. K3 has generated tokens on this GPU family **only** with
 `ENFORCE_EAGER=1` (no cudagraph); a non-cudagraph launch has served real
-tokens at up to 415 tok/s aggregate (10+ jobs, `BENCHMARK.md`). A
-cudagraph launch deadlocks on PP3 decode (full-decode graph captures the
-gloo `recv_object`), so this recipe runs a **mandatory** factual-correctness
-probe (`GEN_PROBE=1`, default) before registration.
+tokens — up to 415 tok/s aggregate under concurrent load
+(dummy-weight sweep, `BENCHMARK.md`; identical compute path, so throughput
+is real), and real-weight *correctness* is proven by job 588856 ("Paris",
+"2, 3, 5, 7, 11" at 6–7 tok/s single-request). A cudagraph launch
+deadlocks on PP3 decode (full-decode graph captures the gloo `recv_object`),
+so this recipe runs a **mandatory** factual-correctness probe (`GEN_PROBE=1`,
+default) before registration, and an optional concurrent throughput sweep
+(`BENCH=1`) after it.
 
 `gen_correctness.py` sends the **same six greedy `/v1/completions` prompts
 the Clariden sglang servekit bench uses** (temperature 0, `max_tokens` 64 —
@@ -351,6 +355,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `K3_ENABLE_PARSERS` | `1` | Adds `--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
 | `K3_PIECEWISE` | `0` | **Confirmed NOT viable** (job 589322). Sets `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'`, but `KimiK3ForConditionalGeneration` carries NO `@support_torch_compile`, so `mode=VLLM_COMPILE` only warns (`vllm.py:2410`) and at init (`gpu_model_runner.py:5442`) `is_breakable=False` + `PIECEWISE.has_full_cudagraphs()=False` installs NO wrapper — the model runs EAGER, identical to `ENFORCE_EAGER=1`. Real PIECEWISE cudagraph requires upstream `@support_torch_compile` on Kimi-K3. |
 | `LOAD_FORMAT` | _unset_ | Override weight loading (e.g. `dummy` for a 5-min cold start without real weights — used with `K3_PIECEWISE=1`). |
+| `BENCH` | `0` | Set `1` to run `benchmark.py` — a concurrent `/v1/completions` throughput sweep (warmup + one JSON line per `CONC:NUMREQ` level) — after the correctness probe passes, BEFORE registration. Pair with `OTELA_BIN=/bin/true` for a pure benchmark. Knobs: `BENCH_SPEC` (default `1:16 8:32 32:64 64:64`), `BENCH_OUT_TOK` (256), `BENCH_IN_TOK` (32, short to isolate decode), `BENCH_TIMEOUT` (1800). |
 | `DISTRIBUTED_TIMEOUT_SECONDS` | _unset_ | Override the gloo/NCCL init+recv timeout (vLLM default 3600 s). Set low (e.g. `300`) with `K3_PIECEWISE=1` so a decode deadlock fails in 5 min, not 1 h. |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64, sai-v0.0.6 (`--bootstrap.static`, `--label`). |
