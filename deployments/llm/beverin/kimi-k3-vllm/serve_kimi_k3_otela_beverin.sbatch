@@ -248,6 +248,22 @@ export GEN_CORRECTNESS_PER_REQ_TIMEOUT="${GEN_CORRECTNESS_PER_REQ_TIMEOUT:-180}"
 # correctness. Verifies the full pipeline (load -> JIT -> forward -> HTTP)
 # without requiring real weights. Exit 0 iff all 6 prompts return tokens.
 export GEN_CORRECTNESS_SMOKE="${GEN_CORRECTNESS_SMOKE:-0}"
+# BENCH=1: after the correctness probe passes, run benchmark.py — a
+# CONCURRENCY SWEEP of /v1/completions (ignore_eos, temperature 0) that
+# reports aggregate + per-request decode throughput + latency per level.
+# A warmup pass (C=4 N=8, discarded) runs first so the first measured level
+# sees warm JIT kernels. BENCH_SPEC is a space-separated list of CONC:NUMREQ
+# pairs (default 1:16 8:32 32:64 64:64). BENCH_OUT_TOK / BENCH_IN_TOK set the
+# output and prompt lengths in tokens (defaults 256 / 32 — short prompt
+# isolates decode throughput, matching BENCHMARK.md's table methodology).
+# BENCH_TIMEOUT is the overall wall budget (default 1800 s). Results are
+# written to $RUNDIR/benchmark_${SLURM_JOB_ID}.json. Runs BEFORE registration,
+# so pair with OTELA_BIN=/bin/true for a pure benchmark (no mesh join).
+export BENCH="${BENCH:-0}"
+export BENCH_SPEC="${BENCH_SPEC:-1:16 8:32 32:64 64:64}"
+export BENCH_OUT_TOK="${BENCH_OUT_TOK:-256}"
+export BENCH_IN_TOK="${BENCH_IN_TOK:-32}"
+export BENCH_TIMEOUT="${BENCH_TIMEOUT:-1800}"
 
 export RUNDIR="$DEPLOY_DIR/run-$SLURM_JOB_ID"
 export PATCH_MARKER="$K3/home/pylib/.k3_patch_done"
@@ -704,6 +720,26 @@ trap 'stop_otela' EXIT TERM INT
       echo "[$(date -Is)]       (Paris / primes / 40 km/h) — treat as a real MoE-corruption signal." >&2
       exit 1
     fi
+  fi
+
+  # Concurrent throughput sweep (BENCH=1). Runs in the same container as the
+  # probe (aiohttp is bundled by vLLM); host netns is shared so 127.0.0.1
+  # reaches the engine. Warmup first, then one JSON line per concurrency
+  # level to stdout; full summary in $RUNDIR/benchmark_${SLURM_JOB_ID}.json.
+  # Runs BEFORE registration so a pure benchmark uses OTELA_BIN=/bin/true.
+  if [ "$BENCH" = "1" ]; then
+    BENCH_OUT="$RUNDIR/benchmark_${SLURM_JOB_ID}.json"
+    echo "[$(date -Is)] benchmark sweep (model=$SERVED_MODEL_NAME, spec=$BENCH_SPEC, out_tok=$BENCH_OUT_TOK, in_tok=$BENCH_IN_TOK, budget=${BENCH_TIMEOUT}s) ..."
+    BENCH_TIMEOUT="$BENCH_TIMEOUT" \
+    BENCH_PER_REQ_TIMEOUT="${GEN_CORRECTNESS_PER_REQ_TIMEOUT:-180}" \
+      timeout "$((BENCH_TIMEOUT + 300))" \
+      srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
+           -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+           python3 "$SCRIPT_DIR/benchmark.py" \
+               "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
+               "$BENCH_OUT" "$BENCH_SPEC" "$BENCH_OUT_TOK" "$BENCH_IN_TOK"
+    brc=$?
+    echo "[$(date -Is)] BENCH rc=$brc (report in $BENCH_OUT)"
   fi
 
   echo "[$(date -Is)] starting otela worker on $HEAD (inside container, EDF=$OTELA_EDF_NAME)"
