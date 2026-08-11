@@ -1,28 +1,46 @@
-"""sitecustomize: force vLLM's K3 SiTU MoE onto the AITER backend on gfx942.
+"""sitecustomize: route K3 SiTU MXFP4 MoE to Triton-unfused on gfx942.
 
 Loaded automatically by the CPython interpreter at startup (this file lives at
 $K3/home/pylib/sitecustomize.py, which k3_patch.py installs and engine.sh puts
 first on PYTHONPATH), so it runs BEFORE vllm.model_executor builds any layer.
 
-Why this is needed (k3-eng11 -> job 580844 lesson)
---------------------------------------------------
-k3_patch.py makes the gfx950-targeted flydsl a16w4 MoE kernels RUN on gfx942
-(LDS software fill, K16 MFMA split, software fp4->bf16 dequant, async off).
-But vLLM's Python MoE-backend selector (`quantization/mxfp4.py:
-_use_k3_situ_aiter`) ALSO gates the direct AITER path on `on_gfx950()`, which
-queries amdsmi and returns False on real MI300A hardware. With it False, the
-selector falls through to `oracle/mxfp4.py:select_deepseek_v4_mxfp4_moe_backend`
-which finds no supported backend for Kimi-K3's SiTU activation and raises
+Background (k3-eng11 -> job 580844 lesson)
+------------------------------------------
+The AITER FlyDSL a16w4 MoE kernel (used by the AITER_MXFP4_BF16 backend)
+requires 82944 bytes of LDS on gfx942, but the hardware limit is 65536
+(64 KB).  The kernel was designed for gfx950 (128 KB LDS) and cannot fit
+on MI300A regardless of tile size, suffix, or wave-per-EU parameters.
+This was exhaustively verified across jobs 583297-583962.
 
-    NotImplementedError: No MXFP4 MoE backend supports the deployment configuration.
+Solution (job 584xxx)
+---------------------
+Instead of trying to make FlyDSL fit on gfx942, we route the MoE backend
+selection to ``TRITON_UNFUSED`` — the ``UnfusedOAITritonExperts`` class
+from ``gpt_oss_triton_kernels_moe.py``.  This class uses ``matmul_ogs``
+(plain Triton kernels, NOT FlyDSL) for the GEMMs and applies the activation
+separately (unfused), so there is no 82 KB LDS requirement.
 
-- crash at ~4 min, before any shard loads. This sitecustomize.py is the Python
-counterpart to k3_patch.py's C++ patches: it lies to the selector so the
-engine takes the direct `AITER_MXFP4_BF16` branch (the path that k3-eng11
-reached full init on, same image v0.1.dev19253+g5f76ae224, same TP8 x PP2).
+The class already supports ``(kMxfp4Static, None)`` quantization and all
+routing methods on gfx942; the only blocker was ``_supports_activation``
+not including ``MoEActivation.SITU``.  We patch that, and the unfused
+``activation()`` method falls through to ``super().activation()`` which
+calls ``apply_moe_activation(SITU, ...)`` which uses the compiled
+``torch.ops._C.situ_and_mul(output, input, beta, linear_beta)`` kernel.
 
-Vendored verbatim from the working bring-up at
-/capstor/scratch/cscs/xyao/kimi-k3/home/pylib/sitecustomize.py (job k3-eng11).
+Patches applied here:
+  (1) Keep ``on_gfx950 = True`` for MLA and other AITER ops that need it.
+  (2) Patch ``_use_k3_situ_aiter`` to return False so the MoE selector goes
+      through ``select_deepseek_v4_mxfp4_moe_backend`` instead of the
+      direct AITER branch.
+  (3) Patch ``_get_priority_backends`` on ROCm to include TRITON_UNFUSED
+      after AITER_MXFP4_BF16 (Kimi-K3 uses ``DeepSeekV3`` routing, which
+      does NOT get the special ``[AITER_MXFP4_BF16, TRITON_UNFUSED]`` list
+      that ``DeepseekV4`` gets).
+  (4) Patch ``UnfusedOAITritonExperts._supports_activation`` to include SITU.
+
+The AITER MoE backend's ``_supports_activation`` deliberately does NOT
+include SITU (see ``rocm_aiter_moe.py:484``), so the oracle naturally
+falls through from AITER to TRITON_UNFUSED.
 """
 import os
 
@@ -32,10 +50,10 @@ import os
 os.environ.setdefault("VLLM_ROCM_USE_AITER", "1")
 os.environ.setdefault("VLLM_ROCM_USE_AITER_MOE", "1")
 
-# (1) on_gfx950() -> True. The flydsl kernels are PATCHED (k3_patch.py), not
-# stock gfx950, so the amdsmi-reported arch (gfx942) must be hidden from the
-# selector. Monkey-patching the module attribute is picked up by the late
-# `from vllm.platforms.rocm import on_gfx950` inside _use_k3_situ_aiter.
+# (1) on_gfx950() -> True.  We STILL need this for the MLA backend
+# (`_fp8_mla_prefill_supported()` in `rocm_aiter_mla.py:71`) and for AITER
+# linear / FP4 BMM ops.  The MoE backend selection is handled separately
+# by patch (2) below so that `on_gfx950=True` no longer forces FlyDSL.
 try:
     from vllm.platforms import rocm as _rocm
 
@@ -43,26 +61,126 @@ try:
 except Exception:
     pass
 
-# (2) Tell the AITER MXFP4 backend's is_supported_config that SiTU is OK.
-# The direct `is_k3_situ_aiter=True` branch does not consult this, but the
-# oracle (taken on other shapes / future images) does, so keep it in step.
+# (2) Patch _use_k3_situ_aiter to return False.
+# Without this, `Mxfp4MoEMethod.__init__` (mxfp4.py:516) would see
+# `on_gfx950()=True` + `is_fused_moe_enabled()=True` + SITU activation and
+# directly select the AITER FlyDSL kernel — which exceeds the 64 KB LDS
+# limit on gfx942 and crashes at JIT compile time.
+# With this patch, the selector calls `select_deepseek_v4_mxfp4_moe_backend`
+# which tries backends in priority order and falls through to TRITON_UNFUSED.
 try:
-    from vllm.model_executor.layers.fused_moe.modular_kernel import MoEActivation
-    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
-        RocmAiterMxfp4MoeBase,
-    )
+    from vllm.model_executor.layers.quantization import mxfp4 as _mxfp4_mod
 
-    _orig = RocmAiterMxfp4MoeBase._supports_activation
-
-    @staticmethod
-    def _patched(activation):
-        if activation == MoEActivation.SITU:
-            return True
-        return _orig(activation)
-
-    RocmAiterMxfp4MoeBase._supports_activation = _patched
+    _mxfp4_mod._use_k3_situ_aiter = lambda moe: False
 except Exception:
     pass
+
+# (3) Patch _get_priority_backends on ROCm to include TRITON_UNFUSED.
+# Kimi-K3 uses `RoutingMethodType.DeepSeekV3` (not DeepseekV4), so the
+# special `if current_platform.is_rocm() and config.routing_method ==
+# DeepseekV4` branch in `select_deepseek_v4_mxfp4_moe_backend` (which
+# already includes TRITON_UNFUSED) is NOT taken.  Instead the else branch
+# calls `_get_priority_backends()` which on ROCm returns only
+# `[AITER_MXFP4_BF16]`.  We add TRITON_UNFUSED so the oracle can fall
+# through from AITER (which fails `_supports_activation(SITU)`) to the
+# Triton-unfused backend.
+try:
+    from vllm.model_executor.layers.fused_moe.oracle import mxfp4 as _oracle_mod
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.platforms import current_platform as _cp
+
+    if _cp.is_rocm():
+        _orig_gpb = _oracle_mod._get_priority_backends
+
+        def _patched_gpb():
+            return [
+                _oracle_mod.Mxfp4MoeBackend.AITER_MXFP4_BF16,
+                _oracle_mod.Mxfp4MoeBackend.TRITON_UNFUSED,
+            ]
+
+        _oracle_mod._get_priority_backends = _patched_gpb
+except Exception:
+    pass
+
+# (4) Patch UnfusedOAITritonExperts._supports_activation to include SITU.
+# The class already supports `(kMxfp4Static, None)` quantization, all
+# routing methods, and `_supports_current_device()` on gfx942 (via
+# `on_gfx9()`).  The `activation()` method falls through to
+# `super().activation()` for unknown activations, which calls
+# `apply_moe_activation(SITU, ...)` which uses the compiled
+# `torch.ops._C.situ_and_mul(output, input, beta, linear_beta)` kernel.
+try:
+    from vllm.model_executor.layers.fused_moe.config import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+        UnfusedOAITritonExperts,
+    )
+
+    _orig_unfused_act = UnfusedOAITritonExperts._supports_activation
+
+    @staticmethod
+    def _patched_unfused_act(activation):
+        if activation == MoEActivation.SITU:
+            return True
+        return _orig_unfused_act(activation)
+
+    UnfusedOAITritonExperts._supports_activation = _patched_unfused_act
+except Exception:
+    pass
+
+# --- K3 JIT stagger: prevent OOM from simultaneous worker startup --
+# On gfx942 with 4 workers/node and ~501 GB system RAM, all 4 workers
+# simultaneously constructing the Kimi-K3 model + JIT-compiling Triton
+# matmul_ogs exceeds the node's system RAM (jobs 584773/584789 OOM).
+# Stagger worker startup by local_rank: rank 0 starts immediately and
+# populates the shared TRITON_CACHE_DIR; ranks 1-3 wait in sequence so
+# they load compiled kernels from cache instead of compiling them.
+# After EACH worker's load_model, gc.collect() + cuda.empty_cache()
+# release temporary CPU buffers (safetensors deserialization, weight
+# remap) and GPU caching-allocator memory back to the OS.  On UMA this
+# is critical: GPU memory IS system RAM, so the ~20 GB/worker temp
+# buffer during the 4th worker's load was the tipping point in job
+# 585639 (4×138 GB > 501 GB node RAM).  Freeing it immediately after
+# each worker finishes load_model keeps the peak under the node limit.
+try:
+    import gc as _gc_mod
+    import time as _time_mod
+    import torch as _torch_mod
+    from vllm.v1.worker.gpu_worker import Worker as _K3Worker
+    _orig_load_model = _K3Worker.load_model
+
+    def _k3_staggered_load_model(self, *, load_dummy_weights=False):
+        _delay = self.local_rank * int(
+            os.environ.get("K3_JIT_STAGGER_DELAY", "60")
+        )
+        if _delay > 0 and os.environ.get("K3_JIT_STAGGER", "1") != "0":
+            print(
+                f"[K3_STAGGER] local_rank={self.local_rank} rank={self.rank} "
+                f"sleeping {_delay}s before load_model",
+                flush=True,
+            )
+            _time_mod.sleep(_delay)
+        _orig_load_model(self, load_dummy_weights=load_dummy_weights)
+        # Release temporary CPU buffers (safetensors deserialization,
+        # weight remap) and GPU caching-allocator memory back to the OS.
+        # On UMA this returns memory to the OS immediately, reducing the
+        # peak for the next worker's load (job 585639: ~20 GB/worker temp).
+        try:
+            _gc_mod.collect()
+            if hasattr(self, "device"):
+                _torch_mod.cuda.synchronize(self.device)
+            _torch_mod.cuda.empty_cache()
+            _gc_mod.collect()
+        except Exception as _e:
+            print(f"[K3_STAGGER] gc/empty_cache warning: {_e}", flush=True)
+        print(
+            f"[K3_STAGGER] local_rank={self.local_rank} rank={self.rank} "
+            f"load_model done (gc+empty_cache)",
+            flush=True,
+        )
+    _K3Worker.load_model = _k3_staggered_load_model
+    print("[K3] JIT stagger patch applied (Worker.load_model)", flush=True)
+except Exception as e:
+    print(f"[K3] JIT stagger patch FAILED: {e}", flush=True)
 
 # ---------------------------------------------------------------------
 # (3) Multi-node PP follower fix (job 580876 lesson)
@@ -419,3 +537,34 @@ if os.environ.get("K3_DISABLE_MOE_ASM_FALLBACK", "0") != "1":
         # aiter may be unavailable in helper interpreters; the fallback
         # only matters in worker processes, which import the full stack.
         pass
+
+# ── K3_DISABLE_KDA: replace KDA layers with MLA for gen-probe ─────────────
+# The KDA (Kimi Delta Attention) Triton kernels are validated on gfx950 only.
+# On gfx942 (MI300A), they cause GPU memory access faults during execution
+# (job 586165: 8 GPU faults across 4 GPUs on PP0, right after JIT compilation
+# of kda_gate_chunk_cumsum_vector_kernel, chunk_kda_fwd_kernel_intra_sub_chunk,
+# chunk_kda_fwd_kernel_inter_solve_fused, chunk_gated_delta_rule_fwd_kernel,
+# chunk_gla_fwd_kernel_o, layer_norm_gated_fwd_kernel, pack_bitmatrix).
+# Setting K3_DISABLE_KDA=1 patches KimiLinearConfig.is_kda_layer() to return
+# False, so ALL layers use KimiMLAAttention (TRITON_MLA backend, verified
+# working on gfx942 in job 586165).  This is ONLY valid with --load-format
+# dummy (the model architecture is incorrect — ~2/3 of layers should be KDA,
+# not MLA).  State management (MambaStateDtypeCalculator etc.) is still set
+# up but harmless when no KDA layers exist.
+if os.environ.get("K3_DISABLE_KDA", "0") == "1":
+    try:
+        from vllm.transformers_utils.configs.kimi_linear import (
+            KimiLinearConfig as _KLC,
+        )
+
+        def _patched_is_kda(self, layer_idx: int):
+            return False
+
+        _KLC.is_kda_layer = _patched_is_kda
+        print(
+            "[K3] KDA disabled (is_kda_layer -> False); all layers use MLA "
+            "(K3_DISABLE_KDA=1) -- ONLY valid with --load-format dummy",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[K3] KDA disable patch FAILED: {e}", flush=True)
