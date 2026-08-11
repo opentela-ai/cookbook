@@ -169,37 +169,31 @@ fi
 export CTX_LEN="${CTX_LEN:-131072}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+# KV cache per worker (bytes). On MI300A UMA the auto-calculated available
+# memory is negative (hipMalloc reduces system RAM below the model size), so
+# we must set --kv-cache-memory-bytes manually. 1 GiB is too small: the KV
+# cache for a single request at max_model_len=131072 is ~1.15 GiB/worker
+# (job 588646: _check_enough_kv_cache_memory raised ValueError). 4 GiB
+# per worker passes the check and allows ~3 concurrent full-context requests.
+export KV_CACHE_MEM="${KV_CACHE_MEM:-4294967296}"
+# --max-num-batched-tokens: limits profile_run activation memory. K3's vision
+# tower forward during profile_run needs ~80+ GiB; without --skip-mm-profiling
+# it OOMs (hipErrorOutOfMemory). 512 is the minimum that avoids OOM.
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"
 # vLLM distributed init store (rank discovery) + head HTTP port.
 export MASTER_PORT="${MASTER_PORT:-6379}"
 export SERVE_PORT="${SERVE_PORT:-8080}"
 # Passthrough for experimental vLLM flags (e.g. ENFORCE_EAGER=1 adds
 # --enforce-eager) without forking this script.
+# CUDA graphs (ENFORCE_EAGER=0) are NOT viable on gfx942 with PP=3:
+# the first decode after prefill hangs on inter-PP gloo, crashing the
+# engine after the 1800 s cpu_distributed_timeout. Use ENFORCE_EAGER=1
+# (default) and scale throughput via max_num_seqs batching instead.
 export K3_NIC="${K3_NIC:-hsn0}"
 export VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
-if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
+if [ "${ENFORCE_EAGER:-1}" = "1" ]; then
   export VLLM_EXTRA_ARGS="$VLLM_EXTRA_ARGS --enforce-eager"
 fi
-
-# Kimi-K3 is a hybrid reasoning model: its chat template emits a <think>...</think>
-# (reasoning) block and supports OpenAI-style tool calls. vLLM exposes
-# reasoning_content + tool_calls on /v1/chat/completions ONLY with
-# --enable-auto-tool-choice + --tool-call-parser + --reasoning-parser. This
-# kimi-k3 vLLM fork spells the tool flag --tool-call-parser, same as Clariden/
-# JSC (sglang). The `kimi_k3` parser ships in the custom vllm-openai-rocm:kimi-k3
-# image; if an image bump drops it, startup errors "invalid tool call parser:
-# kimi_k3" first -- set K3_ENABLE_PARSERS=0 to recover without editing this
-# file. The /v1/completions probe below is unaffected (no chat template / tools
-# applied), so parsing stays out of the mandatory correctness gate.
-export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
-# K3_PIECEWISE=1: opt into the "textbook fix" for the gfx942 PP=3 decode
-# deadlock — VLLM_USE_BREAKABLE_CUDAGRAPH=0 + --compilation-config with
-# mode=VLLM_COMPILE/cudagraph_mode=PIECEWISE, so torch.compile splits the
-# forward at attention ops and keeps the gloo recv_object (which runs
-# eagerly in the worker driver, outside the model forward) out of the
-# captured graph pieces. See the full mechanism comment in engine.sh below.
-# UNTESTED for Kimi-K3 on this image — default 0 = unchanged (enforce_eager
-# is the proven path per BENCHMARK.md).
-export K3_PIECEWISE="${K3_PIECEWISE:-0}"
 
 # ------------------------------------------------------------------- otela ----
 # x86_64 build, sai-v0.0.6 (same dialect as the Clariden arm64 build). A
@@ -468,63 +462,11 @@ VLLM_ARGS=(
   --master-addr "$HEAD" --master-port "$MASTER_PORT"
   --max-model-len "$CTX_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
+  --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
-  --enable-prefix-caching
+  --kv-cache-memory-bytes "$KV_CACHE_MEM"
+  --skip-mm-profiling
 )
-# --load-format: override weight loading (e.g. LOAD_FORMAT=dummy for fast
-# iteration without real weights — a 5-min cold start instead of 3 h).
-if [ -n "${LOAD_FORMAT:-}" ]; then
-  VLLM_ARGS+=(--load-format "$LOAD_FORMAT")
-fi
-# --distributed-timeout-seconds: override the gloo/NCCL init+recv timeout
-# (vLLM default 3600 s). Set low (e.g. 300) with K3_PIECEWISE=1 so a decode
-# deadlock fails in 5 min, not 1 h.
-if [ -n "${DISTRIBUTED_TIMEOUT_SECONDS:-}" ]; then
-  VLLM_ARGS+=(--distributed-timeout-seconds "$DISTRIBUTED_TIMEOUT_SECONDS")
-fi
-# Reasoning + tool-call parsing (mirrors Clariden/JSC sglang --reasoning-parser
-# kimi_k3 --tool-call-parser kimi_k3). This kimi-k3 vLLM fork uses the same
-# --tool-call-parser spelling. Gated: set K3_ENABLE_PARSERS=0 if the image
-# lacks the kimi_k3 parser (startup errors "invalid tool call parser" first).
-if [ "${K3_ENABLE_PARSERS:-1}" = "1" ]; then
-  VLLM_ARGS+=(
-    --enable-auto-tool-choice
-    --tool-call-parser kimi_k3
-    --reasoning-parser kimi_k3
-  )
-fi
-# K3_PIECEWISE=1: the "textbook fix" for the gfx942 PP=3 decode deadlock.
-# vLLM auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH=1 for
-# KimiK3ForConditionalGeneration (config/vllm.py:1209), which forces
-# compilation_config.mode=NONE. With mode=NONE and empty splitting_ops, the
-# default FULL_AND_PIECEWISE cudagraph_mode degrades to FULL for decode — a
-# whole-decode forward graph is captured that contains the gloo recv_object
-# on the PP boundary, which cannot be replayed, deadlocking at the first real
-# decode (jobs 588153/588156, BENCHMARK.md). K3_PIECEWISE=1 opts out of
-# breakable (VLLM_USE_BREAKABLE_CUDAGRAPH=0) and sets mode=VLLM_COMPILE +
-# cudagraph_mode=PIECEWISE so torch.compile splits the forward at attention
-# ops, keeping the PP recv/send (which run eagerly in the worker driver,
-# outside the model forward) out of the captured graph pieces. splitting_ops
-# omitted from the JSON so vLLM auto-populates from _attention_ops
-# (compilation.py:1144). UNTESTED for Kimi-K3 on this image — the model does
-# not carry @support_torch_compile (the auto-enable comment calls breakable
-# "the supported PIECEWISE path"), so mode=VLLM_COMPILE may fail fast. Use
-# with LOAD_FORMAT=dummy and DISTRIBUTED_TIMEOUT_SECONDS=300 for iteration.
-if [ "${K3_PIECEWISE:-0}" = "1" ]; then
-  # ENFORCE_EAGER=1 forces mode=NONE + cudagraph_mode=NONE at config time
-  # (vllm.py:~1190), silently overriding the PIECEWISE experiment. Warn and
-  # strip --enforce-eager from VLLM_EXTRA_ARGS so the test is valid.
-  if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
-    echo "[rank $RANK] WARN: K3_PIECEWISE=1 and ENFORCE_EAGER=1 are mutually" >&2
-    echo "[rank $RANK]       exclusive (--enforce-eager forces mode=NONE)." >&2
-    echo "[rank $RANK]       Stripping --enforce-eager for this experiment." >&2
-    VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS// --enforce-eager/}"
-  fi
-  export VLLM_USE_BREAKABLE_CUDAGRAPH=0
-  VLLM_ARGS+=(
-    --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'
-  )
-fi
 if [ "$RANK" = "0" ]; then
   VLLM_ARGS+=(--host 0.0.0.0 --port "$SERVE_PORT")
 else
@@ -698,7 +640,7 @@ trap 'stop_otela' EXIT TERM INT
 # [env] (HOME on /capstor, HF_HOME, TRITON_CACHE_DIR, the aws_ofi_nccl hook …).
 # If a var is mysteriously empty on a rank, check:
 #   srun -n1 --environment=$OTELA_EDF_NAME env | grep NAME
-srun --nodes="$NNODES" --ntasks-per-node=1 --environment="$OTELA_EDF_NAME" bash "$RUNDIR/engine.sh"
+srun --ntasks-per-node=1 --environment="$OTELA_EDF_NAME" bash "$RUNDIR/engine.sh"
 SRUN_EXIT=$?
 echo "[$(date -Is)] srun_exited code=${SRUN_EXIT}"
 

@@ -1,0 +1,45 @@
+# Kimi-K3 serving on Beverin MI300A (gfx942) via the vLLM ROCm K3 image.
+# Image: vllm/vllm-openai-rocm:kimi-k3 — vLLM 0.1.dev19253+g5f76ae224.rocm723,
+# bakes /etc/environment with HSA_NO_SCRATCH_RECLAIM=1, PYTORCH_ROCM_ARCH=gfx942,
+# AITER_ROCM_ARCH=gfx942;gfx950.
+#
+# This is the recipe-local EDF (found via EDF_PATH=$SCRIPT_DIR). Paths below
+# are pinned to DEPLOY_DIR=/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin; if
+# you override DEPLOY_DIR at submit time, update workdir/HOME/HF_HOME/
+# TRITON_CACHE_DIR (and the sbatch's K3 so k3_patch.py targets the same pylib).
+image = "/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3.x86_64.sqsh"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+workdir = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin"
+
+[env]
+# HOME on /capstor (NOT quota-limited /users/xyao) so otela's libp2p identity +
+# badger DB and HF/Trtiton caches live on the big store, and k3_patch.py's aiter
+# overlay lands at $HOME/pylib.
+HOME = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache/huggingface"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache/triton"
+# TMPDIR on scratch (AITER_JIT_DIR intentionally NOT set -- (project 2161, unlimited).  The sbatch's
+# outer-shell `export TMPDIR` is lost when srun uses --environment=$OTELA_EDF_NAME
+# (the EDF replaces, not merges, the inherited env).  Without this, Triton/LLVM
+# defaults to /tmp on the enroot overlay (tmpfs, competes with model memory)
+# causing "LLVM ERROR: IO failure on output stream: Disk quota exceeded"
+# (jobs 585851, 585992).
+TMPDIR = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.tmp"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/home/.cache"
+NCCL_DEBUG = "WARN"
+PIP_BREAK_SYSTEM_PACKAGES = "1"
+
+# The aws-ofi-nccl hook LD_PRELOADs a CUDA-built libnccl-net.so that is unusable
+# on ROCm (no libcudart). engine.sh neutralises it at runtime (unset
+# NCCL_NET_PLUGIN/NCCL_NET, NCCL_SOCKET_IFNAME=hsn0, NCCL_IB_DISABLE=1) so RCCL
+# uses its built-in Socket transport over Slingshot. This combination was the
+# verified bring-up path (eng11). TODO: a HIP-aware OFI plugin for real CXI perf.
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
