@@ -335,8 +335,11 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `GEN_CORRECTNESS_MAX_TOKENS` | `64` | `max_tokens` per prompt (matches the Clariden servekit baseline). |
 | `GEN_CORRECTNESS_MIN_PASS` | `5` | Min correct of 6; all 3 crisp must also pass. Set `6` for a strict baseline match. |
 | `GEN_CORRECTNESS_PER_REQ_TIMEOUT` | `180` | Per-request urllib timeout (s); the first request may trigger CUDA-graph capture. |
-| `ENFORCE_EAGER` | `0` | Set `1` to add `--enforce-eager` (skip CUDA-graph capture; try if capture is unstable). |
+| `ENFORCE_EAGER` | `0` | Set `1` to add `--enforce-eager` (skip CUDA-graph capture; the proven path on gfx942+PP3 per `BENCHMARK.md`). |
 | `K3_ENABLE_PARSERS` | `1` | Adds `--enable-prefix-caching --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
+| `K3_PIECEWISE` | `0` | **Experimental.** Set `1` to opt into the "textbook fix" for the gfx942 PP3 decode deadlock: `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'` so `torch.compile` splits the forward at attention ops, keeping the gloo `recv_object` (PP comm, runs eagerly in the worker driver) out of the captured graph. **Untested** for Kimi-K3 (no `@support_torch_compile` — `mode=VLLM_COMPILE` may fail fast). Pair with `LOAD_FORMAT=dummy` + `DISTRIBUTED_TIMEOUT_SECONDS=300` for a fast (≤30 min) iteration; see `BENCHMARK.md` for the deadlock root cause. |
+| `LOAD_FORMAT` | _unset_ | Override weight loading (e.g. `dummy` for a 5-min cold start without real weights — used with `K3_PIECEWISE=1`). |
+| `DISTRIBUTED_TIMEOUT_SECONDS` | _unset_ | Override the gloo/NCCL init+recv timeout (vLLM default 3600 s). Set low (e.g. `300`) with `K3_PIECEWISE=1` so a decode deadlock fails in 5 min, not 1 h. |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64, sai-v0.0.6 (`--bootstrap.static`, `--label`). |
 | `OTELA_RELAY_ADDR` | `/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJk…` | Alps OpenTela bootstrap peer (direct, no relay). |

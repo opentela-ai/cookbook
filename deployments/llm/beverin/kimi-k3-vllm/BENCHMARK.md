@@ -33,8 +33,26 @@ not correctly replay for the first real decode after prefill. The hang is on
 the inter-PP `torch.distributed.recv` (gloo), not on JIT (enforce_eager has
 142 JIT during inference and completes the first request in 0.8 s).
 
+**Precise mechanism** (source `config/vllm.py:1209`, `config/compilation.py`,
+hung-run logs 588153/588156): `KimiK3ForConditionalGeneration` is in the
+architecture list that auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH=1`, which
+forces `compilation_config.mode = NONE`. With `mode=NONE` and empty
+`splitting_ops`, the default `FULL_AND_PIECEWISE` cudagraph_mode degrades to
+`FULL` for decode — a whole-decode forward graph is captured that contains
+the gloo `recv_object` on the PP boundary (`parallel_state.py:838`), which
+cannot be replayed, deadlocking at the first real decode.
+
 **Workaround:** Use `ENFORCE_EAGER=1` (no CUDA graphs). Single-request decode
 is 7.3 tok/s; aggregate throughput scales via batching (see below).
+
+**Potential fix (untested):** `K3_PIECEWISE=1` (see recipe knobs) opts out of
+breakable (`VLLM_USE_BREAKABLE_CUDAGRAPH=0`) and sets
+`mode=VLLM_COMPILE`/`cudagraph_mode=PIECEWISE` so `torch.compile` splits the
+forward at attention ops, keeping the PP `recv_object` (which runs eagerly in
+the worker driver, outside the model forward) out of the captured graph
+pieces. Kimi-K3 lacks `@support_torch_compile`, so `mode=VLLM_COMPILE` may
+fail fast — iterate with `LOAD_FORMAT=dummy` +
+`DISTRIBUTED_TIMEOUT_SECONDS=300`.
 
 ## Batching benchmark (ENFORCE_EAGER=1)
 

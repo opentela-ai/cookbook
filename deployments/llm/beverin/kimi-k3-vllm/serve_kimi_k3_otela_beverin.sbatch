@@ -191,6 +191,15 @@ fi
 # file. The /v1/completions probe below is unaffected (no chat template / tools
 # applied), so parsing stays out of the mandatory correctness gate.
 export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
+# K3_PIECEWISE=1: opt into the "textbook fix" for the gfx942 PP=3 decode
+# deadlock — VLLM_USE_BREAKABLE_CUDAGRAPH=0 + --compilation-config with
+# mode=VLLM_COMPILE/cudagraph_mode=PIECEWISE, so torch.compile splits the
+# forward at attention ops and keeps the gloo recv_object (which runs
+# eagerly in the worker driver, outside the model forward) out of the
+# captured graph pieces. See the full mechanism comment in engine.sh below.
+# UNTESTED for Kimi-K3 on this image — default 0 = unchanged (enforce_eager
+# is the proven path per BENCHMARK.md).
+export K3_PIECEWISE="${K3_PIECEWISE:-0}"
 
 # ------------------------------------------------------------------- otela ----
 # x86_64 build, sai-v0.0.6 (same dialect as the Clariden arm64 build). A
@@ -462,6 +471,17 @@ VLLM_ARGS=(
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --enable-prefix-caching
 )
+# --load-format: override weight loading (e.g. LOAD_FORMAT=dummy for fast
+# iteration without real weights — a 5-min cold start instead of 3 h).
+if [ -n "${LOAD_FORMAT:-}" ]; then
+  VLLM_ARGS+=(--load-format "$LOAD_FORMAT")
+fi
+# --distributed-timeout-seconds: override the gloo/NCCL init+recv timeout
+# (vLLM default 3600 s). Set low (e.g. 300) with K3_PIECEWISE=1 so a decode
+# deadlock fails in 5 min, not 1 h.
+if [ -n "${DISTRIBUTED_TIMEOUT_SECONDS:-}" ]; then
+  VLLM_ARGS+=(--distributed-timeout-seconds "$DISTRIBUTED_TIMEOUT_SECONDS")
+fi
 # Reasoning + tool-call parsing (mirrors Clariden/JSC sglang --reasoning-parser
 # kimi_k3 --tool-call-parser kimi_k3). This kimi-k3 vLLM fork uses the same
 # --tool-call-parser spelling. Gated: set K3_ENABLE_PARSERS=0 if the image
@@ -471,6 +491,29 @@ if [ "${K3_ENABLE_PARSERS:-1}" = "1" ]; then
     --enable-auto-tool-choice
     --tool-call-parser kimi_k3
     --reasoning-parser kimi_k3
+  )
+fi
+# K3_PIECEWISE=1: the "textbook fix" for the gfx942 PP=3 decode deadlock.
+# vLLM auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH=1 for
+# KimiK3ForConditionalGeneration (config/vllm.py:1209), which forces
+# compilation_config.mode=NONE. With mode=NONE and empty splitting_ops, the
+# default FULL_AND_PIECEWISE cudagraph_mode degrades to FULL for decode — a
+# whole-decode forward graph is captured that contains the gloo recv_object
+# on the PP boundary, which cannot be replayed, deadlocking at the first real
+# decode (jobs 588153/588156, BENCHMARK.md). K3_PIECEWISE=1 opts out of
+# breakable (VLLM_USE_BREAKABLE_CUDAGRAPH=0) and sets mode=VLLM_COMPILE +
+# cudagraph_mode=PIECEWISE so torch.compile splits the forward at attention
+# ops, keeping the PP recv/send (which run eagerly in the worker driver,
+# outside the model forward) out of the captured graph pieces. splitting_ops
+# omitted from the JSON so vLLM auto-populates from _attention_ops
+# (compilation.py:1144). UNTESTED for Kimi-K3 on this image — the model does
+# not carry @support_torch_compile (the auto-enable comment calls breakable
+# "the supported PIECEWISE path"), so mode=VLLM_COMPILE may fail fast. Use
+# with LOAD_FORMAT=dummy and DISTRIBUTED_TIMEOUT_SECONDS=300 for iteration.
+if [ "${K3_PIECEWISE:-0}" = "1" ]; then
+  export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+  VLLM_ARGS+=(
+    --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'
   )
 fi
 if [ "$RANK" = "0" ]; then
@@ -646,7 +689,7 @@ trap 'stop_otela' EXIT TERM INT
 # [env] (HOME on /capstor, HF_HOME, TRITON_CACHE_DIR, the aws_ofi_nccl hook …).
 # If a var is mysteriously empty on a rank, check:
 #   srun -n1 --environment=$OTELA_EDF_NAME env | grep NAME
-srun --ntasks-per-node=1 --environment="$OTELA_EDF_NAME" bash "$RUNDIR/engine.sh"
+srun --nodes="$NNODES" --ntasks-per-node=1 --environment="$OTELA_EDF_NAME" bash "$RUNDIR/engine.sh"
 SRUN_EXIT=$?
 echo "[$(date -Is)] srun_exited code=${SRUN_EXIT}"
 
