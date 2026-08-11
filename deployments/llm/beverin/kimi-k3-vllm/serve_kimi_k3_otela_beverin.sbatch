@@ -180,6 +180,18 @@ if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
   export VLLM_EXTRA_ARGS="$VLLM_EXTRA_ARGS --enforce-eager"
 fi
 
+# Kimi-K3 is a hybrid reasoning model: its chat template emits a <think>...</think>
+# (reasoning) block and supports OpenAI-style tool calls. vLLM exposes
+# reasoning_content + tool_calls on /v1/chat/completions ONLY with
+# --enable-auto-tool-choice + --tool-parser + --reasoning-parser. Clariden/JSC
+# (sglang) spell the tool flag --tool-call-parser; vLLM spells it --tool-parser.
+# The `kimi_k3` parser ships in the custom vllm-openai-rocm:kimi-k3 image; if an
+# image bump drops it, startup errors "Unknown tool parser: kimi_k3" first --
+# set K3_ENABLE_PARSERS=0 to recover without editing this file. The
+# /v1/completions probe below is unaffected (no chat template / tools applied),
+# so parsing stays out of the mandatory correctness gate.
+export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
+
 # ------------------------------------------------------------------- otela ----
 # x86_64 build, sai-v0.0.6 (same dialect as the Clariden arm64 build). A
 # multiaddr goes to --bootstrap.static (NOT --bootstrap.addr, which expects an
@@ -448,7 +460,19 @@ VLLM_ARGS=(
   --max-model-len "$CTX_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
+  --enable-prefix-caching
 )
+# Reasoning + tool-call parsing (mirrors Clariden/JSC sglang --reasoning-parser
+# kimi_k3 --tool-call-parser kimi_k3). vLLM uses --tool-parser, not
+# --tool-call-parser. Gated: set K3_ENABLE_PARSERS=0 if the image lacks the
+# kimi_k3 parser (startup errors "Unknown tool parser" first).
+if [ "${K3_ENABLE_PARSERS:-1}" = "1" ]; then
+  VLLM_ARGS+=(
+    --enable-auto-tool-choice
+    --tool-parser kimi_k3
+    --reasoning-parser kimi_k3
+  )
+fi
 if [ "$RANK" = "0" ]; then
   VLLM_ARGS+=(--host 0.0.0.0 --port "$SERVE_PORT")
 else
