@@ -1,0 +1,26 @@
+# EDF for building + testing vkernels (gfx942 kernel library for Kimi-K3)
+# on Beverin MI300A compute nodes. Reuses the SGLang ROCm image (same digest
+# as the glm52/glm47-flash recipes) because it ships ROCm 7.2 userspace +
+# cmake + hipcc, all needed for `cmake --preset hip`.
+#
+# vkernels issues #21 (MLA+KDA), #22 (MoE aux), #29 (bf16 GEMM), #19 (RCCL),
+# #20 (vLLM integration) are all CLOSED as of 2026-08-14. This EDF verifies
+# the gfx942 HIP device kernels actually run on Beverin's MI300A APU — the
+# prerequisite for any K3+vkernels integration.
+image = "lmsysorg/sglang@sha256:80d04638deb64fac000fa565cb46e5d2f692173dc125a32a956014a6383ecaee"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/vkernels"
+
+[env]
+HOME = "/capstor/scratch/cscs/xyao/vkernels/home"
+HSA_NO_SCRATCH_RECLAIM = "1"
+ROCM_PATH = "/opt/rocm"
+HIP_PATH = "/opt/rocm"
+LD_LIBRARY_PATH = "/opt/rocm/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+PYTHONPATH = ""
+PYTHONNOUSERSITE = "1"
