@@ -1,0 +1,39 @@
+# OFI/CXI RCCL net-plugin smoke test on Beverin MI300A (gfx942).
+#
+# Reuses the kimi-k3-vllm image on PURPOSE: the point is to exercise the EXACT
+# RCCL that serve_kimi_k3_otela_beverin.sbatch runs (RCCL 1.0.70203 /
+# NCCL-compat 2.27.7, baked at /opt/rocm-7.2.3). The vkernels plugin
+# (plugins/rccl-net-ofi) redeclares the RCCL net-plugin ABI locally and links
+# libfabric alone, so whether RCCL 1.0.70203's loader accepts its v-table is
+# the make-or-break question for the beverin integration — it can only be
+# answered by loading the .so inside this image.
+#
+# /opt/cray/libfabric (1.29.1, has the cxi provider BUILTIN) is mounted into
+# the container: the image only ships libfabric 1.14.0 (no cxi), so the plugin
+# needs the Cray libfabric at both BUILD time (rdma/fabric.h headers) and
+# RUN time (libfabric.so.1.29.1 + the cxi provider). It is mounted read-write
+# like the other EDF binds; the plugin only reads it.
+#
+# This EDF is for the standalone smoke (ofi_rccl_smoke.sbatch) and is
+# intentionally separate from kimi-k3-vllm.toml so the proven serving recipe
+# is untouched until the smoke passes.
+image = "/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3.x86_64.sqsh"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+  "/opt/cray/libfabric:/opt/cray/libfabric",
+]
+workdir = "/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin"
+
+[env]
+# NCCL_DEBUG=INFO so the smoke log shows which transport RCCL actually used
+# (cxi vs Socket) and whether the external plugin was loaded. The serving
+# recipe uses WARN; INFO here is intentional for a one-off test.
+NCCL_DEBUG = "INFO"
+# LD_LIBRARY_PATH is intentionally NOT set here (the EDF [env] table is
+# authoritative for a key and would shadow the image's ROCm ld.so path).
+# The smoke scripts prepend the Cray libfabric at runtime so the image's
+# /opt/rocm-7.2.3 libs (found via ldconfig) are preserved.
+PIP_BREAK_SYSTEM_PACKAGES = "1"

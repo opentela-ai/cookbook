@@ -1,0 +1,8 @@
+# Runtime state (logs, otela config/pid, last_service.env) — created by the
+# serve/register scripts under ./run/
+/run/
+
+# This recipe reuses the s3er-qwen36-dgx-spark image (same qwen3_5 family);
+# there is no build_image.sh here. The model weights are downloaded out of
+# band to $HOME/models/Qwen3.8-27B-FP8 (see README) and are NOT part of the
+# cookbook.

@@ -61,6 +61,11 @@ class _DevicePropsProxy:
 _orig_get_device_properties = torch.cuda.get_device_properties
 
 
+# NOTE: keep the `device=None` default matching the original
+# torch.cuda.get_device_properties(device=None) signature.  The aiter DSA
+# decode path (dsa_indexer.py forward_cuda) calls get_device_properties()
+# with NO argument (defaults to the current device); without this default
+# the proxy raises TypeError: missing 1 required positional argument.
 def _patched_get_device_properties(device=None):
     return _DevicePropsProxy(_orig_get_device_properties(device))
 

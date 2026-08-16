@@ -179,7 +179,7 @@ class _DevicePropsProxy:
 _orig_get_device_properties = torch.cuda.get_device_properties
 
 
-def _patched_get_device_properties(device):
+def _patched_get_device_properties(device=None):
     return _DevicePropsProxy(_orig_get_device_properties(device))
 
 

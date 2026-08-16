@@ -1,0 +1,134 @@
+# EDF for serving GLM-5.2 (zai-org/GLM-5.2, BF16 ~1.5 TB, DeepSeek Sparse
+# Attention + MoE + MTP) on Beverin (AMD MI300A / gfx942) compute nodes with
+# the *plain upstream* SGLang ROCm image, launched via the CSCS Slurm Container
+# Engine (enroot + Pyxis) with `srun --environment=sglang-rocm`.
+#
+# Why this image / tag (same as the glm47-flash recipe, validated for SGLang on
+# MI300A):
+#   * sglang only publishes ROCm builds for MI300A (gfx942, `*-mi30x`) and the
+#     MI350 series (gfx950, `*-mi35x`) — there is NO MI250X/gfx90a build, so the
+#     job MUST run on the `mi300` partition even though the login node is
+#     MI250X. Confirmed via `docker/rocm.Dockerfile`:
+#       docker build --build-arg GPU_ARCH=gfx942-rocm720 \
+#         -t <ver>-rocm720-mi30x -f rocm.Dockerfile .
+#   * Pinned by digest (not a floating :rocm720-mi30x tag) so the
+#     Triton/tilelang JIT caches on shared /capstor stay warm across launches —
+#     a moving tag silently invalidates the whole cache. Digest resolved
+#     2026-07-30 from Docker Hub lmsysorg/sglang:v0.5.16-rocm720-mi30x
+#     (ROCm 7.2 userspace; the MI300A kernel driver on Beverin is 6.3/6.4 and
+#      is forward-compatible with the 7.2 userspace, same as the existing
+#      vllm/vllm-openai-rocm and minisgl-rocm EDFs in ~/.edf).
+#
+# GLM-5.2 support in this image (verified against the v0.5.16 tag):
+#   * SGLang `configs/model_config.py` L114-115 registers `GlmMoeDsaForCausalLM`
+#     + `GlmMoeDsaForCausalLMNextN`; `arg_groups/overrides.py` L329/L1324 lists
+#     the architecture and auto-sets `attention_backend=dsa` for it
+#     ("DeepSeek 3.2/GLM 5").
+#   * transformers (bundled 5.12.1; config.json records transformers_version
+#     5.12.0) ships `src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py`
+#     and registers `glm_moe_dsa -> GlmMoeDsaForCausalLM` in `auto/modeling_auto.py`
+#     (L749). GLM-5.2 ships NO remote modeling .py, so the class is resolved
+#     from the image's transformers via `--trust-remote-code` (a no-op load,
+#     kept for safety).
+#   * The DSA backend (`layers/attention/dsa_backend.py`) on hip auto-defaults
+#     to `dsa_prefill_backend=tilelang` and `dsa_decode_backend=tilelang` and
+#     uses AITER for paged-MQA-logits — a SEPARATE path from SGLANG_USE_AITER
+#     (which only gates the attention_backend/MoE aiter selection), so keeping
+#     SGLANG_USE_AITER=0 (to avoid the aiter get_rope crash, glm47 lesson) does
+#     NOT block DSA.
+#
+# First run pulls ~66 GiB into $SCRATCH/.edf_imagestore (shared, cached for
+# every subsequent job across all nodes). To pre-warm from the login node:
+#   enroot import docker://lmsysorg/sglang:v0.5.16-rocm720-mi30x
+image = "lmsysorg/sglang@sha256:80d04638deb64fac000fa565cb46e5d2f692173dc125a32a956014a6383ecaee"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin"
+
+[env]
+# Per-rank HOME on /capstor (NOT /users — quota-limited). otela writes a libp2p
+# identity key + a badger DB under $HOME/.config/opentela; a shared HOME across
+# ranks/jobs collides. The serve script overrides this per rank (SLURM_PROCID)
+# for the otela worker; the value here is the base for rank 0 / single-node runs.
+HOME = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/xdg"
+XDG_CONFIG_HOME = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/config"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/triton"
+# Tilelang (DSA prefill/decode backend) keeps its own compiled-kernel cache,
+# separate from Triton. Shared on /capstor so only the first run pays the JIT.
+TILELANG_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/tilelang"
+PIP_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/pip"
+# tempfile goes on /capstor, NOT the default /users/<u>/.tmp that Slurm hands
+# the container (home is quota-limited and sglang's tempfile cleanup on quota
+# dirs throws OSError [Errno 39]). The serve script also re-exports this.
+TMPDIR = "/capstor/scratch/cscs/xyao/glm52-sglang-beverin/cache/tmp"
+# MI300A + ROCm 7.2 hard-requires this or HIP/RCCL aborts at kernel launch
+# (mandatory on Beverin; see ~/.edf/minisgl-rocm.toml and tokenspeed-rocm*).
+HSA_NO_SCRATCH_RECLAIM = "1"
+ROCM_PATH = "/opt/rocm"
+HIP_PATH = "/opt/rocm"
+# /opt/rocm/lib MUST come first: some base images ship a stale libhsa-runtime64
+# in /lib/x86_64-linux-gnu that breaks torch import on MI300A.
+LD_LIBRARY_PATH = "/opt/rocm/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+# Cross-node TP allreduce runs over RCCL Socket transport on Slingshot. The
+# engine.sh wrapper unsets NCCL_NET_PLUGIN/NCCL_NET (the image ships a
+# CUDA-built aws_ofi_nccl plugin that cannot init on ROCm), pins
+# NCCL_SOCKET_IFNAME=hsn0 and NCCL_IB_DISABLE=1. Keep IFNAME=hsn here as the
+# single-node default (engine.sh's export wins for the multi-node case).
+NCCL_SOCKET_IFNAME = "hsn"
+# NCCL_DEBUG is INTENTIONALLY NOT pinned here (unlike the glm47/kimi-k3 EDFs):
+# an EDF [env] key replaces the inherited value, making it impossible to raise
+# at submit time for first-bring-up RCCL diagnosis. The engine.sh wrapper sets
+# NCCL_DEBUG="${NCCL_DEBUG:-WARN}", so `sbatch --export=ALL,NCCL_DEBUG=INFO`
+# (or setting it in the parent shell) takes effect.
+# SGLANG_USE_AITER governs the DSA indexer's preshuffle paged-MQA path
+# (aiter_can_use_preshuffle_paged_mqa() in dsa/utils.py L49 checks
+# get_bool_env_var("SGLANG_USE_AITER") FIRST, before AITER_ENABLE_AOT_*
+# or the Triton>=3.5.0 check).
+#
+# Tested outcomes on MI300A (gfx942), BOTH values have bugs:
+#   SGLANG_USE_AITER=0 -> page_size=1 fallback.  Prefill WORKS (14 s,
+#     /health 200 OK), but decode HANGS at 100% GPU with zero Decode
+#     batches after 10+ min (jobs 594462, 594527; AITER_ENABLE_AOT_
+#     GLUON_PA_MQA_LOGITS=1 did NOT help — SGLANG_USE_AITER=0 is checked
+#     first and returns False before the AOT flag is examined).
+#   SGLANG_USE_AITER=1 -> page_size=64 (preshuffle ENABLED).  NO get_rope
+#     crash (job 594528: GLM-5.2 has NO rope_scaling, and the DSA backend
+#     uses its OWN rope via fused_qk_rmsnorm — a different path from the
+#     glm47 get_rope crash).  Server fires up in ~7 min, but the FIRST
+#     FORWARD NEVER STARTS: GPU at 0% activity (82-83% VRAM static),
+#     detokenizer process alive but idle, health-check loop failing.
+#     This is a DIFFERENT hang from the page_size=1 case (0% vs 100% GPU).
+#
+# The get_rope risk that motivated the original SGLANG_USE_AITER=0 (glm47
+# lesson: aiter get_rope indexes rope_scaling["original_max_position_
+# embeddings"]) does NOT apply to GLM-5.2 — confirmed in job 594528.  The
+# DSA backend has its own rope computation; SGLANG_USE_AITER only gates
+# fused_qk_rmsnorm (forward_mla.py L117), which takes pre-computed rope.
+#
+# Production default is 1 (the preshuffle path is the intended config for
+# future SGLang versions that fix the gfx942 deadlock).  Override at submit
+# time: `--export=ALL,SGLANG_USE_AITER=0` to test the page_size=1 fallback.
+# The last untested DSA backend is `flashmla_sparse` (job 594548, PENDING),
+# which on AMD dispatches to aiter's STANDARD mla_prefill_fwd/mla_decode_fwd
+# (a DIFFERENT path from the DSA preshuffle paged-MQA kernel).
+SGLANG_USE_AITER = "1"
+# Use the image's own SGLang/torch/transformers; never pick up stale user
+# venvs on /users. transformers 5.12.1 (bundled) already ships
+# GlmMoeDsaForCausalLM — the serve script's TRANSFORMERS install guard is a
+# no-op unless overridden to a different version.
+PYTHONPATH = ""
+PYTHONNOUSERSITE = "1"
+PIP_BREAK_SYSTEM_PACKAGES = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+
+[annotations]
+com.pyxis.entrypoint_log = "true"
