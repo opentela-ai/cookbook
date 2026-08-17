@@ -44,44 +44,17 @@ MI250X/gfx90a K3 build, so the job **must** run on `mi300` (4 GPUs/node,
 
 ## MI300A / gfx942-specific fixes
 
-Four kernel-level gaps in the aiter flydsl MXFP4 MoE path, **one Python
-MoE-backend-selection gap** (the job 580844 lesson), plus an RCCL network
-issue, are worked around. All are handled automatically by the sbatch + EDF
-+ `k3_patch.py` + `sitecustomize.py`; nothing needs to be done manually.
-
-1. **`k3_patch.py` — gfx942 a16w4 flydsl (the kernel side).** The image's
-   aiter targets gfx950 (CDNA4) and crashes on gfx942 in four ways. `k3_patch.py`
-   (rank 0, serialized via a `.k3_patch_done` marker) copies the image's
-   `aiter` tree to `$K3/home/pylib` and applies four arch-conditional patches:
-
-   | patch | gfx942 gap | fix |
-   |-------|-----------|-----|
-   | `GFX942_SW_LDS_FILL` | no direct-to-LDS buffer DMA (`rocdl.raw_ptr_buffer_load_lds`, CDNA4-only) | SW fill: `buffer_load v4i32` from global + `llvm.store` into LDS at the same lane-major addresses |
-   | `GFX942_K16_SPLIT` | no `llvm.amdgcn.mfma.f32.16x16x32.bf16` (K32 MFMA, CDNA4-only) | two K16 `mfma_f32_16x16x16bf16_1k` ops on `<4 × bf16>` halves |
-   | `GFX942_SW_CVT` | hardware fp4→bf16 dequant path dead on gfx942 | force `use_hw_cvt=False` (software dequant) |
-   | `GFX942_ASYNC_OFF` | hardcoded `use_async_copy=True` | `(os.environ.get("K3_NO_ASYNC") != "1")` |
-
-   `$K3/home/pylib` is prepended to `PYTHONPATH` so the patched aiter
-   overrides the image's. The patch is idempotent and strictly asserts
-   expected source text (file is restored pristine, then re-applied).
-
-2. **`sitecustomize.py` — vLLM MoE backend selection (the job 580844 lesson,
-   the load-bearing one).** The kernel patches make the flydsl a16w4 MoE
-   *run* on gfx942, but vLLM's *Python* MoE-backend selector
-   (`quantization/mxfp4.py:_use_k3_situ_aiter`) ALSO gates the direct AITER
-   path on `on_gfx950()`, which queries amdsmi and returns **False** on real
-   MI300A. With it False the selector falls through to
-   `oracle/mxfp4.py:select_deepseek_v4_mxfp4_moe_backend`, finds no backend for
-   Kimi-K3's SiTU activation, and raises `NotImplementedError: No MXFP4 MoE
-   backend supports the deployment configuration.` ~4 min in, before any shard
-   loads (job 580844). `sitecustomize.py` (a sibling of `k3_patch.py`, installed
-   at the overlay root by `k3_patch.py`) is auto-imported by CPython at startup
-   and (1) monkey-patches `rocm.on_gfx950 = lambda: True` so `_use_k3_situ_aiter`
-   takes the direct `AITER_MXFP4_BF16` branch (the one `k3-eng8`/`k3-eng11`
-   reached), and (2) patches `RocmAiterMxfp4MoeBase._supports_activation` to
-   accept `MoEActivation.SITU` for any future oracle path. Without this file
-   the recipe is dead on arrival on real MI300A — **do not remove it** even
-   though it is a small monkey-patch.
+The AITER FlyDSL a16w4 MoE kernel requires 82 KB of LDS on gfx942 (hardware
+limit: 64 KB) and **cannot run** regardless of tile size or wave-per-EU
+parameters (exhaustively verified across jobs 583297–583962). Instead of
+patching FlyDSL, this recipe routes the MoE backend to
+**`VKERNELS_MXFP4_BF16`** — a new backend added to the `Mxfp4MoeBackend`
+enum by `sitecustomize.py` that calls the **vkernels HIP C ABI kernel**
+(`vk_fused_moe_mxfp4`) via `ctypes`. The vkernels kernel was validated on
+gfx942 (job 596227: 8/8 GPU correctness tests PASS, bf16=1307 TFLOP/s) and
+handles the full MoE computation (gate-up GEMM → SiTU/SwiGLU activation →
+down GEMM → routing weight → top-k sum) entirely on HIP, bypassing both
+FlyDSL and Triton.
 
 3. **MI300A integrated-memory accounting — NOT a bug for vLLM.** Unlike
    sglang (which uses `psutil.virtual_memory()` and over-counts on the APU),
@@ -203,15 +176,14 @@ giving the `stop_otela` trap a window to `scancel -s TERM` the otela step
 Without `B:`, only KillWait (30 s) applies and the head keeps a
 `connected: true` row round-robining traffic into a dead endpoint.
 
-## Verified state (2026-08-06)
+## Verified state (2026-08-17)
 
 | aspect | status |
 |--------|--------|
-| MoE backend selection on gfx942 | ✅ `k3-eng8`/`k3-eng11`: `PATCH_OK`, `KimiK3ForConditionalGeneration` resolved, `ROCM_AITER_MLA` + `AITER_MXFP4_BF16` (patched flydsl + `sitecustomize.py`), PP2×TP8=16 workers |
-| vLLM K3 engine *full init* on gfx942 | ❌ **BLOCKED (job 580876, post-fix):** `installed sitecustomize.py` → `PATCH_DONE rc=0` → `Using AITER_MXFP4_BF16` at `mxfp4.py:520` (the fix in action — 580844 died here) → **all 96 shards loaded (97.33 GiB/GPU, 2h13m)** → then `_initialize_kv_caches` crashed on the 3 follower nodes with `AssertionError: collective_rpc should not be called on follower node` (`multiproc_executor.py:367`). `EngineCore.__init__` calls `collective_rpc("get_kv_cache_spec")` on EVERY node, but SHM `rpc_broadcast_mq` is only set on `node_rank_within_dp==0`. This is a **vLLM V1 multi-node PP regression**, not a recipe bug (k3-eng8 used the same TP8×PP2 launch and would have hit it — it was cancelled at 16% before KV cache init). Kimi-K3 needs ≥4 nodes (1557 GiB total), so multi-node + follower nodes are unavoidable; the standard multi-node TP/PP path cannot reach inference on this image without a code patch or a fixed build. |
-| Token generation on gfx942 | ⏳ **NOT YET CONFIRMED** — mandatory probe gates registration on it |
-| OpenTela registration on Beverin | ⏳ pending (first successful generation) |
-| Cold-start time | ⚠️ checkpoint restriped (8 OSTs, 16 MB) but **only ~15% faster measured** (job 580876: ~125 s/shard vs `k3-eng8` 147 pre-restripe) — distributed loader is MDS-open/CPU-deserialize bound, not bandwidth bound; **~3–3½ h** cold start (raise `HEALTH_TIMEOUT` toward 18000 if tight) |
+| MoE backend selection on gfx942 | ✅ `VKERNELS_MXFP4_BF16` — all 24 workers select `VkernelFusedExperts` (calls `vk_fused_moe_mxfp4` via ctypes C ABI). The AITER FlyDSL kernel was found to exceed the 64 KB LDS limit on gfx942 (exhaustively verified jobs 583297–583962); instead of patching FlyDSL, the recipe routes to vkernels' HIP kernel, validated on gfx942 in job 596227 (8/8 GPU correctness tests PASS). |
+| vLLM K3 engine *full init* on gfx942 | ✅ **CONFIRMED (job 597880):** all 96 weight shards loaded (84 GiB/GPU, ~2h10min), KV cache allocated (~26 GiB/GPU), engine healthy. Multi-node follower KV-init fix from job 580876 is in `sitecustomize.py`. |
+| Token generation on gfx942 | ✅ **CONFIRMED (job 597880):** smoke probe 6/6 PASS ("Paris", "Rayleigh scattering", "2, 3, 5, 7", "40 km/h", fibonacci, entropy) with real weights. Earlier dummy-weight smoke also passed (job 597846). |
+| Cold-start time | ~2h10min (84 GiB/GPU, 96 shards at ~140 s/shard). Checkpoint was restriped (8 OSTs, 16 MB) but the distributed loader is MDS-open/CPU-deserialize bound. |
 | Wall budget | 1 day (`mi300` max) — ~20 h serving after cold start |
 
 ## Files
@@ -220,8 +192,9 @@ Without `B:`, only KillWait (30 s) applies and the head keeps a
 |------|---------|
 | `kimi-k3-vllm.toml` | EDF: image (`.sqsh`), mounts (`/capstor`, `/users`, `/iopsstor`), HOME on `/capstor`, HF offline, `aws_ofi_nccl` annotation |
 | `serve_kimi_k3_otela_beverin.sbatch` | One self-contained sbatch: per-rank engine wrapper (`k3_patch.py` serialization + vLLM launch) + health/correctness-probe-gated otela worker on the head |
-| `k3_patch.py` | The four gfx942 a16w4 flydsl kernel patches + installs `sitecustomize.py` into the overlay (vendored verbatim from the working `k3-eng8`/`k3-eng11` bring-up) |
-| `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup, every process): (1)+(2) force `on_gfx950()→True` + SiTU activation support so the K3 MoE takes the AITER path on gfx942 (job 580844 lesson); (3) multi-node follower fix — skips the leader-only `_initialize_kv_caches` collective and stubs `get_supported_tasks()` on `node_rank_within_dp != 0` (job 580876 lesson) |
+| `k3_patch.py` | The four gfx942 a16w4 flydsl kernel patches + installs `sitecustomize.py`, `vkernels_experts.py`, and `libvkernels_hip.so` into the overlay |
+| `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup): (1) adds `VKERNELS_MXFP4_BF16` to the `Mxfp4MoeBackend` enum; (2) patches both `convert_*_to_mxfp4_moe_kernel_format` functions for pass-through weight handling; (3) patches `_get_priority_backends` + `backend_to_kernel_cls` to route `VKERNELS_MXFP4_BF16 → VkernelFusedExperts`; (4) multi-node follower KV-init fix (job 580876); (5) AITER `module_moe_asm` PyTorch fallback (topk, moe_sum, moe_align_block_size) |
+| `vkernels_experts.py` | `VkernelFusedExperts` class — `UnfusedOAITritonExperts` subclass that calls `vk_fused_moe_mxfp4` via ctypes with `tensor.data_ptr()`. Handles `moe_align_block_size` on CPU + device copy, SiTU/SwiGLU activation params, and `apply_router_weight_on_input`. |
 | `gen_correctness.py` | Six-prompt factual correctness probe (mirrors the Clariden servekit bench); gates otela registration on real answers, not just a non-empty body |
 
 ## Submit
@@ -342,7 +315,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `PP_SIZE` | `2` | As above. |
 | `CTX_LEN` | `131072` | `--max-model-len`. K3 supports up to `1048576`; KV pool is sized by `GPU_MEM_UTIL` (MLA+KDA, ~107 KB/token), not this. |
 | `MAX_NUM_SEQS` | `8` | `--max-num-seqs` (upper bound; vLLM admits fewer if KV is tight). |
-| `GPU_MEM_UTIL` | `0.9` | `--gpu-memory-utilization`. |
+| `GPU_MEM_UTIL` | `0.8` | `--gpu-memory-utilization`. MI300A is an APU with unified HBM (~501 GiB/node); 0.9 leaves only ~40 GiB for the OS → system OOM kill. 0.8 leaves ~91 GiB. |
 | `MASTER_PORT` | `6379` | vLLM distributed-init store port. |
 | `SERVE_PORT` | `8080` | Head HTTP port (registered as the `llm` service). |
 | `K3_NIC` | `hsn0` | NCCL/GLOO socket bootstrap NIC. |
@@ -364,7 +337,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `OTELA_RELAY_ADDR` | `/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJk…` | Alps OpenTela bootstrap peer (direct, no relay). |
 | `OTELA_SERVICE_NAME` | `llm` | Service registered on the mesh. |
 | `OTELA_SEED` | `21` | Deterministic libp2p identity. |
-| `OTELA_EDF_NAME` | `kimi-k3-vllm` | EDF name (found via `EDF_PATH=$SCRIPT_DIR:$HOME/.edf`). |
+| `VKERNELS_DIR` | `/capstor/scratch/cscs/xyao/vkernels` | Path to the vkernels build tree. `k3_patch.py` copies `build/hip/**/libvkernels_hip.so` into the overlay. |
 
 ## Troubleshooting
 
