@@ -93,9 +93,32 @@ try:
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
     from vllm.platforms import current_platform as _cp
 
-    # Add VKERNELS_MXFP4_BF16 to the Mxfp4MoeBackend enum.
+    # Add VKERNELS_MXFP4_BF16 to the Mxfp4MoeBackend enum as a
+    # proper member (not a plain string).  The oracle calls
+    # backend.value / backend.name in _make_log_backend and
+    # _make_log_unsupported, so a bare string would crash with
+    # AttributeError: 'str' object has no attribute 'value'.
+    # Python's Enum functional API (Enum(name, value)) creates a
+    # new enum *class*, not a new member, so we construct the
+    # member manually via object.__new__ and register it in the
+    # internal _member_map_ / _value2member_map_.
     if not hasattr(_oracle_mod.Mxfp4MoeBackend, "VKERNELS_MXFP4_BF16"):
-        _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16 = "VKERNELS_MXFP4_BF16"
+        _vk = object.__new__(_oracle_mod.Mxfp4MoeBackend)
+        _vk._name_ = "VKERNELS_MXFP4_BF16"
+        _vk._value_ = "VKERNELS_MXFP4_BF16"
+        # EnumType.__setattr__ blocks reassignment of existing members
+        # but allows setting NEW attributes (falls through to
+        # type.__setattr__).  This adds _vk to __dict__ so that
+        # Mxfp4MoeBackend.VKERNELS_MXFP4_BF16 attribute access works.
+        _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16 = _vk
+        _oracle_mod.Mxfp4MoeBackend._member_map_[
+            "VKERNELS_MXFP4_BF16"
+        ] = _vk
+        _oracle_mod.Mxfp4MoeBackend._value2member_map_[
+            "VKERNELS_MXFP4_BF16"
+        ] = _vk
+        print(f"[sitecustomize] VKERNELS_MXFP4_BF16 enum member created: {_vk}",
+              flush=True)
 
     # Patch convert_gpt_oss_weight_to_mxfp4_moe_kernel_format: for
     # VKERNELS_MXFP4_BF16, pass weights and scales through unchanged
@@ -154,8 +177,11 @@ try:
             ]
 
         _oracle_mod._get_priority_backends = _patched_gpb
-except Exception:
-    pass
+except Exception as _e:
+    import traceback
+    print(f"[sitecustomize] WARNING: VKERNELS_MXFP4_BF16 patch failed: {_e}",
+          flush=True)
+    traceback.print_exc()
 
 # (4) Patch UnfusedOAITritonExperts._supports_activation to include SITU.
 # The class already supports `(kMxfp4Static, None)` quantization, all
