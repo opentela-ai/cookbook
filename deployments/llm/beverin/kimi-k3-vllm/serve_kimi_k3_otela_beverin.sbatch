@@ -168,7 +168,9 @@ fi
 # 1048576 once a cold start + generation are confirmed fast.
 export CTX_LEN="${CTX_LEN:-131072}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+# MI300A is an APU: HBM is shared between CPU and 4 GPU complexes.
+# 0.9 leaves only ~40 GiB for OS → OOM kill. 0.8 leaves ~91 GiB.
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
 # vLLM distributed init store (rank discovery) + head HTTP port.
 export MASTER_PORT="${MASTER_PORT:-6379}"
 export SERVE_PORT="${SERVE_PORT:-8080}"
@@ -395,6 +397,13 @@ export VLLM_ROCM_USE_SKINNY_GEMM=0
 # hardcoded use_async_copy in fused_moe.py on gfx942.
 export K3_NO_ASYNC=1
 export K3_SKIP_FLYDSL_PATCHES=1
+# VKERNELS_DIR: path to the vkernels build tree (for libvkernels_hip.so).
+# The VkernelFusedExperts backend (sitecustomize.py) loads the C ABI
+# shared library from $VKERNELS_DIR/build/hip/src/c/libvkernels_hip.so.
+# Built by deployments/llm/beverin/vkernels/build_test_vkernels.sbatch.
+# If not found, sitecustomize.py falls back to Triton
+# (UnfusedOAITritonExperts) which also works on gfx942.
+export VKERNELS_DIR="${VKERNELS_DIR:-/capstor/scratch/cscs/xyao/vkernels}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 # Shared Triton cache on /capstor/scratch (project 2161, unlimited quota,
