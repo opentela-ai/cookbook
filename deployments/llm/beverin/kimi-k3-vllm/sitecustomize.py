@@ -75,19 +75,73 @@ try:
 except Exception:
     pass
 
-# (3) Patch _get_priority_backends on ROCm to include TRITON_UNFUSED.
+# (3) Patch _get_priority_backends on ROCm to include VKERNELS_MXFP4_BF16.
 # Kimi-K3 uses `RoutingMethodType.DeepSeekV3` (not DeepseekV4), so the
 # special `if current_platform.is_rocm() and config.routing_method ==
 # DeepseekV4` branch in `select_deepseek_v4_mxfp4_moe_backend` (which
 # already includes TRITON_UNFUSED) is NOT taken.  Instead the else branch
 # calls `_get_priority_backends()` which on ROCm returns only
-# `[AITER_MXFP4_BF16]`.  We add TRITON_UNFUSED so the oracle can fall
-# through from AITER (which fails `_supports_activation(SITU)`) to the
-# Triton-unfused backend.
+# `[AITER_MXFP4_BF16]`.  We add VKERNELS_MXFP4_BF16 (a new backend we
+# add to the Mxfp4MoeBackend enum below) so the oracle can fall through
+# from AITER (which fails `_supports_activation(SITU)`) to the vkernels
+# C ABI kernel.  VKERNELS_MXFP4_BF16 passes weights through WITHOUT
+# swizzling (unlike TRITON_UNFUSED which is in TRITON_BACKENDS and
+# calls _swizzle_mxfp4 + wraps scales in PrecisionConfig).
 try:
+    import torch
     from vllm.model_executor.layers.fused_moe.oracle import mxfp4 as _oracle_mod
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
     from vllm.platforms import current_platform as _cp
+
+    # Add VKERNELS_MXFP4_BF16 to the Mxfp4MoeBackend enum.
+    if not hasattr(_oracle_mod.Mxfp4MoeBackend, "VKERNELS_MXFP4_BF16"):
+        _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16 = "VKERNELS_MXFP4_BF16"
+
+    # Patch convert_gpt_oss_weight_to_mxfp4_moe_kernel_format: for
+    # VKERNELS_MXFP4_BF16, pass weights and scales through unchanged
+    # (only convert biases to float32).  This avoids the _swizzle_mxfp4
+    # + PrecisionConfig wrapping that TRITON_BACKENDS does.
+    _orig_convert = _oracle_mod.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format
+
+    def _patched_convert(
+        mxfp4_backend,
+        layer,
+        w13_weight,
+        w2_weight,
+        w13_weight_scale,
+        w2_weight_scale,
+        w13_bias=None,
+        w2_bias=None,
+        _cache_permute_indices=None,
+    ):
+        if mxfp4_backend == _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16:
+            if w13_bias is not None:
+                w13_bias = w13_bias.data.to(torch.float32)
+            if w2_bias is not None:
+                w2_bias = w2_bias.data.to(torch.float32)
+            return (
+                w13_weight.data,
+                w2_weight.data,
+                w13_weight_scale.data,
+                w2_weight_scale.data,
+                w13_bias,
+                w2_bias,
+            )
+        return _orig_convert(
+            mxfp4_backend,
+            layer,
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+            _cache_permute_indices=_cache_permute_indices,
+        )
+
+    _oracle_mod.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format = (
+        _patched_convert
+    )
 
     if _cp.is_rocm():
         _orig_gpb = _oracle_mod._get_priority_backends
@@ -95,6 +149,7 @@ try:
         def _patched_gpb():
             return [
                 _oracle_mod.Mxfp4MoeBackend.AITER_MXFP4_BF16,
+                _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16,
                 _oracle_mod.Mxfp4MoeBackend.TRITON_UNFUSED,
             ]
 
@@ -126,6 +181,50 @@ try:
     UnfusedOAITritonExperts._supports_activation = _patched_unfused_act
 except Exception:
     pass
+
+# (5) Register VkernelFusedExperts — vkernels HIP C ABI MoE backend.
+# Instead of using Triton kernels for the MoE GEMMs (which work but are
+# slow on gfx942), we route the new VKERNELS_MXFP4_BF16 backend to
+# VkernelFusedExperts which calls vk_fused_moe_mxfp4 via ctypes. The
+# vkernels kernel does the full MoE computation (gate-up GEMM ->
+# activation -> down GEMM -> routing weight -> top-k sum) on gfx942 HIP,
+# validated in job 596227.
+#
+# VKERNELS_MXFP4_BF16 is NOT in TRITON_BACKENDS, so weights are passed
+# through WITHOUT swizzling (raw MXFP4 uint8 + ue8m0 scales), matching
+# vLLM's Mxfp4MoEMethod.create_weights() output exactly:
+#   w13_weight:      [E, 2*ispp, hidden/2]  uint8 (packed MXFP4)
+#   w13_weight_scale: [E, 2*ispp, hidden/32] uint8 (ue8m0)
+#   w2_weight:       [E, hidden, ispp/2]    uint8 (packed MXFP4)
+#   w2_weight_scale: [E, hidden, ispp/32]   uint8 (ue8m0)
+#   w13_bias/w2_bias: [E, ...]              float32 (if has_bias)
+#
+# If libvkernels_hip.so is not found, falls back to the original
+# UnfusedOAITritonExperts (Triton kernels) silently.
+try:
+    import sys as _sys_mod
+    _k3_pylib = os.path.join(os.environ.get("K3", ""), "home/pylib")
+    if _k3_pylib not in _sys_mod.path:
+        _sys_mod.path.insert(0, _k3_pylib)
+    from vkernels_experts import VkernelFusedExperts, _find_libvkernels_hip
+
+    if _find_libvkernels_hip() is not None:
+        _orig_btoc = _oracle_mod.backend_to_kernel_cls
+
+        def _patched_btoc(backend):
+            if backend == _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16:
+                return [VkernelFusedExperts]
+            return _orig_btoc(backend)
+
+        _oracle_mod.backend_to_kernel_cls = _patched_btoc
+        print("[sitecustomize] VkernelFusedExperts registered "
+              "(VKERNELS_MXFP4_BF16)", flush=True)
+    else:
+        print("[sitecustomize] libvkernels_hip.so not found, "
+              "using Triton fallback", flush=True)
+except Exception as _vk_err:
+    print(f"[sitecustomize] VkernelFusedExperts registration skipped: "
+          f"{_vk_err}", flush=True)
 
 # --- K3 JIT stagger: prevent OOM from simultaneous worker startup --
 # On gfx942 with 4 workers/node and ~501 GB system RAM, all 4 workers
