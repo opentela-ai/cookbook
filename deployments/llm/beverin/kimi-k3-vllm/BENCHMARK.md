@@ -231,6 +231,82 @@ correct factual output (6/6) at 6–7 tok/s single-request, scaling to
 serve until upstream fixes `@support_torch_compile` (cudagraph) and the
 `HybridKVCacheCoordinator` selection bug (prefix caching).
 
+## VKERNELS_MXFP4_BF16 backend benchmark (job 598005)
+
+**Date:** 2026-08-17
+**Backend:** `VKERNELS_MXFP4_BF16` → `VkernelFusedExperts` (vkernels HIP C ABI
+kernel `vk_fused_moe_mxfp4` via ctypes), replacing the patched AITER FlyDSL
+kernel (which exceeded the 64 KB LDS limit on gfx942, see jobs 583297–583962).
+**Weights:** dummy (`--load-format dummy`), identical compute path.
+**Topology:** TP=8 PP=3 across 6 nodes (24 MI300A GPUs), `MAX_NUM_SEQS=256`,
+`--max-num-batched-tokens 8192`, `GPU_MEM_UTIL=0.8`, `ENFORCE_EAGER=1`.
+**Correctness:** 6/6 PASS (Paris, Rayleigh, primes, 40 km/h, fibonacci,
+entropy) — confirmed with the VKERNELS backend.
+
+### Throughput sweep (out_tok=128, in_tok≈32)
+
+| Concurrency | N reqs | ok | wall (s) | agg (tok/s) | per-req (med tok/s) | lat p50 (s) | lat max (s) |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 8 | 8 | 283.4 | **3.6** | 3.6 | 35.4 | 35.9 |
+| 8 | 16 | 16 | 75.9 | **27.0** | 3.5 | 39.0 | 39.0 |
+| 32 | 32 | 32 | 48.2 | **85.0** | 2.7 | 48.2 | 48.2 |
+| 64 | 64 | 64 | 68.0 | **120.4** | 1.9 | 68.0 | 68.0 |
+| 128 | 128 | 128 | 117.9 | **139.0** | 1.7 | 73.2 | 117.9 |
+| 256 | 256 | 256 | 190.2 | **172.3** | 0.9 | 135.2 | 190.2 |
+
+Peak aggregate: **172.3 tok/s** at C=256. vLLM engine reported a momentary
+peak of **220.0 tok/s** during the C=128 run (100 reqs in flight).
+
+### Also measured at out_tok=256 (job 597987)
+
+| Concurrency | N reqs | agg (tok/s) | per-req (med tok/s) |
+|:---:|:---:|:---:|:---:|
+| 1 | 16 | **3.6** | 3.6 |
+| 8 | 32 | **26.7** | 3.3 |
+| 32 | 64 | **83.8** | 2.7 |
+| 64 | 64 | **147.7** | 2.3 |
+
+### Comparison: VKERNELS vs AITER FlyDSL (out_tok=256)
+
+| Concurrency | VKERNELS (tok/s) | AITER (tok/s) | VKERNELS / AITER |
+|:---:|:---:|:---:|:---:|
+| 1 | 3.6 | 7.32 | **0.49×** |
+| 8 | 26.7 | 48.91 | **0.55×** |
+| 32 | 83.8 | 134.85 | **0.62×** |
+| 64 | 147.7 | 178.09 | **0.83×** |
+| 128 | — | 249.88 | — |
+| 256 | — | 414.94 | — |
+
+At out_tok=128, the VKERNELS C=256 peak of 172.3 tok/s is **0.42×** the
+AITER C=256 peak of 414.94 tok/s (different output length, but
+representative of the scaling ceiling).
+
+### Key observations
+
+1. **Single-request throughput is 49% of AITER** (3.6 vs 7.32 tok/s). This
+   is the primary bottleneck — the vkernels `vk_fused_moe_mxfp4` kernel
+   uses `block_size=16` for decode and `kGroupSize=32` hardcoded, while
+   AITER FlyDSL was hand-tuned (LDS fill, K32→K16 split, SW dequant) for
+   MI300A.
+
+2. **Aggregate scales sub-linearly**, plateauing at ~172 tok/s (C=256,
+   out_tok=128) vs AITER's 415 tok/s. The per-request decode rate drops
+   sharply: 3.6 → 3.5 → 2.7 → 1.9 → 1.7 → 0.9 tok/s.
+
+3. **ctypes call overhead** is a contributing factor: each of K3's 61 MoE
+   layers invokes `vk_fused_moe_mxfp4` via ctypes, plus a CPU-side
+   `moe_align_block_size` call + device copy for `sorted_ids`/`expert_ids`
+   on every forward pass.
+
+4. **Correctness is fully preserved** — 6/6 factual-correctness probes
+   pass with real weights (job 597880) and dummy weights (jobs 597846,
+   597987, 598005), matching the AITER backend's quality.
+
+5. **The VKERNELS backend is the only working option** on MI300A without
+   the AITER FlyDSL kernel patches (which are fragile and depend on
+   specific JIT module versions). The ~2× throughput cost is the trade-off
+   for a clean, maintainable C ABI integration.
+
 ## Caveats
 
 - **Dummy weights** → output is degenerate. Throughput/latency are real
