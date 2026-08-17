@@ -117,8 +117,6 @@ try:
         _oracle_mod.Mxfp4MoeBackend._value2member_map_[
             "VKERNELS_MXFP4_BF16"
         ] = _vk
-        print(f"[sitecustomize] VKERNELS_MXFP4_BF16 enum member created: {_vk}",
-              flush=True)
 
     # Patch convert_gpt_oss_weight_to_mxfp4_moe_kernel_format: for
     # VKERNELS_MXFP4_BF16, pass weights and scales through unchanged
@@ -164,6 +162,67 @@ try:
 
     _oracle_mod.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format = (
         _patched_convert
+    )
+
+    # Also patch convert_weight_to_mxfp4_moe_kernel_format (the non-GPT-OSS
+    # path used by K3 / DeepSeekV3-routing models).  Same pass-through for
+    # VKERNELS_MXFP4_BF16: return weights and scales unchanged, convert
+    # biases to float32.
+    _orig_convert2 = (
+        _oracle_mod.convert_weight_to_mxfp4_moe_kernel_format
+    )
+
+    def _patched_convert2(
+        mxfp4_backend,
+        layer,
+        w13_weight,
+        w2_weight,
+        w13_weight_scale,
+        w2_weight_scale,
+        w13_bias=None,
+        w2_bias=None,
+        _cache_permute_indices=None,
+    ):
+        if mxfp4_backend == _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16:
+            if w13_bias is not None:
+                w13_bias = w13_bias.data.to(torch.float32)
+            if w2_bias is not None:
+                w2_bias = w2_bias.data.to(torch.float32)
+            return (
+                w13_weight.data,
+                w2_weight.data,
+                w13_weight_scale.data,
+                w2_weight_scale.data,
+                w13_bias,
+                w2_bias,
+            )
+        return _orig_convert2(
+            mxfp4_backend,
+            layer,
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+            _cache_permute_indices=_cache_permute_indices,
+        )
+
+    _oracle_mod.convert_weight_to_mxfp4_moe_kernel_format = (
+        _patched_convert2
+    )
+
+    # CRITICAL: quantization/mxfp4.py imports these functions at module
+    # load time (from ... import convert_weight_to_mxfp4_moe_kernel_format).
+    # Patching the oracle module alone is NOT enough — the quantization
+    # module has its own reference to the ORIGINAL function.  We must
+    # patch both modules.
+    from vllm.model_executor.layers.quantization import mxfp4 as _qm_mod
+    _qm_mod.convert_gpt_oss_weight_to_mxfp4_moe_kernel_format = (
+        _patched_convert
+    )
+    _qm_mod.convert_weight_to_mxfp4_moe_kernel_format = (
+        _patched_convert2
     )
 
     if _cp.is_rocm():

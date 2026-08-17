@@ -291,10 +291,17 @@ class VkernelFusedExperts(UnfusedOAITritonExperts):
         b13 = self.w1_bias
         b2 = self.w2_bias
 
-        # act_scratch [EM, ispp] bf16 — from workspace13
-        if workspace13.numel() >= EM * ispp:
-            act_scratch = workspace13[: EM * ispp].view(EM, ispp)
+        # act_scratch [EM, ispp] bf16 — from workspace13.
+        # workspace13 may be 2D (EM_max_setup, ispp_setup) or 1D;
+        # flatten first, then slice and reshape.
+        _ws13_flat = workspace13.view(-1)
+        if _ws13_flat.numel() >= EM * ispp:
+            act_scratch = _ws13_flat[: EM * ispp].view(EM, ispp)
         else:
+            print(f"[VkernelFusedExperts] WARN: workspace13 too small "
+                  f"({_ws13_flat.numel()} < {EM * ispp}); allocating"
+                  f" (EM={EM}, ispp={ispp}, ws13.shape={workspace13.shape})",
+                  flush=True)
             act_scratch = torch.empty(
                 EM * ispp, dtype=torch.bfloat16, device=dev
             )

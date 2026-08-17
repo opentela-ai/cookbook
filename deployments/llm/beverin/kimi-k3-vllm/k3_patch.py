@@ -69,6 +69,35 @@ if not os.path.isfile(_sc_src):
 shutil.copyfile(_sc_src, _sc_dst)
 print(f"installed sitecustomize.py -> {_sc_dst}", flush=True)
 
+# --- install vkernels_experts.py + libvkernels_hip.so into the overlay ---
+# VkernelFusedExperts (imported by sitecustomize.py) calls the vkernels HIP
+# C ABI via ctypes. The .so must be on the container's filesystem; we place
+# it in $K3/home/pylib/ alongside sitecustomize.py. VKERNELS_DIR points at
+# the vkernels build tree (set by serve_kimi_k3_otela_beverin.sbatch).
+_ve_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "vkernels_experts.py")
+if os.path.isfile(_ve_src):
+    _ve_dst = os.path.join(K3, "home/pylib", "vkernels_experts.py")
+    shutil.copyfile(_ve_src, _ve_dst)
+    print(f"installed vkernels_experts.py -> {_ve_dst}", flush=True)
+else:
+    print("WARN: vkernels_experts.py not found next to k3_patch.py "
+          f"({_ve_src}), vkernels backend disabled", flush=True)
+
+import glob as _glob_mod
+_vdir = os.environ.get("VKERNELS_DIR", "/capstor/scratch/cscs/xyao/vkernels")
+_so_cands = sorted(_glob_mod.glob(
+    os.path.join(_vdir, "build", "hip", "**", "libvkernels_hip.so"),
+    recursive=True))
+if _so_cands:
+    _so_dst = os.path.join(K3, "home/pylib", "libvkernels_hip.so")
+    shutil.copyfile(_so_cands[0], _so_dst)
+    print(f"installed libvkernels_hip.so -> {_so_dst} "
+          f"(from {_so_cands[0]})", flush=True)
+else:
+    print(f"WARN: libvkernels_hip.so not found under {_vdir}, "
+          "vkernels backend will fall back to Triton", flush=True)
+
 t = os.path.join(DST, TARGET_REL)
 # always start from the pristine image copy -> deterministic, no drift
 import shutil as _sh
