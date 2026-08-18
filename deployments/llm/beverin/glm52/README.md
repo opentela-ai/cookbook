@@ -7,8 +7,8 @@ on the OpenTela mesh.
 
 > **STATUS (2026-08-15): BLOCKED — DSA decode on MI300A.** Every DSA backend
 > tested (tilelang, aiter) either crashes, hangs at 100% GPU, or deadlocks
-> before the first forward. A `flashmla_sparse` backend test (job 594548) is
-> PENDING. See the [DSA backend test matrix](#dsa-backend-test-matrix) and
+> before the first forward. All 8 DSA backends are now exhausted (6
+> NVIDIA-only, 2 AMD-viable but decode-broken). See the [DSA backend test matrix](#dsa-backend-test-matrix) and
 > [Job outcome history](#job-outcome-history) below. GLM-4.7-Flash (non-DSA,
 > same image) remains the working GLM on Beverin.
 
@@ -271,17 +271,29 @@ The DSA backend is selected by `--dsa-prefill-backend` /
 | `aiter` | 0 | 1 | ✅ 14 s, /health 200 OK | ❌ hang 100% GPU | 594462, 594527 |
 | `aiter` | 1 | 64 | ❌ first forward never starts | — | 594528 (0% GPU, detokenizer idle) |
 | `flashinfer_sparse_mla` | — | — | ❌ invalid CLI choice | — | 594547 (exited in 1:14) |
-| `flashmla_sparse` | 1 | 64 | ⏳ PENDING (6-node) | ⏳ PENDING | 594548 (dispatches to aiter standard MLA on AMD). 594552 (2-node PP1): OOM during model load, NOT a kernel issue — flashmla_sparse init succeeded, no deadlock. |
+| `flashmla_sparse` | 1 | 64 | ❌ ImportError `flashmla_ops` | — | 594548 — NOT in ROCm `sgl_kernel` (needs CUDA ≥ 12.4) |
+| `flashmla_sparse_q8` | — | — | ❌ (same family) | — | not tested — NVIDIA-only |
+| `flashmla_kv` | — | — | ❌ (same family) | — | not tested — NVIDIA-only |
+| `flashmla_auto` | — | — | ❌ (auto-selects above) | — | not tested — NVIDIA-only |
 | `fa3` | — | — | NVIDIA-only | — | not tested |
 | `trtllm` | — | — | NVIDIA-only | — | not tested |
 
-**Key insight**: on AMD (hip), the DSA backend module
-(`dsa_backend.py` L110) imports aiter's `mla_prefill_fwd` / `mla_decode_fwd`
-as the standard MLA kernels. The `flashmla_sparse` choice uses these
-**standard** kernels — a **different** path from the DSA preshuffle
-paged-MQA kernel (which hangs at 100% GPU with page_size=1, or deadlocks
-with page_size=64). If the standard MLA decode kernel works on gfx942,
-`flashmla_sparse` might succeed where `aiter` DSA failed.
+**Verdict**: Of the 8 valid DSA backends, **6 are NVIDIA-only** (require
+`sgl_kernel.flashmla_ops` / FlashAttention-3 / TensorRT-LLM, none compiled
+into the ROCm `sgl_kernel`). The **2 AMD-viable backends** (`tilelang`,
+`aiter`) **both fail on the decode path**:
+- `tilelang` crashes/hangs in `forward_c4_indexer`.
+- `aiter` prefill **works** (the first DSA computation to succeed on MI300A)
+  but decode hangs at 100% GPU (page_size=1) or deadlocks at 0% (page_size=64).
+
+GLM-5.2 DSA is **NOT servable** on MI300A (gfx942) with SGLang v0.5.16.
+
+**Note**: the flashmla backends do NOT dispatch to aiter's standard MLA on
+AMD (as initially inferred from `dsa_backend.py` L110). They require
+`sgl_kernel.flashmla_ops` (a native CUDA extension, `flash_mla.py:7`), which
+is absent from the ROCm build (`ImportError: cannot import name 'flashmla_ops'
+from 'sgl_kernel'`). The aiter imports at `dsa_backend.py` L110 are for the
+`aiter`/`tilelang` backends, not flashmla.
 
 ---
 
@@ -446,7 +458,7 @@ Chronological. All jobs: 6 nodes, TP8 × PP3, `mi300` partition,
 | 594527 | aiter | aiter | 0 | 1 | ⏳ Same as 594462 despite `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` (env confirmed in container). The function checks `SGLANG_USE_AITER` **first** (L49), returns False before the AOT flag. Cancelled. |
 | 594528 | aiter | aiter | 1 | 64 | ⏳ **No get_rope crash!** "Setting page size to 64" (preshuffle ENABLED, ×3 PP stages). Server fired up in ~7 min. But **first forward never starts** — 0% GPU, detokenizer idle, health check failing. Cancelled. |
 | 594547 | flashinfer_sparse_mla | flashinfer_sparse_mla | 0 | — | ❌ Invalid CLI choice (exited in 1:14). Valid: `flashmla_sparse`, `flashmla_sparse_q8`, `flashmla_kv`, `flashmla_auto`, `fa3`, `tilelang`, `aiter`, `trtllm`. |
-| 594548 | flashmla_sparse | flashmla_sparse | 1 | 64 | ⏳ **PENDING** (6-node TP8×PP3, starts tomorrow) — dispatches to aiter standard `mla_prefill_fwd`/`mla_decode_fwd` on AMD (different from DSA preshuffle paged-MQA). Last untested option. |
+| 594548 | flashmla_sparse | flashmla_sparse | 1 | 64 | ❌ **ImportError**: `cannot import name 'flashmla_ops' from 'sgl_kernel'` (`flash_mla.py:7`). The flashmla backends require a native CUDA extension (≥ 12.4) that is NOT in the ROCm build. All 4 flashmla_* + fa3 + trtllm are NVIDIA-only. |
 | 594552 | flashmla_sparse | flashmla_sparse | 1 | 64 | ❌ OOM at 3:54 during model load (2-node TP8×PP1 — all 78 layers on 8 GPUs, ~177 GiB exceeds 137 GiB HBM). **Not a flashmla_sparse kernel issue** — PP1 is not viable for GLM-5.2 (minimum is PP3 = 26 layers/stage ~59 GiB/GPU). Importantly, flashmla_sparse + page_size=64 did NOT deadlock during init (unlike aiter DSA in 594528); it got to model load before the OOM. |
 
 ---
@@ -466,26 +478,20 @@ The **best result** so far is `aiter` DSA with `SGLANG_USE_AITER=0`
 at 100% GPU with zero Decode batches (a GPU-kernel-stuck pattern, no error,
 no watchdog fires).
 
-### The remaining option
+### Conclusion
 
-`flashmla_sparse` (job 594548, PENDING) dispatches to aiter's **standard**
-`mla_prefill_fwd`/`mla_decode_fwd` on AMD — a **different** path from the
-DSA preshuffle paged-MQA kernel that hangs. If the standard MLA decode
-kernel works on gfx942, `flashmla_sparse` might succeed where the DSA
-backends failed.
-
-### If `flashmla_sparse` also fails
-
-The conclusion is that GLM-5.2 DSA on MI300A requires kernel-level fixes
-(not configuration tweaks). Options:
-1. **Wait for a newer SGLang image** with DSA kernels fixed for gfx942
-   (the preshuffle page_size=64 path is the intended config — it currently
-   deadlocks before the first forward, but this is likely a bug that will be
-   fixed).
-2. **File an issue on SGLang** — the DSA preshuffle paged-MQA decode kernel
-   hangs at 100% GPU on MI300A (gfx942) with page_size=1 (jobs 594462,
-   594527) and deadlocks before the first forward with page_size=64 (job
-   594528). The tilelang `forward_c4_indexer` also crashes on MI300A (jobs
+GLM-5.2 DSA on MI300A requires kernel-level fixes (not configuration
+tweaks). The 2 AMD-viable backends (tilelang, aiter) both fail on the
+decode path, and the other 6 (all flashmla_* + fa3 + trtllm) are
+NVIDIA-only. Options:
+1. **Wait for a newer SGLang image** with DSA decode kernels fixed for
+   gfx942 (the preshuffle page_size=64 path is the intended config — it
+   currently deadlocks before the first forward, but this is likely a bug
+   that will be fixed).
+2. **File an issue on SGLang** — the DSA decode kernel hangs at 100% GPU
+   on MI300A (gfx942) with page_size=1 (jobs 594462, 594527) and deadlocks
+   before the first forward with page_size=64 (job 594528). The tilelang
+   `forward_c4_indexer` also crashes on MI300A (jobs
    594304, 594340). MI300X (same gfx942 ISA) works with tilelang.
 3. **Continue serving GLM-4.7-Flash** (non-DSA, same image, already working
    on MI300A) until DSA is fixed.
