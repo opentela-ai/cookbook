@@ -86,9 +86,15 @@ else:
 
 import glob as _glob_mod
 _vdir = os.environ.get("VKERNELS_DIR", "/capstor/scratch/cscs/xyao/vkernels")
-_so_cands = sorted(_glob_mod.glob(
-    os.path.join(_vdir, "build", "hip", "**", "libvkernels_hip.so"),
-    recursive=True))
+# PR #44 renamed the symbols to vk_hip_* and builds libvkernels_hip.so
+# under build/cabi/.  Prefer the new build; fall back to build/hip/ for
+# older local builds that used the since-removed hip_api.cpp.
+_so_cands = sorted(
+    _glob_mod.glob(os.path.join(_vdir, "build", "cabi", "**", "libvkernels_hip.so"),
+                   recursive=True)
+    + _glob_mod.glob(os.path.join(_vdir, "build", "hip", "**", "libvkernels_hip.so"),
+                     recursive=True)
+)
 if _so_cands:
     _so_dst = os.path.join(K3, "home/pylib", "libvkernels_hip.so")
     shutil.copyfile(_so_cands[0], _so_dst)

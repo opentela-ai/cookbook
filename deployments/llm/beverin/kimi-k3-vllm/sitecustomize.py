@@ -270,7 +270,7 @@ except Exception:
 # (5) Register VkernelFusedExperts — vkernels HIP C ABI MoE backend.
 # Instead of using Triton kernels for the MoE GEMMs (which work but are
 # slow on gfx942), we route the new VKERNELS_MXFP4_BF16 backend to
-# VkernelFusedExperts which calls vk_fused_moe_mxfp4 via ctypes. The
+# VkernelFusedExperts which calls vk_hip_fused_moe_mxfp4 via ctypes. The
 # vkernels kernel does the full MoE computation (gate-up GEMM ->
 # activation -> down GEMM -> routing weight -> top-k sum) on gfx942 HIP,
 # validated in job 596227.

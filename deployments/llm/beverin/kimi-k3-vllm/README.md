@@ -50,7 +50,7 @@ parameters (exhaustively verified across jobs 583297–583962). Instead of
 patching FlyDSL, this recipe routes the MoE backend to
 **`VKERNELS_MXFP4_BF16`** — a new backend added to the `Mxfp4MoeBackend`
 enum by `sitecustomize.py` that calls the **vkernels HIP C ABI kernel**
-(`vk_fused_moe_mxfp4`) via `ctypes`. The vkernels kernel was validated on
+(`vk_hip_fused_moe_mxfp4`) via `ctypes`. The vkernels kernel was validated on
 gfx942 (job 596227: 8/8 GPU correctness tests PASS, bf16=1307 TFLOP/s) and
 handles the full MoE computation (gate-up GEMM → SiTU/SwiGLU activation →
 down GEMM → routing weight → top-k sum) entirely on HIP, bypassing both
@@ -180,7 +180,7 @@ Without `B:`, only KillWait (30 s) applies and the head keeps a
 
 | aspect | status |
 |--------|--------|
-| MoE backend selection on gfx942 | ✅ `VKERNELS_MXFP4_BF16` — all 24 workers select `VkernelFusedExperts` (calls `vk_fused_moe_mxfp4` via ctypes C ABI). The AITER FlyDSL kernel was found to exceed the 64 KB LDS limit on gfx942 (exhaustively verified jobs 583297–583962); instead of patching FlyDSL, the recipe routes to vkernels' HIP kernel, validated on gfx942 in job 596227 (8/8 GPU correctness tests PASS). |
+| MoE backend selection on gfx942 | ✅ `VKERNELS_MXFP4_BF16` — all 24 workers select `VkernelFusedExperts` (calls `vk_hip_fused_moe_mxfp4` via ctypes C ABI). The AITER FlyDSL kernel was found to exceed the 64 KB LDS limit on gfx942 (exhaustively verified jobs 583297–583962); instead of patching FlyDSL, the recipe routes to vkernels' HIP kernel, validated on gfx942 in job 596227 (8/8 GPU correctness tests PASS). |
 | vLLM K3 engine *full init* on gfx942 | ✅ **CONFIRMED (job 597880):** all 96 weight shards loaded (84 GiB/GPU, ~2h10min), KV cache allocated (~26 GiB/GPU), engine healthy. Multi-node follower KV-init fix from job 580876 is in `sitecustomize.py`. |
 | Token generation on gfx942 | ✅ **CONFIRMED (job 597880):** smoke probe 6/6 PASS ("Paris", "Rayleigh scattering", "2, 3, 5, 7", "40 km/h", fibonacci, entropy) with real weights. Earlier dummy-weight smoke also passed (job 597846). |
 | Cold-start time | ~2h10min (84 GiB/GPU, 96 shards at ~140 s/shard). Checkpoint was restriped (8 OSTs, 16 MB) but the distributed loader is MDS-open/CPU-deserialize bound. |
@@ -194,7 +194,7 @@ Without `B:`, only KillWait (30 s) applies and the head keeps a
 | `serve_kimi_k3_otela_beverin.sbatch` | One self-contained sbatch: per-rank engine wrapper (`k3_patch.py` serialization + vLLM launch) + health/correctness-probe-gated otela worker on the head |
 | `k3_patch.py` | The four gfx942 a16w4 flydsl kernel patches + installs `sitecustomize.py`, `vkernels_experts.py`, and `libvkernels_hip.so` into the overlay |
 | `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup): (1) adds `VKERNELS_MXFP4_BF16` to the `Mxfp4MoeBackend` enum; (2) patches both `convert_*_to_mxfp4_moe_kernel_format` functions for pass-through weight handling; (3) patches `_get_priority_backends` + `backend_to_kernel_cls` to route `VKERNELS_MXFP4_BF16 → VkernelFusedExperts`; (4) multi-node follower KV-init fix (job 580876); (5) AITER `module_moe_asm` PyTorch fallback (topk, moe_sum, moe_align_block_size) |
-| `vkernels_experts.py` | `VkernelFusedExperts` class — `UnfusedOAITritonExperts` subclass that calls `vk_fused_moe_mxfp4` via ctypes with `tensor.data_ptr()`. Handles `moe_align_block_size` on CPU + device copy, SiTU/SwiGLU activation params, and `apply_router_weight_on_input`. |
+| `vkernels_experts.py` | `VkernelFusedExperts` class — `UnfusedOAITritonExperts` subclass that calls `vk_hip_fused_moe_mxfp4` via ctypes with `tensor.data_ptr()`. Handles `moe_align_block_size` on CPU + device copy, SiTU/SwiGLU activation params, and `apply_router_weight_on_input`. |
 | `gen_correctness.py` | Six-prompt factual correctness probe (mirrors the Clariden servekit bench); gates otela registration on real answers, not just a non-empty body |
 
 ## Submit

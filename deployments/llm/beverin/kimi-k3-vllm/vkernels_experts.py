@@ -75,6 +75,25 @@ def _get_lib():
     return _lib_cache["lib"]
 
 
+def _resolve_moe_fn(lib):
+    """Return the fused-MoE C ABI function.
+
+    Upstream PR #44 names it ``vk_hip_fused_moe_mxfp4`` (namespaced away
+    from the CPU reference ``vk_fused_moe_mxfp4`` in capi.hpp).  Older
+    local builds used the bare ``vk_fused_moe_mxfp4`` name from the
+    since-removed ``hip_api.cpp``.  Try the new name first, fall back.
+    """
+    fn = getattr(lib, "vk_hip_fused_moe_mxfp4", None)
+    if fn is None:
+        fn = getattr(lib, "vk_fused_moe_mxfp4", None)
+    if fn is None:
+        raise RuntimeError(
+            "neither vk_hip_fused_moe_mxfp4 nor vk_fused_moe_mxfp4 "
+            "found in libvkernels_hip.so — rebuild with PR #44"
+        )
+    return fn
+
+
 # ---------------------------------------------------------------------------
 # moe_align_block_size (CPU reference, matching vkernels' expected format)
 # ---------------------------------------------------------------------------
@@ -147,7 +166,7 @@ def _moe_align_block_size_cpu(
 class VkernelFusedExperts(UnfusedOAITritonExperts):
     """vkernels HIP C ABI backend for MXFP4 MoE on gfx942 (MI300A).
 
-    Calls vk_fused_moe_mxfp4 via ctypes. The kernel does the full MoE
+    Calls vk_hip_fused_moe_mxfp4 (PR #44) via ctypes.  The kernel does the
     computation: gate-up GEMM -> activation -> down GEMM -> routing weight
     application -> top-k summation. Output is fp32, converted to bf16.
 
@@ -231,6 +250,7 @@ class VkernelFusedExperts(UnfusedOAITritonExperts):
         apply_router_weight_on_input: bool,
     ) -> None:
         lib = _get_lib()
+        moe_fn = _resolve_moe_fn(lib)
         dev = hidden_states.device
 
         M, K = hidden_states.shape
@@ -309,7 +329,7 @@ class VkernelFusedExperts(UnfusedOAITritonExperts):
         # Temp fp32 output [M*K] — allocated separately (fp32, not bf16)
         out_fp32 = torch.empty(M * K, dtype=torch.float32, device=dev)
 
-        lib.vk_fused_moe_mxfp4(
+        moe_fn(
             ctypes.c_void_p(hidden_states.data_ptr()),
             ctypes.c_void_p(w1.data_ptr()),
             ctypes.c_void_p(w13_scale.data_ptr()),

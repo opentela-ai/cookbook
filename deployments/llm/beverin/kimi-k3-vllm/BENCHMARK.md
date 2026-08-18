@@ -235,7 +235,7 @@ serve until upstream fixes `@support_torch_compile` (cudagraph) and the
 
 **Date:** 2026-08-17
 **Backend:** `VKERNELS_MXFP4_BF16` → `VkernelFusedExperts` (vkernels HIP C ABI
-kernel `vk_fused_moe_mxfp4` via ctypes), replacing the patched AITER FlyDSL
+kernel `vk_hip_fused_moe_mxfp4` via ctypes), replacing the patched AITER FlyDSL
 kernel (which exceeded the 64 KB LDS limit on gfx942, see jobs 583297–583962).
 **Weights:** dummy (`--load-format dummy`), identical compute path.
 **Topology:** TP=8 PP=3 across 6 nodes (24 MI300A GPUs), `MAX_NUM_SEQS=256`,
@@ -284,7 +284,7 @@ representative of the scaling ceiling).
 ### Key observations
 
 1. **Single-request throughput is 49% of AITER** (3.6 vs 7.32 tok/s). This
-   is the primary bottleneck — the vkernels `vk_fused_moe_mxfp4` kernel
+   is the primary bottleneck — the vkernels `vk_hip_fused_moe_mxfp4` kernel
    uses `block_size=16` for decode and `kGroupSize=32` hardcoded, while
    AITER FlyDSL was hand-tuned (LDS fill, K32→K16 split, SW dequant) for
    MI300A.
@@ -294,7 +294,7 @@ representative of the scaling ceiling).
    sharply: 3.6 → 3.5 → 2.7 → 1.9 → 1.7 → 0.9 tok/s.
 
 3. **ctypes call overhead** is a contributing factor: each of K3's 61 MoE
-   layers invokes `vk_fused_moe_mxfp4` via ctypes, plus a CPU-side
+   layers invokes `vk_hip_fused_moe_mxfp4` via ctypes, plus a CPU-side
    `moe_align_block_size` call + device copy for `sorted_ids`/`expert_ids`
    on every forward pass.
 
