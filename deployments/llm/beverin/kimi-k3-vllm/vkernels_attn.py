@@ -507,7 +507,7 @@ class VkernelMLABackend(MLACommonBackend):  # type: ignore[misc]
 # VkernelKDA -- route the delta-rule forward to vk_hip_kda_delta_rule_fwd
 # ---------------------------------------------------------------------------
 
-# The KDA layer (vllm.models.kimi_k3.amd.kda.KimiK3DeltaAttention) computes
+# The AMD KDA layer (vllm.model_executor.layers.mamba.gdn.
 # the delta-rule update through three vLLM-internal ops depending on the
 # batch composition:
 #
@@ -525,7 +525,7 @@ class VkernelMLABackend(MLACommonBackend):  # type: ignore[misc]
 
 
 def _apply_kda_layer_patch():
-    """Monkey-patch ``KimiK3DeltaAttention._forward`` to call
+    """Monkey-patch the ROCm KDA layer's ``_forward`` (KimiGatedDeltaNetAttention)
     ``vk_hip_kda_delta_rule_fwd`` on gfx942 (when ``VKERNELS_KDA=1``).
 
     The original ``_forward`` dispatches to ``chunk_kda_with_fused_gate``
@@ -538,20 +538,44 @@ def _apply_kda_layer_patch():
     .. note::
        The exact extraction of q/k/v/g/beta (incl. A_log -> forget gate,
        dt_bias, gate_lower_bound, q/k L2-norm, initial_state gather) is
-       layer-version-specific; the structure below mirrors the public
-       vllm.models.kimi_k3.amd.kda forward and must be confirmed against the
-       fork before ``VKERNELS_KDA=1`` is set in production.
+       layer-version-specific; the body below is a from-scratch
+       ``vk_hip_kda_delta_rule_fwd`` call (skips conv1d / gate transform /
+       initial_state / spec decoding / state writeback), so its shape guard
+       RAISES on real metadata and refuses to fall back to ``orig_forward``
+       (which faults).  ``VKERNELS_KDA=1`` must stay OFF until issue #45.
     """
+    # On-cluster (beverin, vLLM 0.1.dev19253+g5f76ae224.d20260727, gfx942) the
+    # K3 AMD model instantiates KimiGatedDeltaNetAttention
+    # (vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn) for every
+    # is_kda_layer index (models.kimi_k3.amd.linear, line ~471).  That class's
+    # ``_forward`` performs conv1d (causal_conv1d_fn/_update), the A_log ->
+    # g / dt_bias / lower_bound gate transform, initial_state gather, the
+    # spec-vs-non-spec split, and recurrent-state writeback, then dispatches
+    # the delta-rule itself to the leaf kernels chunk_kda_with_fused_gate /
+    # fused_recurrent_kda[_packed_decode] in vllm.models.kimi_k3.amd.ops.
+    # third_party.kda -- which FAULT on gfx942 (job 586165).  The NVIDIA-only
+    # KimiK3DeltaAttention (vllm.models.kimi_k3.nvidia.kda) is NOT on the ROCm
+    # serving path.  Patch the ROCm class; keep the older import as a fallback
+    # so a different fork build still resolves.
+    _KDA_LAYER = None
     try:
-        from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
-    except Exception as exc:  # pragma: no cover -- fork import
-        print(f"[VkernelKDA] KimiK3DeltaAttention not importable ({exc!r}); "
-              "KDA routing disabled.", flush=True)
-        return False
+        from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+            KimiGatedDeltaNetAttention as _KDA_LAYER,
+        )
+    except Exception as _exc_rocm:  # pragma: no cover -- fork import
+        try:
+            from vllm.models.kimi_k3.amd.kda import (
+                KimiK3DeltaAttention as _KDA_LAYER,
+            )
+        except Exception as _exc_old:
+            print(f"[VkernelKDA] KDA layer not importable on this build "
+                  f"(roc={_exc_rocm!r}, legacy={_exc_old!r}); "
+                  "KDA routing disabled.", flush=True)
+            return False
 
     kda_hip = _bind_kda_hip(_hip_lib())
     chunk_size = int(os.environ.get("VKERNELS_KDA_CHUNK", str(_DEFAULT_KDA_CHUNK)))
-    orig_forward = KimiK3DeltaAttention._forward
+    orig_forward = _KDA_LAYER._forward
 
     def _patched_forward(self, mixed_qkv, g1, g2, beta, core_attn_out):
         # Only take the delta-rule hot path on gfx942 + opt-in; otherwise run
@@ -563,9 +587,9 @@ def _apply_kda_layer_patch():
         # The non-spec decode / prefill path feeds q/k/v packed in
         # `mixed_qkv` ([num_toks, 3*local_projection_size]) and the per-token
         # raw gate / beta in g1/beta ([1, num_toks, local_num_heads, 1]).
-        # See the public KimiK3DeltaAttention._forward for the exact
-        # conventions; the shapes below are confirmed against that file and
-        # MUST be re-checked against the fork's metadata before production.
+        # See the public KimiGatedDeltaNetAttention._forward for the exact
+        # conventions; the shapes below are confirmed against the beverin
+        # image and MUST be re-checked against the fork's metadata (issue #45).
         num_tokens = mixed_qkv.size(0)
         H = self.local_num_heads
         D = self.head_dim
@@ -586,9 +610,23 @@ def _apply_kda_layer_patch():
         beta_t = beta[0, :num_tokens].transpose(0, 1).unsqueeze(0).contiguous()
         beta_t = beta_t.to(torch.float32)
         if g_t.shape != (1, H, num_tokens, 1):
-            raise NotImplementedError(f"VkernelKDA: gate shape {g_t.shape} != (1,{H},{num_tokens},1)")
+            # On the real ROCm path g1 is D-dim ([1, num_actual_tokens, H, D]),
+            # so this guard trips immediately -- i.e. the from-scratch
+            # vk_hip_kda_delta_rule_fwd call below is NOT a valid replacement
+            # for the conv1d+gate+initial-state+spec bookkeeping the leaf
+            # kernels perform.  Raise LOUDLY (do not fall back to orig_forward,
+            # which faults on gfx942) until issue #45 lands the leaf-kernel
+            # re-architecture; set VKERNELS_KDA=0 meanwhile.
+            raise NotImplementedError(
+                f"VkernelKDA: gate shape {g_t.shape} != (1,{H},{num_tokens},1). "
+                "KDA marshalling is incomplete for this vLLM build (conv1d + "
+                "A_log/dt_bias/lower_bound gate + initial_state + spec/non-spec "
+                "split); set VKERNELS_KDA=0 and use the K3_DISABLE_KDA baseline "
+                "until issue #45 (leaf-kernel re-architecture).")
         if beta_t.shape != (1, H, num_tokens, 1):
-            raise NotImplementedError(f"VkernelKDA: beta shape {beta_t.shape}")
+            raise NotImplementedError(
+                f"VkernelKDA: beta shape {beta_t.shape}; KDA marshalling "
+                "incomplete for this build -- set VKKERNELS_KDA=0 (issue #45).")
 
         # k is L2-normalised by the caller in the delta-net formulation; the
         # public layer relies on the chunked kernel's use_qk_l2norm_in_kernel.
@@ -616,17 +654,23 @@ def _apply_kda_layer_patch():
                     1, H, num_tokens, D, chunk_size, out,
                 )
             except Exception as exc:  # pragma: no cover -- cluster-only
-                print(f"[VkernelKDA] validation failed ({exc!r}); "
-                      "falling back to Triton/MLA baseline", flush=True)
-                return orig_forward(self, mixed_qkv, g1, g2, beta, core_attn_out)
+                # Do NOT fall back to orig_forward: on gfx942 that path faults
+                # (the leaf Triton kernels).  Fail loudly so the operator keeps
+                # VKERNELS_KDA=0 until issue #45.
+                raise RuntimeError(
+                    f"VkernelKDA cross-check failed ({exc!r}); KDA marshalling "
+                    "not validated. Set VKERNELS_KDA=0 and use the K3_DISABLE_KDA "
+                    "baseline until issue #45.") from exc
 
         # The layer expects core_attn_out as [1, num_tokens, H, D].
         core_attn_out[:, :num_tokens] = out.to(mixed_qkv.dtype).view(num_tokens, H, D)
         return None
 
-    KimiK3DeltaAttention._forward = _patched_forward
-    print(f"[VkernelKDA] routed KimiK3DeltaAttention._forward to "
-          f"vk_hip_kda_delta_rule_fwd on gfx942 (chunk={chunk_size}).", flush=True)
+    _KDA_LAYER._forward = _patched_forward
+    print(f"[VkernelKDA] routed {_KDA_LAYER.__name__}._forward to "
+          f"vk_hip_kda_delta_rule_fwd on gfx942 (chunk={chunk_size}); NOTE the "
+          "from-scratch body is incomplete -- it raises on real metadata until "
+          "issue #45 (leaf-kernel re-architecture).", flush=True)
     return True
 
 
