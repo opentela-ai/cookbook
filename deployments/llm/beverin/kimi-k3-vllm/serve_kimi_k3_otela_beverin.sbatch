@@ -168,6 +168,13 @@ fi
 # 1048576 once a cold start + generation are confirmed fast.
 export CTX_LEN="${CTX_LEN:-131072}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# --max-num-batched-tokens caps tokens/step (prefill + decode). vLLM's
+# default 2048 is too small for high-concurrency sweeps: at C=256 with
+# in_tok~=50, prefill demand is ~12800 tokens and the chunked schedule
+# exceeds benchmark.py's HTTP timeout -> TimeoutError + JSONDecodeError
+# (job 600469). BENCHMARK.md's baseline (job 598005) used 8192, which lets
+# the C=256 sweep complete (~172 tok/s). Default 8192 matches that baseline.
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 # MI300A is an APU: HBM is shared between CPU and 4 GPU complexes.
 # 0.9 leaves only ~40 GiB for OS → OOM kill. 0.8 leaves ~91 GiB.
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
@@ -506,6 +513,7 @@ VLLM_ARGS=(
   --master-addr "$HEAD" --master-port "$MASTER_PORT"
   --max-model-len "$CTX_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
+  --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
 )
 # --enable-prefix-caching: gated by K3_PREFIX_CACHE (default 0 = OFF).
@@ -605,8 +613,6 @@ if [ "$RANK" = "0" ]; then
 else
   VLLM_ARGS+=(--headless)
 fi
-
-exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
 ENGINE
 
 # KDA routing on gfx942 (issue #42): the faulting AITER / Triton
@@ -632,6 +638,22 @@ cat >> "${RUNDIR}/engine.sh" <<EOFA
 export VKERNELS_KDA="${VKERNELS_KDA:-0}"
 export K3_DISABLE_KDA="${K3_DISABLE_KDA:-1}"
 EOFA
+
+# Issue #42 launch guard: the KDA exports above MUST precede `exec`.
+# Earlier these exports were appended AFTER `exec python3 ...` and were
+# therefore DEAD CODE (exec replaces the shell), so sitecustomize.py saw
+# neither var set -> the default Triton KDA path faulted on gfx942 -> NaN
+# ("!!!..." / repetitive garbage) on every prompt. Assert one of the two
+# VALID states is in effect BEFORE exec'ing vLLM, so a future silent drop
+# is caught at launch instead of producing junk.
+cat >> "${RUNDIR}/engine.sh" <<'ENGINE2'
+if [ "${VKERNELS_KDA:-0}" != "1" ] && [ "${K3_DISABLE_KDA:-1}" != "1" ]; then
+  echo "FATAL: KDA mis-configured (VKERNELS_KDA='${VKERNELS_KDA:-0}' K3_DISABLE_KDA='${K3_DISABLE_KDA:-1}');" \
+       "refusing to launch -- set VKERNELS_KDA=1 (validated HIP) or K3_DISABLE_KDA=1 (MLA-only). See issue #42." >&2
+  exit 1
+fi
+exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
+ENGINE2
 chmod +x "$RUNDIR/engine.sh"
 
 # ============================================================ otela worker ====
