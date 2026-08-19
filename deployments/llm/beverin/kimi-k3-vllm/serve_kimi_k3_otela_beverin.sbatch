@@ -634,9 +634,28 @@ ENGINE
 # so after validation the operator flips a SINGLE variable
 # (VKERNELS_KDA=1) to serve the validated HIP kernel; then set
 # K3_DISABLE_KDA=0 (or unset it) to complete AC4 (K3_DISABLE_KDA removed).
+# MLA routing on gfx942 (issue #42): VKERNELS_MLA=1 patches
+# vllm.v1.attention.selector.get_attn_backend to return VkernelMLABackend
+# (vk_hip_mla_fwd via ctypes) ahead of TRITON_MLA for every use_mla layer.
+# VKERNELS_MLA_FORCE=1 actually runs forward_mqa -> vk_hip_mla_fwd (vLLM
+# calls forward_mqa bare at mla_attention.py:895 with NO try/except, so
+# FORCE=1 is the only way the kernel runs end-to-end).  VKERNELS_MLA_VALIDATE=0
+# skips the CPU-oracle cross-check (libvkernels_c.so not built yet).
+# Default VKERNELS_MLA=0 / VKERNELS_MLA_FORCE=0 keep the integration OPT-IN
+# until validated on the cluster (mirrors VKERNELS_KDA).
+if [ "$STEP_PROFILE" = "1" ]; then
+  export VLLM_STEP_PROFILE_DIR="${VLLM_STEP_PROFILE_DIR:-$RUNDIR/step_profiles}"
+  echo "[$(date -Is)] STEP_PROFILE on: dir=$VLLM_STEP_PROFILE_DIR ranks=$VLLM_STEP_PROFILE_RANKS dur=${VLLM_STEP_PROFILE_DUR}s"
+fi
 cat >> "${RUNDIR}/engine.sh" <<EOFA
+export VKERNELS_MLA="${VKERNELS_MLA:-0}"
+export VKERNELS_MLA_FORCE="${VKERNELS_MLA_FORCE:-0}"
+export VKERNELS_MLA_VALIDATE="${VKERNELS_MLA_VALIDATE:-0}"
 export VKERNELS_KDA="${VKERNELS_KDA:-0}"
 export K3_DISABLE_KDA="${K3_DISABLE_KDA:-1}"
+export VLLM_STEP_PROFILE_DIR="${VLLM_STEP_PROFILE_DIR:-}"
+export VLLM_STEP_PROFILE_DUR="${VLLM_STEP_PROFILE_DUR:-15}"
+export VLLM_STEP_PROFILE_RANKS="${VLLM_STEP_PROFILE_RANKS:-0,8,16}"
 EOFA
 
 # Issue #42 launch guard: the KDA exports above MUST precede `exec`.
@@ -778,6 +797,31 @@ trap 'stop_otela' EXIT TERM INT
       echo "[$(date -Is)]       (Paris / primes / 40 km/h) — treat as a real MoE-corruption signal." >&2
       exit 1
     fi
+  fi
+
+  # Per-step torch.profiler pass (STEP_PROFILE=1). Drives a SHORT C=8 load
+  # via benchmark.py, which writes $VLLM_STEP_PROFILE_DIR/.go right before
+  # its first MEASURED level (warmup excluded). The in-worker profiler
+  # threads (sitecustomize.py, ranks $VLLM_STEP_PROFILE_RANKS) then capture
+  # a $VLLM_STEP_PROFILE_DUR-second window of steady-state decode and export
+  # per-rank chrome traces. Generous per-req timeout avoids the C>1 client
+  # pool artifact (this measures the ENGINE, not the harness limits).
+  if [ "$STEP_PROFILE" = "1" ]; then
+    mkdir -p "$VLLM_STEP_PROFILE_DIR"
+    echo "[$(date -Is)] step profile: driving spec=$STEP_PROFILE_SPEC (per_req=${STEP_PROFILE_PER_REQ_TIMEOUT}s, budget=${STEP_PROFILE_BUDGET}s) -> traces in $VLLM_STEP_PROFILE_DIR"
+    BENCH_PER_REQ_TIMEOUT="$STEP_PROFILE_PER_REQ_TIMEOUT" \
+    BENCH_TIMEOUT="$STEP_PROFILE_BUDGET" \
+      timeout "$((STEP_PROFILE_BUDGET + 300))" \
+      srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 \
+           --ntasks=1 -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+      python3 "$SCRIPT_DIR/benchmark.py" \
+          "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
+          "$VLLM_STEP_PROFILE_DIR/bench_profile.json" \
+          "$STEP_PROFILE_SPEC" "$BENCH_OUT_TOK" "$BENCH_IN_TOK"
+    echo "[$(date -Is)] step profile: waiting ${VLLM_STEP_PROFILE_DUR}s for trace export, then clearing .go"
+    sleep "$((VLLM_STEP_PROFILE_DUR + 10))"
+    rm -f "$VLLM_STEP_PROFILE_DIR/.go"
+    echo "[$(date -Is)] STEP_PROFILE done (see $VLLM_STEP_PROFILE_DIR/step_profile_rank*.json)"
   fi
 
   # Concurrent throughput sweep (BENCH=1). Runs in the same container as the
