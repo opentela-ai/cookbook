@@ -56,6 +56,32 @@ handles the full MoE computation (gate-up GEMM → SiTU/SwiGLU activation →
 down GEMM → routing weight → top-k sum) entirely on HIP, bypassing both
 FlyDSL and Triton.
 
+**Attention (MLA + KDA) — issue #42.** The same `ctypes`-over-`libvkernels_
+hip.so` pattern now wires the two remaining critical-path attention layers,
+both of which were left on gfx950-only paths before this issue:
+
+  * **MLA** ran through `TRITON_MLA` (AITER MLA is gated on gfx950).
+    `vkernels_attn.py` (loaded by `sitecustomize.py`) registers a
+    `VkernelMLABackend` ahead of `TRITON_MLA` on gfx942 that calls
+    `vk_hip_mla_fwd` (issue #21) with the absorbed-form `q`/`k_c`/`k_pe`/`v_c`
+    and the per-layer `q_start`/`kv_start`/`scale` (issue #42 scope 1).
+  * **KDA** (the delta-rule attention, ~2/3 of K3's attention stack) was
+    **silently dropped** via `K3_DISABLE_KDA=1` because the AITER/Triton
+    `kda_delta_rule_fwd` kernels GPU-fault on gfx942 (job 586165).
+    `vkernels_attn.py` patches `KimiK3DeltaAttention._forward` to call
+    `vk_hip_kda_delta_rule_fwd` (issue #21) on gfx942, **re-enabling the
+    layer without the fault** and improving output quality (issue #42 scope
+    2).
+
+Both are **opt-in** (`VKERNELS_MLA`/`VKERNELS_KDA`, default `0`),
+`on_gfx942()`-guarded, and cross-check the device output against the CPU
+oracle (`vk_mla_fwd`/`vk_kda_naive_delta_rule_fwd`, `max_rel<0.01`) on first
+use. On-cluster validation (6/6 probes + `KDA_RECALL_PROBE=1`, `rocprof`
+zero AITER/Triton attention kernels, ≤1.05× per-request latency vs the
+`K3_DISABLE_KDA=1` baseline via `BENCH_BASE_KDA_OFF`) gates flipping them to
+`1`; until then `K3_DISABLE_KDA` remains available as an explicit all-MLA
+fallback for `--load-format dummy`.
+
 3. **MI300A integrated-memory accounting — NOT a bug for vLLM.** Unlike
    sglang (which uses `psutil.virtual_memory()` and over-counts on the APU),
    vLLM's `vllm/platforms/rocm.py` `get_device_total_memory()` queries
@@ -193,24 +219,33 @@ Without `B:`, only KillWait (30 s) applies and the head keeps a
 | `kimi-k3-vllm.toml` | EDF: image (`.sqsh`), mounts (`/capstor`, `/users`, `/iopsstor`), HOME on `/capstor`, HF offline, `aws_ofi_nccl` annotation |
 | `serve_kimi_k3_otela_beverin.sbatch` | One self-contained sbatch: per-rank engine wrapper (`k3_patch.py` serialization + vLLM launch) + health/correctness-probe-gated otela worker on the head |
 | `k3_patch.py` | The four gfx942 a16w4 flydsl kernel patches + installs `sitecustomize.py`, `vkernels_experts.py`, and `libvkernels_hip.so` into the overlay |
-| `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup): (1) adds `VKERNELS_MXFP4_BF16` to the `Mxfp4MoeBackend` enum; (2) patches both `convert_*_to_mxfp4_moe_kernel_format` functions for pass-through weight handling; (3) patches `_get_priority_backends` + `backend_to_kernel_cls` to route `VKERNELS_MXFP4_BF16 → VkernelFusedExperts`; (4) multi-node follower KV-init fix (job 580876); (5) AITER `module_moe_asm` PyTorch fallback (topk, moe_sum, moe_align_block_size) |
+| `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup): (1) adds `VKERNELS_MXFP4_BF16` to the `Mxfp4MoeBackend` enum; (2) patches both `convert_*_to_mxfp4_moe_kernel_format` functions for pass-through weight handling; (3) patches `_get_priority_backends` + `backend_to_kernel_cls` to route `VKERNELS_MXFP4_BF16 → VkernelFusedExperts`; (4) multi-node follower KV-init fix (job 580876); (5) AITER `module_moe_asm` PyTorch fallback (topk, moe_sum, moe_align_block_size); **(6) VkernelMLA + VkernelKDA registration (issue #42)** — `VKERNELS_MLA=1` selects the `vk_hip_mla_fwd` backend ahead of `TRITON_MLA`; `VKERNELS_KDA=1` routes the delta-rule to `vk_hip_kda_delta_rule_fwd`, re-enabling the KDA layer `K3_DISABLE_KDA=1` used to drop |
 | `vkernels_experts.py` | `VkernelFusedExperts` class — `UnfusedOAITritonExperts` subclass that calls `vk_hip_fused_moe_mxfp4` via ctypes with `tensor.data_ptr()`. Handles `moe_align_block_size` on CPU + device copy, SiTU/SwiGLU activation params, and `apply_router_weight_on_input`. |
+| `vkernels_attn.py` | **issue #42** — `VkernelMLAImpl`/`VkernelMLABackend` (absorbed-form MLA via `vk_hip_mla_fwd`) + a `KimiK3DeltaAttention._forward` patch routing the delta-rule to `vk_hip_kda_delta_rule_fwd` on gfx942. Both load `libvkernels_hip.so` via ctypes (reusing `vkernels_experts._find_libvkernels_hip`), are `on_gfx942()`-guarded, opt-in (`VKERNELS_MLA`/`VKERNELS_KDA`), default OFF, and cross-check the device output against the CPU oracle (`vk_mla_fwd`/`vk_kda_naive_delta_rule_fwd`, `max_rel<0.01`) on first use (`VKERNELS_*_VALIDATE`). |
 | `gen_correctness.py` | Six-prompt factual correctness probe (mirrors the Clariden servekit bench); gates otela registration on real answers, not just a non-empty body |
 
 ## Submit
 
 ```bash
-# default: 4 nodes, TP8 x PP2 (16 GPUs), served as moonshotai/Kimi-K3,
+# default: 6 nodes x 4 GPUs = 24 GPUs, TP8 x PP3, served as
+#                                  SwissAI-Research/moonshot/kimi-k3-rocm,
 #                                  max-model-len 131072 (128K)
 sbatch serve_kimi_k3_otela_beverin.sbatch
 
-# from your laptop via remote-cluster-controller (rcc):
-rcc -p beverin push
-rcc -p beverin job submit serve_kimi_k3_otela_beverin.sbatch
-rcc -p beverin job status <JOBID>
-rcc -p beverin job tail <JOBID> -f
-rcc -p beverin job cancel <JOBID>
-rcc -p beverin pull logs/
+# from your laptop via remote-cluster-controller (rcc).
+# WHY submit runs sbatch from inside the recipe dir: the sbatch resolves its
+# siblings (k3_patch.py, sitecustomize.py, gen_correctness.py, kimi-k3-vllm.toml)
+# from $SLURM_SUBMIT_DIR. `rcc job submit` runs sbatch from remote_dir (the
+# repo root), so SLURM_SUBMIT_DIR=repo-root and the job fails preflight with
+# "FATAL: k3_patch.py not found next to this sbatch" (observed, job 598873).
+# `rcc run -s 'cd … && sbatch …'` sets SLURM_SUBMIT_DIR to the recipe dir.
+# Logs live at an absolute path outside remote_dir (DEPLOY_DIR/logs), so pass
+# --file to `rcc job tail` (the default slurm-<JOBID>.out in remote_dir is wrong).
+rcc --profile beverin push
+rcc --profile beverin run -s 'cd deployments/llm/beverin/kimi-k3-vllm && sbatch serve_kimi_k3_otela_beverin.sbatch'
+rcc --profile beverin job status <JOBID>
+rcc --profile beverin job tail <JOBID> --file /capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/logs/k3-vllm-beverin-<JOBID>.out -f
+rcc --profile beverin job cancel <JOBID>
 
 # 128K context explicitly (same as default)
 sbatch --export=ALL,CTX_LEN=131072 serve_kimi_k3_otela_beverin.sbatch
@@ -310,7 +345,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 |------|---------|-------|
 | `DEPLOY_DIR` | `/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin` | Work/logs/otela home. If overridden, update the EDF `workdir`/`HOME`/`HF_HOME` too. |
 | `MODEL_PATH` | `/capstor/store/cscs/swissai/infra01/hf_models/models/moonshotai/Kimi-K3` | Weights. Point at a restriped copy to fix the load bottleneck. |
-| `SERVED_MODEL_NAME` | `moonshotai/Kimi-K3` | Mesh-consistent (coexists with the Clariden sglang K3 as additive capacity). Override `kimi-k3` to match the original probe. |
+| `SERVED_MODEL_NAME` | `SwissAI-Research/moonshot/kimi-k3-rocm` | Mesh-consistent (coexists with the Clariden sglang K3 as additive capacity). Override `moonshotai/Kimi-K3` or `kimi-k3` to match other probes. |
 | `TP_SIZE` | `8` | Must satisfy `TP × PP == nodes × 4`. |
 | `PP_SIZE` | `2` | As above. |
 | `CTX_LEN` | `131072` | `--max-model-len`. K3 supports up to `1048576`; KV pool is sized by `GPU_MEM_UTIL` (MLA+KDA, ~107 KB/token), not this. |
@@ -330,7 +365,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `K3_ENABLE_PARSERS` | `1` | Adds `--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
 | `K3_PIECEWISE` | `0` | **Confirmed NOT viable** (job 589322). Sets `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'`, but `KimiK3ForConditionalGeneration` carries NO `@support_torch_compile`, so `mode=VLLM_COMPILE` only warns (`vllm.py:2410`) and at init (`gpu_model_runner.py:5442`) `is_breakable=False` + `PIECEWISE.has_full_cudagraphs()=False` installs NO wrapper — the model runs EAGER, identical to `ENFORCE_EAGER=1`. Real PIECEWISE cudagraph requires upstream `@support_torch_compile` on Kimi-K3. |
 | `LOAD_FORMAT` | _unset_ | Override weight loading (e.g. `dummy` for a 5-min cold start without real weights — used with `K3_PIECEWISE=1`). |
-| `BENCH` | `0` | Set `1` to run `benchmark.py` — a concurrent `/v1/completions` throughput sweep (warmup + one JSON line per `CONC:NUMREQ` level) — after the correctness probe passes, BEFORE registration. Pair with `OTELA_BIN=/bin/true` for a pure benchmark. Knobs: `BENCH_SPEC` (default `1:16 8:32 32:64 64:64`), `BENCH_OUT_TOK` (256), `BENCH_IN_TOK` (32, short to isolate decode), `BENCH_TIMEOUT` (1800). |
+| `BENCH` | `0` | Set `1` to run `benchmark.py` — a concurrent `/v1/completions` throughput sweep (warmup + one JSON line per `CONC:NUMREQ` level) — after the correctness probe passes, BEFORE registration. Pair with `OTELA_BIN=/bin/true` for a pure benchmark. Knobs: `BENCH_SPEC` (default `1:16 8:32 32:64 64:64`), `BENCH_OUT_TOK` (256), `BENCH_IN_TOK` (32, short to isolate decode), `BENCH_TIMEOUT` (1800). **issue #42:** pass a 7th arg or set `BENCH_BASE_KDA_OFF` to a KDA-disabled baseline server (`K3_DISABLE_KDA=1`) — the SAME spec runs against both and a per-level throughput + per-request latency delta is reported (acceptance: KDA-on / KDA-off latency ratio ≤ 1.05×). |
 | `DISTRIBUTED_TIMEOUT_SECONDS` | _unset_ | Override the gloo/NCCL init+recv timeout (vLLM default 3600 s). Set low (e.g. `300`) with `K3_PIECEWISE=1` so a decode deadlock fails in 5 min, not 1 h. |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64, sai-v0.0.6 (`--bootstrap.static`, `--label`). |
@@ -338,6 +373,10 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `OTELA_SERVICE_NAME` | `llm` | Service registered on the mesh. |
 | `OTELA_SEED` | `21` | Deterministic libp2p identity. |
 | `VKERNELS_DIR` | `/capstor/scratch/cscs/xyao/vkernels` | Path to the vkernels build tree. `k3_patch.py` copies `build/hip/**/libvkernels_hip.so` into the overlay. |
+| `VKERNELS_BUILD` | `hip` | Which vkernels build dir to prefer: `hip` (legacy `hip_api.cpp`, links `libamdhip64.so.7` — matches the ROCm 7.2.3 container, the verified 597880 path) or `cabi` (PR #44, links `libamdhip64.so.6` — **broken on this container**: `OSError: libamdhip64.so.6 cannot open shared object file` at the first MoE forward during `determine_available_memory`, job 598876). Re-enable `cabi` only after rebuilding against ROCm 7. |
+| `VKERNELS_MLA` | `0` | **issue #42.** Set `1` to register `VkernelMLA` (in `vkernels_attn.py`) ahead of `TRITON_MLA` on gfx942 and route absorbed-form MLA through `vk_hip_mla_fwd` (issue #21). Default `0` = TRITON_MLA. `VKERNELS_MLA_FORCE=1` is additionally required before `VkernelMLAImpl` handles real traffic (otherwise it raises `NotImplementedError`, falling back to TRITON_MLA). `VKERNELS_MLA_VALIDATE=1` cross-checks the device output vs the CPU oracle (`vk_mla_fwd`, `max_rel<0.01`) on first use. Validate on-cluster (6/6 probes, `rocprof` zero Triton MLA kernels) before flipping to `1`. |
+| `VKERNELS_KDA` | `0` | **issue #42.** Set `1` to route the KDA delta-rule forward to `vk_hip_kda_delta_rule_fwd` (issue #21) on gfx942, re-enabling the delta-rule attention layer that `K3_DISABLE_KDA=1` used to silently drop. Default `0` keeps the integration opt-in until on-cluster validation (`VKERNELS_KDA_VALIDATE=1`, the KDA recall probe, 6/6 probes, `rocprof` zero AITER/Triton attention kernels). `VKERNELS_KDA_CHUNK` (default `64`) selects the chunk size. After validation, **`K3_DISABLE_KDA` is no longer needed** in the serving recipe (kept as an explicit all-MLA fallback for `--load-format dummy` and as an emergency kill-switch). |
+| `KDA_RECALL_PROBE` | `0` | **issue #42.** Set `1` to run an ADDITIONAL long-context associative-recall probe in `gen_correctness.py` (a unique marker buried in a long neutral context, retrieved verbatim). The delta-rule layer is what K3 uses for long-range retrieval, so this probe passes with `VKERNELS_KDA=1` and fails on the `K3_DISABLE_KDA=1` all-MLA baseline — surfacing the quality delta the 6 factual probes miss. `KDA_RECALL_CTX` (default `2048`) sets the context length; `KDA_RECALL_REQUIRED=1` folds the probe into the final verdict. |
 
 ## Troubleshooting
 

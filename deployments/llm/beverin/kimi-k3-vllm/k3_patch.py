@@ -84,17 +84,42 @@ else:
     print("WARN: vkernels_experts.py not found next to k3_patch.py "
           f"({_ve_src}), vkernels backend disabled", flush=True)
 
+# --- install vkernels_attn.py into the overlay (issue #42 MLA+KDA) ---
+# sitecustomize.py imports register_vkernels_attn from this module (alongside
+# vkernels_experts.py, which it also imports). Same overlay location so both
+# the import and the ctypes C ABI load resolve on the worker.
+_va_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "vkernels_attn.py")
+if os.path.isfile(_va_src):
+    _va_dst = os.path.join(K3, "home/pylib", "vkernels_attn.py")
+    shutil.copyfile(_va_src, _va_dst)
+    print(f"installed vkernels_attn.py -> {_va_dst} (issue #42 MLA+KDA)",
+          flush=True)
+else:
+    print("WARN: vkernels_attn.py not found next to k3_patch.py "
+          f"({_va_src}), VkernelMLA/VkernelKDA disabled", flush=True)
+
 import glob as _glob_mod
 _vdir = os.environ.get("VKERNELS_DIR", "/capstor/scratch/cscs/xyao/vkernels")
-# PR #44 renamed the symbols to vk_hip_* and builds libvkernels_hip.so
-# under build/cabi/.  Prefer the new build; fall back to build/hip/ for
-# older local builds that used the since-removed hip_api.cpp.
-_so_cands = sorted(
-    _glob_mod.glob(os.path.join(_vdir, "build", "cabi", "**", "libvkernels_hip.so"),
-                   recursive=True)
-    + _glob_mod.glob(os.path.join(_vdir, "build", "hip", "**", "libvkernels_hip.so"),
-                     recursive=True)
-)
+# WHY prefer build/hip/ over build/cabi/: the build/cabi/ .so (PR #44) is
+# linked against libamdhip64.so.6 (old ROCm 6), but the
+# vllm-openai-rocm:kimi-k3 container is ROCm 7.2.3 and only ships
+# libamdhip64.so.7. Loading the build/cabi/ .so fails at the first MoE
+# forward with
+#   OSError: libamdhip64.so.6: cannot open shared object file
+# (job 598876, ~1h32m in, during determine_available_memory -> profile_run
+# -> VkernelFusedExperts.apply -> ctypes.CDLL). build/hip/ links against
+# libamdhip64.so.7 and is the build the verified run (597880) used.
+# vkernels_experts._resolve_moe_fn already falls back to the legacy
+# vk_fused_moe_mxfp4 symbol that build/hip/ exports. Re-enable build/cabi/
+# only after it is rebuilt against ROCm 7 (set VKERNELS_BUILD=cabi).
+_build_pref = os.environ.get("VKERNELS_BUILD", "hip")
+_build_order = ("cabi", "hip") if _build_pref == "cabi" else ("hip", "cabi")
+_so_cands = []
+for _b in _build_order:
+    _so_cands += _glob_mod.glob(
+        os.path.join(_vdir, "build", _b, "**", "libvkernels_hip.so"),
+        recursive=True)
 if _so_cands:
     _so_dst = os.path.join(K3, "home/pylib", "libvkernels_hip.so")
     shutil.copyfile(_so_cands[0], _so_dst)

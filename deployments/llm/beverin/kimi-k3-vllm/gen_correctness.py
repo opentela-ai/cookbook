@@ -110,6 +110,60 @@ assert [c[0] for c in CASES] == list(range(len(CORRECTNESS_PROMPTS))), "CASES mu
 CRISP_TOTAL = sum(1 for c in CASES if c[3])
 
 
+# --- KDA-specific long-context associative recall (issue #42) ---------------
+# The delta-rule attention layers are ~2/3 of K3's attention stack and are
+# DROPPED by the K3_DISABLE_KDA=1 all-MLA baseline. The 6 factual probes above
+# pass on that baseline (they are short and rely on parametric knowledge, not
+# long-range retrieval), so they do NOT surface the quality loss. This probe
+# buries a UNIQUE, unguessable marker early in a long neutral context and
+# asks for it back; retrieval depends on the long-range state the delta-rule
+# maintains, so it should pass with KDA active (VKERNELS_KDA=1) and fail (or
+# hallucinate) on the KDA-disabled baseline -- the quality delta issue #42
+# asks to measure.  Gated by KDA_RECALL_PROBE=1 (default off) so the 6-probe
+# gate above is unchanged; run as an ADDITIONAL verdict (separate function
+# below) so it never disturbs the MIN_PASS/CRISP accounting.
+_KDA_RECALL_MARKER = "Q9XZ-7K2P"  # unique; model must RETRIEVE, not generate
+
+
+def _kda_recall_prompt():
+    ctx = int(os.environ.get("KDA_RECALL_CTX", "2048"))
+    intro = f"The secret access code for the vault is {_KDA_RECALL_MARKER}. "
+    # Neutral filler (no marker, ~28 tokens/period) so the context is long
+    # without leaking the answer or training signal elsewhere.
+    pad = ("Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+           "Sed do eiusmod tempor incididunt ut labore et dolore magna "
+           "aliqua. Ut enim ad minim veniam, quis nostrud exercitation. ")
+    body = (intro + pad * (ctx // 14))[: ctx * 6]  # ~6 chars/token
+    return (f"{body}\n\n"
+            "Question: What is the secret access code for the vault?\nAnswer:")
+
+
+def run_kda_recall(base_url, model, max_tokens, per_req):
+    """Run the single long-context recall probe; return a result dict.
+
+    Independent of the 6-probe CASES/verdict so enabling it never changes the
+    factual-correctness gate. ``ok`` is True iff the unique marker is
+    retrieved verbatim (case-insensitive) -- a KDA-disabled model that loses
+    long-range retrieval typically hallucinates a plausible-looking code and
+    fails this exact match.
+    """
+    prompt = _kda_recall_prompt()
+    entry = {"prompt": _snip(prompt, 96), "label": "KDA long-context recall",
+             "crisp": True, "text": "", "ok": False, "error": "", "elapsed_s": 0.0}
+    try:
+        resp, dt = _completions(base_url, model, prompt, max_tokens, per_req)
+        entry["elapsed_s"] = round(dt, 3)
+        txt = _text(resp)
+        entry["text"] = txt
+        entry["ok"] = _KDA_RECALL_MARKER.lower() in txt.lower()
+    except Exception as exc:  # noqa: BLE001
+        entry["error"] = f"{type(exc).__name__}: {exc}"
+    flag = "PASS" if entry["ok"] else "FAIL"
+    preview = "<" + entry["error"][:72] + ">" if entry["error"] else _snip(entry["text"])
+    print(f"[KDA-RECALL] {flag} {entry['label']} | {preview}")
+    return entry
+
+
 def _completions(base_url, model, prompt, max_tokens, timeout):
     """Mirror servekit.bench._completions exactly (POST /v1/completions)."""
     body = json.dumps(
@@ -153,6 +207,7 @@ def main():
     per_req = float(os.environ.get("GEN_CORRECTNESS_PER_REQ_TIMEOUT", "180"))
     overall = float(os.environ.get("GEN_CORRECTNESS_TIMEOUT", "600"))
     smoke = int(os.environ.get("GEN_CORRECTNESS_SMOKE", "0"))
+    kda_recall = int(os.environ.get("KDA_RECALL_PROBE", "0"))
     if smoke:
         # --load-format dummy: verify the PIPELINE (load + JIT + forward +
         # HTTP) produces non-empty tokens, NOT factual correctness. All
@@ -210,6 +265,17 @@ def main():
         verdict = ok == len(CORRECTNESS_PROMPTS)
     else:
         verdict = (crisp_ok == CRISP_TOTAL) and (ok >= min_pass)
+
+    kda_recall_entry = None
+    if kda_recall and not smoke:
+        # Long-context recall is only meaningful with real weights (smoke run
+        # produces garbage tokens). It is an ADDITIONAL verdict, never counted
+        # in the 6-probe ok/crisp totals above.
+        kda_recall_entry = run_kda_recall(base_url, model, max_tokens, per_req)
+        # KDA_RECALL_REQUIRED=1 folds the probe into the final verdict, so a
+        # serving run with KDA dropped (all-MLA baseline) FAILS the gate.
+        if int(os.environ.get("KDA_RECALL_REQUIRED", "0")) == 1 and not kda_recall_entry["ok"]:
+            verdict = False
     print(f"[{'SMOKE' if smoke else 'CORRECTNESS'}] pass={ok}/{len(CORRECTNESS_PROMPTS)} "
           f"crisp={crisp_ok}/{CRISP_TOTAL} "
           f"verdict={'PASS' if verdict else 'FAIL'} "
@@ -225,6 +291,7 @@ def main():
         "pass": ok,
         "crisp_pass": crisp_ok,
         "verdict": "PASS" if verdict else "FAIL",
+        "kda_recall": kda_recall_entry,
         "elapsed_s": round(time.time() - t_start, 3),
         "results": results,
     }

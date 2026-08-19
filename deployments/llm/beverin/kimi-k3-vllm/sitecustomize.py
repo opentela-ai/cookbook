@@ -311,6 +311,29 @@ except Exception as _vk_err:
     print(f"[sitecustomize] VkernelFusedExperts registration skipped: "
           f"{_vk_err}", flush=True)
 
+# (6) Register VkernelMLA + VkernelKDA -- the two remaining critical-path
+# attention layers of K3 wired to their validated vkernels HIP kernels on
+# gfx942 (issue #42).  Like VkernelFusedExperts above, both load
+# libvkernels_hip.so via ctypes.  They are OPT-IN (VKERNELS_MLA=1 /
+# VKERNELS_KDA=1) and default OFF: importing this file and calling
+# register_vkernels_attn() does not change serving until the flags are set
+# and the device kernels have been validated against the CPU oracle on the
+# cluster (see vkernels_attn.py -- VKERNELS_MLA_FORCE / VKERNELS_KDA + the
+# VKERNELS_*_VALIDATE cross-checks gate < 1e-2).  When enabled, VkernelMLA
+# is selected ahead of TRITON_MLA and the KDA delta-rule goes through
+# vk_hip_kda_delta_rule_fwd, so K3_DISABLE_KDA (see below) is no longer
+# needed and the delta-rule layer is no longer silently dropped.
+try:
+    import sys as _sys_attn
+    _k3_pylib_attn = os.path.join(os.environ.get("K3", ""), "home/pylib")
+    if _k3_pylib_attn not in _sys_attn.path:
+        _sys_attn.path.insert(0, _k3_pylib_attn)
+    from vkernels_attn import register_vkernels_attn  # noqa: E402
+    register_vkernels_attn()
+except Exception as _vk_attn_err:
+    print(f"[sitecustomize] VkernelMLA/VkernelKDA registration skipped: "
+          f"{_vk_attn_err}", flush=True)
+
 # --- K3 JIT stagger: prevent OOM from simultaneous worker startup --
 # On gfx942 with 4 workers/node and ~501 GB system RAM, all 4 workers
 # simultaneously constructing the Kimi-K3 model + JIT-compiling Triton
@@ -722,7 +745,14 @@ if os.environ.get("K3_DISABLE_MOE_ASM_FALLBACK", "0") != "1":
         # only matters in worker processes, which import the full stack.
         pass
 
-# ── K3_DISABLE_KDA: replace KDA layers with MLA for gen-probe ─────────────
+# ── KDA on gfx942: vkernels delta-rule replaces the Triton path ──────
+# With issue #42 the faulting chunked KDA kernels are replaced on gfx942 by
+# the validated vk_hip_kda_delta_rule_fwd (VKERNELS_KDA=1, routed in
+# vkernels_attn.py above).  KDA then stays ACTIVE and K3_DISABLE_KDA is no
+# longer needed in the serving recipe (removed by default; see
+# serve_kimi_k3_otela_beverin.sbatch).  K3_DISABLE_KDA is kept below as an
+# explicit override (default off) for the --load-format dummy all-MLA probe
+# and as an emergency kill-switch.
 # The KDA (Kimi Delta Attention) Triton kernels are validated on gfx950 only.
 # On gfx942 (MI300A), they cause GPU memory access faults during execution
 # (job 586165: 8 GPU faults across 4 GPUs on PP0, right after JIT compilation
@@ -735,7 +765,24 @@ if os.environ.get("K3_DISABLE_MOE_ASM_FALLBACK", "0") != "1":
 # dummy (the model architecture is incorrect — ~2/3 of layers should be KDA,
 # not MLA).  State management (MambaStateDtypeCalculator etc.) is still set
 # up but harmless when no KDA layers exist.
-if os.environ.get("K3_DISABLE_KDA", "0") == "1":
+# Precedence (issue #42): VKERNELS_KDA=1 WINS over K3_DISABLE_KDA=1 so the
+# operator opts into the validated HIP path with a single variable -- they
+# do NOT also have to unset K3_DISABLE_KDA.  K3_DISABLE_KDA=1 (the pre-#42
+# all-MLA workaround) is the safe default in serve_kimi_k3_otela_beverin.
+# sbatch until VKERNELS_KDA=1 has passed the on-cluster validation (device-vs-
+# CPU max_rel<0.01 + the 6/6 factual probes + rocprof + latency, see
+# BENCHMARK.md).  Once validated, set K3_DISABLE_KDA=0 (or unset it) to
+# complete AC4: the delta-rule layer is then served by vk_hip_kda_delta_
+# rule_fwd and no longer silently dropped.
+if os.environ.get("VKERNELS_KDA", "0") == "1":
+    print(
+        "[K3] KDA active via vk_hip_kda_delta_rule_fwd "
+        "(VKERNELS_KDA=1, issue #42); supersedes any K3_DISABLE_KDA=1 "
+        "fallback -- the validated HIP kernel replaces the faulting "
+        "Triton path, so the delta-rule layer is served, not dropped.",
+        flush=True,
+    )
+elif os.environ.get("K3_DISABLE_KDA", "0") == "1":
     try:
         from vllm.transformers_utils.configs.kimi_linear import (
             KimiLinearConfig as _KLC,
@@ -747,8 +794,17 @@ if os.environ.get("K3_DISABLE_KDA", "0") == "1":
         _KLC.is_kda_layer = _patched_is_kda
         print(
             "[K3] KDA disabled (is_kda_layer -> False); all layers use MLA "
-            "(K3_DISABLE_KDA=1) -- ONLY valid with --load-format dummy",
+            "(K3_DISABLE_KDA=1) -- safe fallback until VKERNELS_KDA=1 is "
+            "validated, or for the --load-format dummy gen-probe.",
             flush=True,
         )
     except Exception as e:
         print(f"[K3] KDA disable patch FAILED: {e}", flush=True)
+else:
+    print(
+        "[K3] KDA routing default: neither VKERNELS_KDA=1 nor "
+        "K3_DISABLE_KDA=1 -- the Triton KDA path will fault on gfx942. "
+        "Set VKERNELS_KDA=1 (issue #42, validated HIP kernel) or "
+        "K3_DISABLE_KDA=1 (all-MLA fallback).",
+        flush=True,
+    )

@@ -321,3 +321,60 @@ representative of the scaling ceiling).
   prompts. Increasing to 8192+ would speed up long-prompt TTFT.
 - **KV cache**: 1–16 GiB (depending on `max_num_seqs`). Real serving with
   long context (up to 1 M tokens) would require much more KV cache memory.
+
+## KDA: enabled vs disabled (issue #42)
+
+Before issue #42 the delta-rule attention layer was **silently dropped**
+(`K3_DISABLE_KDA=1`, all layers MLA) because the AITER/Triton
+`kda_delta_rule_fwd` kernels GPU-fault on gfx942 (job 586165). Issue #42
+re-enables it via the validated `vk_hip_kda_delta_rule_fwd` C ABI
+(`vkernels_attn.py`, `VKERNELS_KDA=1`). Measure the quality **and**
+throughput delta directly:
+
+### Quality — long-context associative recall
+
+The 6 factual probes above pass on the KDA-disabled baseline (they rely on
+parametric knowledge, not long-range retrieval), so they do not surface the
+quality loss. Run the additional long-context recall probe
+(`KDA_RECALL_PROBE=1`) — a unique, unguessable marker buried in a long
+neutral context, retrieved verbatim — which the delta-rule layer is what K3
+uses for long-range retrieval:
+
+```bash
+# KDA ON  (VKERNELS_KDA=1 server) -- recall should PASS
+KDA_RECALL_PROBE=1 KDA_RECALL_REQUIRED=1 GEN_PROBE=1 \
+  python3 gen_correctness.py http://127.0.0.1:8080 \
+    SwissAI-Research/moonshot/kimi-k3-rocm kda_on.json
+
+# KDA OFF (K3_DISABLE_KDA=1 all-MLA baseline server) -- recall typically FAILS
+KDA_RECALL_PROBE=1 KDA_RECALL_REQUIRED=1 GEN_PROBE=1 \
+  python3 gen_correctness.py http://127.0.0.1:8081 \
+    SwissAI-Research/moonshot/kimi-k3-rocm kda_off.json
+```
+
+`KDA_RECALL_CTX` (default `2048`) sets the context length. The acceptance
+for issue #42 is: recall PASSES with `VKERNELS_KDA=1` AND (for confirmation)
+the device delta-rule output matches the CPU oracle (`vk_kda_naive_delta_
+rule_fwd`, `max_rel < 0.01`, run automatically on first use via
+`VKERNELS_KDA_VALIDATE=1`).
+
+### Throughput + latency — KDA-on vs KDA-disabled baseline
+
+`benchmark.py` accepts a **second** base URL (7th arg or `BENCH_BASE_KDA_OFF`)
+for the `K3_DISABLE_KDA=1` baseline server; the SAME `BENCH_SPEC` runs
+against both and a per-level throughput + per-request latency delta is
+printed (`lat_ratio = KDA-on / KDA-off`):
+
+```bash
+python3 benchmark.py http://127.0.0.1:8080 \
+    SwissAI-Research/moonshot/kimi-k3-rocm bench_kda_compare.json \
+    "1:16 8:32 32:64 64:64" 256 32 http://127.0.0.1:8081
+#  or: BENCH_BASE_KDA_OFF=http://127.0.0.1:8081 python3 benchmark.py ...
+```
+
+Acceptance: **no regression in per-request latency** vs the
+`TRITON_MLA + K3_DISABLE_KDA=1` baseline — target `lat_ratio ≤ 1.05×` — with
+the recall quality improvement being pure upside. A native gfx942 delta-rule
+kernel is expected to be competitive with (or faster than) the disabled
+path's all-MLA fallback, since it removes ~1/3 of layers from the MLA path
+and replaces the dropped work with a compact linear-attention recurrence.

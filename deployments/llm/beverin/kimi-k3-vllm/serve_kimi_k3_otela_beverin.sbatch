@@ -477,6 +477,15 @@ trap 'kill $_MEM_MON_PID 2>/dev/null' EXIT
 # slow over Socket; TODO a HIP-aware OFI/CXI plugin for real throughput.
 unset NCCL_NET_PLUGIN NCCL_NET
 export NCCL_SOCKET_IFNAME="${K3_NIC:-hsn0}"
+# WHY: gloo is a SEPARATE CPU transport from RCCL — vLLM V1 uses it for the
+# MQ-broadcaster `in_the_same_node_as` check + torch.distributed.barrier
+# during WorkerProc init (multiproc_executor.py:201 wait_for_ready ->
+# create_mq_broadcaster -> shm_broadcast.py:912). Without GLOO_SOCKET_IFNAME
+# gloo binds a non-routable iface and the cross-node recv times out 1800 s
+# -> "WorkerProc initialization failed" -> job tears down (job 600189, real
+# weights, elapsed 1h52m; identical to 600111 which was scancelled before it
+# surfaced). Same iface as K3_NIC/NCCL_SOCKET_IFNAME (hsn0 == Slingshot IP).
+export GLOO_SOCKET_IFNAME="${K3_NIC:-hsn0}"
 export NCCL_IB_DISABLE=1
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 # Prevent RCCL socket bootstrap race when peers start with slight delay
@@ -600,10 +609,28 @@ fi
 exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
 ENGINE
 
-# K3_DISABLE_KDA: EDF replaces inherited env, so embed outer-shell value
-# here (double-quoted heredoc IS expanded by the sbatch outer shell).
+# KDA routing on gfx942 (issue #42): the faulting AITER / Triton
+# chunked KDA kernels are replaced by the validated vk_hip_kda_delta_rule_
+# fwd (routed in vkernels_attn.py via sitecustomize.py) when VKERNELS_KDA=1.
+# This re-enables the delta-rule attention layer that K3_DISABLE_KDA=1
+# used to silently drop, improving output quality.  EDF replaces the
+# inherited env, so embed the outer-shell values here (the double-quoted
+# heredoc IS expanded by the sbatch outer shell).
+#
+# Default VKERNELS_KDA=0 keeps the integration OPT-IN until the device
+# kernel is validated on the cluster against the CPU oracle (max_rel<0.01,
+# see VKERNELS_KDA_VALIDATE in vkernels_attn.py) and the 6/6 factual-
+# correctness probes pass with KDA active (issue #42 acceptance).
+#
+# Until then the DEFAULT is the pre-#42 safe state: K3_DISABLE_KDA=1
+# (all-MLA fallback, delta-rule layer dropped -- no regression vs. today).
+# sitecustomize.py gives VKERNELS_KDA=1 PRECEDENCE over K3_DISABLE_KDA=1,
+# so after validation the operator flips a SINGLE variable
+# (VKERNELS_KDA=1) to serve the validated HIP kernel; then set
+# K3_DISABLE_KDA=0 (or unset it) to complete AC4 (K3_DISABLE_KDA removed).
 cat >> "${RUNDIR}/engine.sh" <<EOFA
-export K3_DISABLE_KDA="${K3_DISABLE_KDA:-0}"
+export VKERNELS_KDA="${VKERNELS_KDA:-0}"
+export K3_DISABLE_KDA="${K3_DISABLE_KDA:-1}"
 EOFA
 chmod +x "$RUNDIR/engine.sh"
 

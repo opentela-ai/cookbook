@@ -129,7 +129,10 @@ for act_name, activation in [("swiglu", 0), ("situ", 1)]:
     dact = torch.zeros(EM * ispp, dtype=torch.bfloat16).to(dev)
     dout = torch.zeros(M * hidden, dtype=torch.float32).to(dev)
 
-    lib.vk_fused_moe_mxfp4(
+    # PR #44 names the device C ABI vk_hip_* (namespaced away from the CPU
+    # reference vk_* in capi.hpp); older local builds exported the bare name.
+    fused_moe = getattr(lib, "vk_hip_fused_moe_mxfp4", None) or getattr(lib, "vk_fused_moe_mxfp4", None)
+    fused_moe(
         ctypes.c_void_p(dA.data_ptr()), ctypes.c_void_p(dw13.data_ptr()),
         ctypes.c_void_p(dw13s.data_ptr()), ctypes.c_void_p(dw2.data_ptr()),
         ctypes.c_void_p(dw2s.data_ptr()),
@@ -168,7 +171,8 @@ v_c = np.random.randn(B, S_kv, lr).astype(np.float32)
 
 dq, dk_c, dk_pe, dv_c = [torch.from_numpy(x).to(dev) for x in (q, k_c, k_pe, v_c)]
 dout = torch.zeros(B * H * S_q * lr, dtype=torch.float32).to(dev)
-lib.vk_mla_fwd(ctypes.c_int(B), ctypes.c_int(H), ctypes.c_int(S_q), ctypes.c_int(S_kv),
+mla_fwd = getattr(lib, "vk_hip_mla_fwd", None) or getattr(lib, "vk_mla_fwd", None)
+mla_fwd(ctypes.c_int(B), ctypes.c_int(H), ctypes.c_int(S_q), ctypes.c_int(S_kv),
     ctypes.c_int(0), ctypes.c_int(0), ctypes.c_int(lr), ctypes.c_int(rhd),
     ctypes.c_float(scale), ctypes.c_void_p(dq.data_ptr()), ctypes.c_void_p(dk_c.data_ptr()),
     ctypes.c_void_p(dk_pe.data_ptr()), ctypes.c_void_p(dv_c.data_ptr()),
@@ -193,7 +197,8 @@ beta = np.full((B, H, S, 1), 4.0, dtype=np.float32)
 
 dq, dk, dv, dg, dbeta = [torch.from_numpy(x).to(dev) for x in (q, k, v, g, beta)]
 dout = torch.zeros(B * H * S * D, dtype=torch.float32).to(dev)
-lib.vk_kda_delta_rule_fwd(ctypes.c_void_p(dq.data_ptr()), ctypes.c_void_p(dk.data_ptr()),
+kda_fwd = getattr(lib, "vk_hip_kda_delta_rule_fwd", None) or getattr(lib, "vk_kda_delta_rule_fwd", None)
+kda_fwd(ctypes.c_void_p(dq.data_ptr()), ctypes.c_void_p(dk.data_ptr()),
     ctypes.c_void_p(dv.data_ptr()), ctypes.c_void_p(dg.data_ptr()),
     ctypes.c_void_p(dbeta.data_ptr()), ctypes.c_void_p(dout.data_ptr()),
     ctypes.c_int(B), ctypes.c_int(H), ctypes.c_int(S), ctypes.c_int(D), ctypes.c_int(64))
