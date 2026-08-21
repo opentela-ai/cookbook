@@ -120,6 +120,33 @@ else
   exit 2
 fi
 echo "[build] ldd fabric:"; ldd "$RUNDIR/librccl-net-ofi.so" 2>/dev/null | grep -i fabric || true
+# libfabric.so.1 (Cray 1.29.1) NEEEDS libcxi.so.1, a host DSO at /usr/lib64
+# that the EDF does NOT mount into the container. Without it the plugin's
+# dlopen fails there with "libcxi.so.1: cannot open shared object file" and
+# RCCL silently falls back to the built-in Socket transport (job 603818:
+# every cross-node channel went "via NET/Socket" despite FI_PROVIDER=cxi).
+# Copy the real libcxi.so.1.* into $RUNDIR and recreate the .so / .so.1
+# symlinks; run.sh prepends $RUNDIR to LD_LIBRARY_PATH so libfabric finds
+# them in-container. (Runs on the head host where /usr/lib64 is present.)
+CXI_SRC=\$(ls /usr/lib64/libcxi.so.1.* 2>/dev/null | head -1)
+if [ -n "\$CXI_SRC" ]; then
+  cp -L "\$CXI_SRC" "$RUNDIR/libcxi.so.1.5.0"
+  ln -sf libcxi.so.1.5.0 "$RUNDIR/libcxi.so.1"
+  ln -sf libcxi.so.1 "$RUNDIR/libcxi.so"
+  echo "[build] copied libcxi: \$CXI_SRC -> $RUNDIR/libcxi.so.1.5.0 (+symlinks)"
+  echo "[build] ldd cxi+fabric:"; ldd "$RUNDIR/librccl-net-ofi.so" 2>/dev/null | grep -iE "cxi|fabric" || true
+else
+  echo "[build] WARN: libcxi.so.1.* not found under /usr/lib64 - plugin will fail to dlopen in-container" >&2
+fi
+# OpenLDAP 2.4 trio: host Cray libfabric -> libcurl -> {libldap_r-2.4,
+# liblber-2.4, libsasl2.so.3}. The container ships OpenLDAP 2.5 (different
+# SONAME), so the host libcurl cannot resolve in-image -> "libldap_r-2.4.so.2:
+# cannot open" (job 603820) -> RCCL silently falls back to Socket. Copy the
+# host trio into $RUNDIR (first on LD_LIBRARY_PATH). An in-container ldd in
+# run.sh names any LATER gap so we stop guessing.
+cp -L /usr/lib64/libldap_r-2.4.so.2.10.9 "$RUNDIR/" 2>/dev/null && ln -sf libldap_r-2.4.so.2.10.9 "$RUNDIR/libldap_r-2.4.so.2" && echo "[build] copied libldap_r-2.4.so.2.10.9 (+soname)"
+cp -L /usr/lib64/liblber-2.4.so.2.10.9 "$RUNDIR/" 2>/dev/null && ln -sf liblber-2.4.so.2.10.9 "$RUNDIR/liblber-2.4.so.2" && echo "[build] copied liblber-2.4.so.2.10.9 (+soname)"
+cp -L /usr/lib64/libsasl2.so.3.0.0 "$RUNDIR/" 2>/dev/null && ln -sf libsasl2.so.3.0.0 "$RUNDIR/libsasl2.so.3" && echo "[build] copied libsasl2.so.3.0.0 (+soname)"
 BUILD
 chmod +x "$RUNDIR/build.sh"
 
@@ -142,17 +169,54 @@ echo "[$(date -Is)] BUILD_DONE"
 cat > "$RUNDIR/run.sh" <<RUN
 #!/bin/bash
 set -uo pipefail
-export LD_LIBRARY_PATH="$CRAY_OFI/lib64:\${LD_LIBRARY_PATH:-}"
-export NCCL_NET="$RUNDIR/librccl-net-ofi.so"
-export RCCL_NET="$RUNDIR/librccl-net-ofi.so"
+export LD_LIBRARY_PATH="$RUNDIR:$CRAY_OFI/lib64:\${LD_LIBRARY_PATH:-}"
+# NCCL_NET/RCCL_NET select a network *type* (IB/Socket) in this RCCL 2.27.7
+# build; they do NOT load the external plugin (proven: RCCL still tried
+# IB+Socket with NCCL_NET=<path> set). The plugin is loaded below as
+# libnccl-net.so via LD_LIBRARY_PATH (+ NCCL_NET_PLUGIN for compat builds),
+# so we LEAVE NCCL_NET/RCCL_NET UNSET to avoid any type restriction and let
+# RCCL pick whatever loads (the OFI plugin, else fall back to IB/Socket).
+unset NCCL_NET RCCL_NET 2>/dev/null || true
 export FI_PROVIDER="cxi"
 export MASTER_ADDR="$HEAD"
 export MASTER_PORT="$MASTER_PORT"
 export RANK="\${SLURM_NODEID:-0}"
 export WORLD_SIZE="\${SLURM_NTASKS:-2}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-# NCCL_DEBUG comes from the EDF (INFO). Do NOT set NCCL_IB_DISABLE/NCCL_SOCKET_IFNAME.
-echo "[r\$RANK] NCCL_NET=\$NCCL_NET FI_PROVIDER=\$FI_PROVIDER MASTER=\$MASTER_ADDR:\$MASTER_PORT CUDA=\$CUDA_VISIBLE_DEVICES"
+export CUDA_VISIBLE_DEVICES="\${CUDA_VISIBLE_DEVICES:-0}"
+# NCCL_DEBUG comes from the EDF (INFO) by default; override to TRACE at
+# submit via SMOKE_NCCL_DEBUG (baked BELOW at heredoc-write time — the EDF
+# replaces the inherited env at srun --environment, so SMOKE_* must be baked
+# here, not read inside the container). SMOKE_PG_TIMEOUT makes init / the
+# first cross-node collective fail fast with a torch.distributed TimeoutError
+# (and a stack trace) instead of hanging to the SLURM wall. FI_LOG_LEVEL +
+# FI_LOG_PROV drive the Cray libfabric (cxi) provider logs.
+#   rcc -p beverin run -s 'cd <SCRIPT_DIR> &&'
+#   sbatch --export=ALL,SMOKE_NCCL_DEBUG=TRACE,SMOKE_FI_LOG_LEVEL=DEBUG,SMOKE_PG_TIMEOUT=90
+#   ofi_rccl_smoke.sbatch
+# Do NOT set NCCL_IB_DISABLE/NCCL_SOCKET_IFNAME (would force the Socket
+# fallback, defeating the purpose). NCCL_DEBUG_SUBSYS narrows the RCCL
+# trace; unset = all subsystems at the NCCL_DEBUG level.
+export NCCL_DEBUG="${SMOKE_NCCL_DEBUG:-${NCCL_DEBUG:-INFO}}"
+export SMOKE_PG_TIMEOUT="${SMOKE_PG_TIMEOUT:-1800}"
+export FI_LOG_LEVEL="${SMOKE_FI_LOG_LEVEL:-${FI_LOG_LEVEL:-warn}}"
+export FI_LOG_PROV="${SMOKE_FI_LOG_PROV:-cxi}"
+[ -n "${SMOKE_NCCL_DEBUG_SUBSYS:-}" ] && export NCCL_DEBUG_SUBSYS="${SMOKE_NCCL_DEBUG_SUBSYS:-}"
+echo "[r\$RANK] NCCL_NET=\${NCCL_NET:-<unset>} FI_PROVIDER=\$FI_PROVIDER MASTER=\$MASTER_ADDR:\$MASTER_PORT CUDA=\$CUDA_VISIBLE_DEVICES debug: NCCL_DEBUG=\$NCCL_DEBUG SUBSYS=\${NCCL_DEBUG_SUBSYS:-<all>} FI_LOG=\$FI_LOG_LEVEL/\$FI_LOG_PROV PG_TIMEOUT=\$SMOKE_PG_TIMEOUT s"
+# RCCL 2.27.7 dlopens the external net plugin by the HARDCODED name
+# libnccl-net.so (resolved via LD_LIBRARY_PATH) and IGNORES NCCL_NET=<path>
+# for plugin loading (NCCL_NET selects a network *type* here — the log still
+# tried IB+Socket with NCCL_NET=<path> set). So expose the vkernels plugin AS
+# libnccl-net.so (symlink in $RUNDIR, on LD_LIBRARY_PATH) AND offer it via
+# NCCL_NET_PLUGIN=<path> for builds that honour that env. (Both $RUNDIR
+# below are baked at heredoc-write time, like the NCCL_NET line above.)
+ln -sf "$RUNDIR/librccl-net-ofi.so" "$RUNDIR/libnccl-net.so"
+export NCCL_NET_PLUGIN="$RUNDIR/librccl-net-ofi.so"
+echo "[r\$RANK] plugin: NCCL_NET_PLUGIN=\$NCCL_NET_PLUGIN LD_LIBRARY_PATH=\$LD_LIBRARY_PATH"
+# Authoritative in-container dependency check: ldd the plugin with THIS
+# run.sh's LD_LIBRARY_PATH so any still-missing host DSO is named in the
+# log (instead of RCCL's one-line "could not open" + silent Socket fallback).
+echo "[r\$RANK] in-container ldd (remaining not-found deps):"
+ldd "\$NCCL_NET_PLUGIN" 2>&1 | grep -i "not found" || echo "[r\$RANK] ldd: all plugin deps resolved"
 python3 "$SCRIPT_DIR/ofi_rccl_smoke.py"
 rc=\$?
 echo "[r\$RANK] ofi_rccl_smoke rc=\$rc"
@@ -173,6 +237,19 @@ echo "[$(date -Is)] ---- transport / plugin evidence (NCCL_DEBUG=INFO) ----"
 grep -iE "ofi|cxi|net plugin|librccl|transport|Socket|version|getDeviceMR|regHandle|NET/|plugin" "$LOG" 2>/dev/null | head -50 || true
 echo "[$(date -Is)] ---- OFI_SMOKE result ----"
 grep -E "OFI_SMOKE_(PASS|FAIL)" "$LOG" 2>/dev/null || true
+# Transport assertion: a correct allreduce over the built-in Socket fallback
+# is a SILENT FAIL - Socket can move a 1-elem tensor over TCP, so the sum
+# being right does NOT prove the OFI plugin carried the traffic. If every
+# cross-node channel went "via NET/Socket" and none via a non-Socket net, the
+# plugin did not engage even if it dlopened (job 603818 was exactly this:
+# libcxi.so.1 missing -> Socket fallback -> OFI_SMOKE_PASS over TCP).
+SOCK=$(grep -aoE "via NET/Socket" "$LOG" 2>/dev/null | sort -u | wc -l)
+NONSOCK=$(grep -aoE "via NET/[A-Za-z0-9_.-]+" "$LOG" 2>/dev/null | grep -avE "via NET/Socket" | sort -u | wc -l)
+echo "[$(date -Is)] transport assertion: socket_channels=$SOCK non_socket_channels=$NONSOCK"
+if [ "$SOCK" -gt 0 ] && [ "$NONSOCK" -eq 0 ]; then
+  echo "[$(date -Is)] OFI_SMOKE_FAIL transport=Socket-only - plugin did not carry cross-node traffic (see $LOG)." >&2
+  SMOKE_RC=1
+fi
 
 if [ "$SMOKE_RC" = 0 ] && grep -q "OFI_SMOKE_PASS" "$LOG" 2>/dev/null; then
   echo "[$(date -Is)] OFI_INTEGRATION_PASS — plugin loaded, RCCL accepted the ABI, allreduce completed."
