@@ -11,7 +11,78 @@
 - `--load-format dummy` — eliminates page-cache thrash during startup
 - `--skip-mm-profiling` — prevents vision-tower OOM during `profile_run()`
 
-## CUDA Graphs: NOT viable on gfx942 with PP=3
+## Breakable piecewise cudagraph — NOW VIABLE (job 602516)
+
+**Date:** 2026-08-21
+**Fix:** `VkernelFusedExperts.apply` (`vkernels_experts.py`) now uses
+**persistent device buffers** for the C-ABI scratch it writes via raw
+ctypes (`out_fp32`, `sorted_ids`, `expert_ids`, and the `act_scratch`
+fallback) — sized once at `MAX_NUM_BATCHED_TOKENS` during the profile/warmup
+run and reused forever. Previously these were allocated **per `apply` call**
+(`torch.empty`), which during cudagraph capture/replay let the vLLM caching
+allocator recycle the buffers while the C kernel still held raw pointers to
+them → **`Memory access fault` (16 faults in ~9 min, job 602311)**. The fix
+makes the path allocation-free under capture: `_capture_active()` (via
+`BreakableCUDAGraphCapture.is_active()`) reuses persistent buffers and
+raises hard if one is somehow too small while a session is live.
+
+**Config:** `K3_BREAKABLE_PIECEWISE=1` → `VLLM_USE_BREAKABLE_CUDAGRAPH=1` +
+`cudagraph_mode=PIECEWISE` (the vLLM-intended split-at-MoE path, which avoids
+the full-graph + PP-recv deadlock of jobs 588153–588156), `VKERNELS_MXFP4_BF16`
+backend, TP=8 PP=3 across 6 nodes (24 MI300A), `--load-format dummy`,
+`max_num_batched_tokens=8192`, `max_num_seqs=8`, `BENCH=1 GEN_CORRECTNESS_SMOKE=1`.
+Baseline: identical config with `K3_BREAKABLE_PIECEWISE=0` (→
+`VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `ENFORCE_EAGER=1`), job 602367.
+
+### Validation — 0 faults; capture succeeds
+
+- **Persistent buffers allocated once** across all 8 TP workers (log):
+  `persistent out_fp32 alloc (key=(0,3584), cap=29360128 fp32, max_M=8192)`,
+  `persistent sids alloc (cap=131968, top_k=16, local_n=896)`,
+  `persistent eids alloc (cap=131968)`. Sizes match K3 exactly (ispp=1536,
+  hidden=7168, routed_expert_hidden_size=3584, 896 experts, top-16).
+- **Zero `Memory access fault` / SIGSEGV over 58 min** (vs 16 faults in ~9
+  min on the unfixed build, job 602311).
+- Breakable CUDA graph **enabled**, capture warmup completed (M=16→50→…),
+  no PP-recv deadlock, `GEN_CORRECTNESS_SMOKE=1` passed (6/6 non-empty),
+  `BENCH` ran to `rc=0`.
+
+### Throughput — breakable vs eager (dummy weights, out_tok=256, in_tok≈50)
+
+| Concurrency | eager agg (tok/s) | breakable agg (tok/s) | speedup | eager per-req | breakable per-req | eager lat p50 | breakable lat p50 | lat lower |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 (single stream, n=16) | 3.7 | **6.0** | **1.62×** | 3.7 | 6.0 | 68.7 | **42.9** | **1.60×** |
+| 4 (warmup, n=8) | 14.3 | **19.8** | **1.39×** | 3.7 | 5.2 | 73.4 | **53.6** | **1.37×** |
+| 8 (n=32) | 22.7 | **38.6** | **1.70×** | 3.6 | 4.9 | 72.2 | **52.9** | **1.36×** |
+| 32 (n=64) | timeout* | timeout* | — | — | — | — | — | — |
+| 64 (n=64) | timeout* | timeout* | — | — | — | — | — | — |
+
+*\*Harness artifact, NOT a path failure: `max_num_seqs=8` serializes the
+C=32/64 client pools into ≥4 batches × ~53 s = 212 s > the 180 s per-request
+timeout (`BENCH_PER_REQ_TIMEOUT`). Affects both jobs equally. Raise
+`BENCH_PER_REQ_TIMEOUT` (e.g. 600 s) and/or `MAX_NUM_SEQS` to measure those
+levels.*
+
+peak aggregate = **38.6 tok/s** (breakable, C=8) vs **22.7 tok/s** (eager,
+C=8). Breakable job 602516 BENCH elapsed 1363.9 s (rc=0); eager job 602367
+BENCH elapsed ~1500 s (warmup 143.3 + C=1 1098.3 + C=8 360.8 + timeout).
+
+### Conclusion
+
+The **breakable piecewise cudagraph path is now viable on gfx942 with
+PP=3** — the persistent-buffer fix in `vkernels_experts.py` eliminates the
+per-call-allocation `Memory access fault` that previously crashed capture,
+and the resulting decode-cudagraph replay delivers a **1.4–1.7× throughput
+improvement and 1.36–1.60× lower per-request latency** over the
+`ENFORCE_EAGER=1` baseline at matched concurrency (single-stream:
+3.7 → 6.0 tok/s). This **supersedes** the "CUDA Graphs: NOT viable on
+gfx942 with PP=3" finding immediately below (which was the full-graph
+path; the breakable PIECEWISE path is the vLLM-intended fix that this
+contribution makes work) and should become the default serving
+configuration. The C=32/C=64 timeout is a `BENCH_PER_REQ_TIMEOUT`/
+`max_num_seqs` harness limit, not a path defect.
+
+## CUDA Graphs: NOT viable on gfx942 with PP=3 (SUPERSEDED — full-graph path; see "Breakable piecewise cudagraph" above)
 
 Tested across jobs 588153, 588154, 588156 with:
 - `ENFORCE_EAGER=0` (CUDA graphs ON)

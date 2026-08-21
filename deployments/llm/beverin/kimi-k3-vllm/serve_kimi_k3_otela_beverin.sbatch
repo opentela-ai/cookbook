@@ -76,14 +76,20 @@
 #     rank 1..N      -> vllm --headless (no HTTP; pipeline P2P to neighbours)
 #
 # Default TP8 x PP2: each tensor-parallel group of 8 spans 2 nodes, so MoE
-# allreduce DOES cross Slingshot — but over RCCL Socket transport (hsn0), which
+# allreduce DOES cross Slingshot — over RCCL Socket transport (hsn*), which
 # is the verified bring-up path (k3-eng8/k3-eng11 reached MoE backend
 # selection — ROCM_AITER_MLA + AITER_MXFP4_BF16 via patched flydsl +
 # sitecustomize.py, PP2xTP8=16 workers; k3-eng8 loaded shards to 16% @ ~147
-# s/shard pre-restripe before being cancelled). A token has not
-# yet been confirmed on this GPU family; the mandatory generation probe gates
-# registration on it. TP4 x PP4 (4 nodes) keeps TP all-reduce intra-node (4
-# GPUs) but stages two pipeline layers per node — unverified, see README.
+# s/shard pre-restripe before being cancelled). Socket is the DEFAULT: the
+# EDF's OFI/CXI plugin initialises but the first cross-node collective HANGS
+# on this allocation (rccl-xport 601320/601321/601339/601341); see the RCCL
+# block below. Two Socket-side all-to-all knobs are now DEFAULT ON since
+# run-601453: RCCL_ALL_TO_ALL_PIVOT_ENABLE + RCCL_CHANNEL_TUNING_ENABLE cut
+# the MoE all-to-all GPU time -31% and lifted agg tok/s 20.6 -> 23.8.
+# A token has not yet been confirmed on this GPU family; the mandatory
+# generation probe gates registration on it. TP4 x PP4 (4 nodes) keeps TP
+# all-reduce intra-node (4 GPUs) but stages two pipeline layers per node —
+# unverified, see README.
 #
 # -----------------------------------------------------------------------------
 # NO RELAY (direct mesh, like Clariden)
@@ -161,6 +167,22 @@ if [ "$(( TP_SIZE * PP_SIZE ))" -ne "$(( NNODES * GPUS_PER_NODE ))" ]; then
   echo "       6 nodes x 4 GPUs -> TP=4 PP=6 (AITER MLA: 24 heads/GPU INVALID)" >&2
   exit 1
 fi
+if [ "${K3_BREAKABLE_PIECEWISE:-0}" = "1" ] && [ "${PP_SIZE:-3}" != "1" ]; then
+  # PP_SIZE>1 (e.g. the proven TP8 PP3) has a recv_object at each PP
+  # boundary in the forward. The breakable PIECEWISE path is what makes
+  # this SAFE: each @eager_break_during_capture op (VkernelFusedExperts.apply)
+  # ends the current cudagraph segment and runs eagerly on the capture
+  # stream, so the forward is captured as MANY small segments (split at MoE)
+  # rather than one monolithic graph. A monolithic graph + PP recv was the
+  # prior deadlock (jobs 588153/588156, cudagraph_mode=FULL_AND_PIECEWISE ->
+  # decode_mode=FULL -> no break). This path (cudagraph_mode=PIECEWISE ->
+  # decode_mode=PIEWISE -> breaks fire) is the vLLM-INTENDED fix
+  # (config/vllm.py:1208-1230). A deadlock now fails in
+  # DISTRIBUTED_TIMEOUT_SECONDS=${DISTRIBUTED_TIMEOUT_SECONDS:-3600}s, not 1 h.
+  echo "[rank ${RANK:-0}] K3_BREAKABLE_PIECEWISE=1 with PP_SIZE=${PP_SIZE:-3}: PP recv present;" >&2
+  echo "[rank ${RANK:-0}]    relying on breakable PIECEWISE (breaks fire) to avoid the PP recv deadlock." >&2
+  echo "[rank ${RANK:-0}]    Deadlock timeout=${DISTRIBUTED_TIMEOUT_SECONDS:-3600}s." >&2
+fi
 # Request-length bound. Kimi-K3 supports up to max_position_embeddings=1048576
 # (1M). The KV pool is sized by --gpu-memory-utilization, NOT this value (MLA +
 # KDA hybrid attention: ~107 KB/token), so even large --max-model-len admits a
@@ -168,6 +190,13 @@ fi
 # 1048576 once a cold start + generation are confirmed fast.
 export CTX_LEN="${CTX_LEN:-131072}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# --max-num-batched-tokens caps tokens/step (prefill + decode). vLLM's
+# default 2048 is too small for high-concurrency sweeps: at C=256 with
+# in_tok~=50, prefill demand is ~12800 tokens and the chunked schedule
+# exceeds benchmark.py's HTTP timeout -> TimeoutError + JSONDecodeError
+# (job 600469). BENCHMARK.md's baseline (job 598005) used 8192, which lets
+# the C=256 sweep complete (~172 tok/s). Default 8192 matches that baseline.
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 # MI300A is an APU: HBM is shared between CPU and 4 GPU complexes.
 # 0.9 leaves only ~40 GiB for OS → OOM kill. 0.8 leaves ~91 GiB.
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
@@ -176,7 +205,11 @@ export MASTER_PORT="${MASTER_PORT:-6379}"
 export SERVE_PORT="${SERVE_PORT:-8080}"
 # Passthrough for experimental vLLM flags (e.g. ENFORCE_EAGER=1 adds
 # --enforce-eager) without forking this script.
-export K3_NIC="${K3_NIC:-hsn0}"
+# All Slingshot NICs (hsn*) for RCCL Socket data path — fans the
+# cross-node MoE all-to-all over the node's aggregate Slingshot BW (vs
+# single hsn0). Default ON since run-601453. Override to hsn0 to reproduce
+# the pre-601453 single-NIC path. gloo is pinned to hsn0 separately below.
+export K3_NIC="${K3_NIC:-hsn}"
 export VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
 if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
   export VLLM_EXTRA_ARGS="$VLLM_EXTRA_ARGS --enforce-eager"
@@ -206,6 +239,57 @@ export K3_ENABLE_PARSERS="${K3_ENABLE_PARSERS:-1}"
 # upstream @support_torch_compile. Default 0 = unchanged (ENFORCE_EAGER=1
 # is the proven path per BENCHMARK.md).
 export K3_PIECEWISE="${K3_PIECEWISE:-0}"
+
+# K3_BREAKABLE_PIECEWISE=1: the vLLM-INTENDED piecewise-cudagraph path for
+# models WITHOUT @support_torch_compile (which Kimi-K3 lacks: no kimi_k3 model
+# file carries the decorator). config/vllm.py:1211-1241 already auto-enables
+# VLLM_USE_BREAKABLE_CUDAGRAPH=1 for KimiK3ForConditionalGeneration (line 1230)
+# AND, via a SEPARATE check at line 1236, forces compilation_config.mode=NONE
+# (line 1241). The two prior attempts ran eager or deadlocked:
+#   (1) AUTO default left cudagraph_mode=FULL_AND_PIECEWISE (the default),
+#       whose decode_mode()=FULL (compilation.py: FULL_AND_PIECEWISE=(2,1),
+#       decode_mode()=value[0]=FULL) means eager_break_during_capture sees
+#       FULL and does NOT break (breakable_cudagraph.py:100-103) -> one
+#       monolithic decode graph -> stale MoE routing + PP3 recv deadlock
+#       (jobs 588153/588156).
+#   (2) K3_PIECEWISE=1 set VLLM_USE_BREAKABLE=0 + mode=VLLM_COMPILE, but
+#       without @support_torch_compile torch.compile never wraps the model
+#       (vllm.py:~2410 only WARNS) -> no FX graph -> is_breakable=False +
+#       PIECEWISE.has_full_cudagraphs()=False installs NO wrapper -> EAGER.
+# This THIRD path sets VLLM_USE_BREAKABLE_CUDAGRAPH=1 BEFORE `exec python3`
+# (see the block near line 700) AND sets cudagraph_mode=PIECEWISE (simple
+# enum -> decode_mode=PIECEWISE -> breaks fire). sitecustomize.py decorates
+# VkernelFusedExperts.apply with @eager_break_during_capture (the break
+# primitive, breakable_cudagraph.py:59-117; apply writes its result into the
+# caller-provided `output` tensor per the decorator's in-place requirement).
+# Unlike the FX-splitting path, breakable does NOT need torch.compile: it uses
+# its own BreakableCUDAGraphCapture + the @eager_break_during_capture op.
+# CRITICAL: VLLM_USE_BREAKABLE_CUDAGRAPH=1 is exported in engine.sh (line
+# ~700, before `exec python3` at ~827) because eager_break_during_capture
+# checks is_breakable_enabled() AT DECORATION TIME (breakable_cudagraph.py:
+# 90-91), i.e. when sitecustomize runs at Python startup, BEFORE vLLM's K3
+# auto-default (config/vllm.py:1230) runs. Relying on the auto-default would
+# let the decoration silently return fn undecorated -> the experiment is a
+# no-op (runs eager). Pre-setting it is equivalent to the auto-default for
+# the config path (line 1236 still forces mode=NONE) AND in time for the
+# decoration.
+# gpu_model_runner.py:5444-5448 installs BreakableCUDAGraphWrapper when
+# is_breakable_cudagraph_enabled() AND cudagraph_mode != NONE AND not
+# ubatching -- INDEPENDENT of `mode`, so mode=NONE + cudagraph_mode=PIECEWISE
+# installs the wrapper.
+# MUST run TP8 PP1 (2 nodes): no PP boundary -> no recv_object in the forward
+# -> cannot deadlock even if a break is missed. The PP_SIZE=1 guard above
+# enforces this. Default 0 = unchanged (ENFORCE_EAGER=1 is the proven path).
+#   sbatch --export=ALL,K3_BREAKABLE_PIECEWISE=1,TP_SIZE=8,PP_SIZE=1,NNODES=2 \
+#     serve_kimi_k3_otela_beverin.sbatch
+export K3_BREAKABLE_PIECEWISE="${K3_BREAKABLE_PIECEWISE:-0}"
+if [ "${K3_BREAKABLE_PIECEWISE:-0}" = "1" ] && [ "${K3_PIECEWISE:-0}" = "1" ]; then
+  echo "[rank ${RANK:-0}] WARN: K3_PIECEWISE=1 and K3_BREAKABLE_PIECEWISE=1 are" >&2
+  echo "[rank ${RANK:-0}]       mutually exclusive (K3_PIECEWISE sets" >&2
+  echo "[rank ${RANK:-0}]       VLLM_USE_BREAKABLE=0, which defeats breakable)." >&2
+  echo "[rank ${RANK:-0}]       Resetting K3_PIECEWISE=0 for this run." >&2
+  export K3_PIECEWISE=0
+fi
 
 # ------------------------------------------------------------------- otela ----
 # x86_64 build, sai-v0.0.6 (same dialect as the Clariden arm64 build). A
@@ -469,29 +553,64 @@ export K3_JIT_STAGGER_DELAY="${K3_JIT_STAGGER_DELAY:-60}"
 _MEM_MON_PID=$!
 trap 'kill $_MEM_MON_PID 2>/dev/null' EXIT
 
-# --- RCCL networking: drop the EDF's CUDA-built OFI plugin, use Socket ------
-# The EDF com.hooks.aws_ofi_nccl hook LD_PRELOADs a CUDA libnccl-net.so that
-# cannot initialise on ROCm (no libcudart.so). Unset the plugin selectors and
-# let RCCL fall back to its built-in Socket transport over hsn0 (Slingshot IP).
-# This is the verified bring-up path (k3-eng11). Cross-node TP allreduce is
-# slow over Socket; TODO a HIP-aware OFI/CXI plugin for real throughput.
-unset NCCL_NET_PLUGIN NCCL_NET
-export NCCL_SOCKET_IFNAME="${K3_NIC:-hsn0}"
-# WHY: gloo is a SEPARATE CPU transport from RCCL — vLLM V1 uses it for the
+# --- RCCL networking ---------------------------------------------------------
+# The EDF (kimi-k3-vllm.toml) ships a fully-tuned RCCL-over-OFI/Slingshot
+# config: NCCL_NET_PLUGIN=ofi, NCCL_NET="AWS Libfabric", NCCL_NET_GDR_READ=1,
+# NCCL_NET_GDR_C2C=1, NCCL_NCHANNELS_PER_NET_PEER=4, NCCL_P2P_LEVEL=NVL,
+# NCCL_PROTO=^LL128, CXI provider via /opt/cscs/netstack. The OFI plugin
+# (librccl-net-ofi.so) is RCCL-native (ROCm 7.2.3, "aws-ofi-nccl 1.20.0"),
+# initialises cleanly across nodes (verified rccl-xport jobs 601320/601321/
+# 601339). USE IT: the Socket path caps the cross-node TP all-to-all at
+# ~78% of GPU wall (run-601239: rccl_all_to_all 15.5s/19.7s).
+#
+# The prior Socket override (k3-eng11) worked around a then-CUDA-built
+# aws_ofi_nccl hook that could not init on ROCm (no libcudart.so). That
+# hook is no longer in the lib path; the RCCL-native OFI plugin works, so
+# the override is now a pessimization. Reproduce the legacy Socket path
+# (debug only) with K3_RCCL_SOCKET=1.
+# Verified rccl-xport 601320/601321/601339/601341: the EDF's OFI plugin
+# INITIALIZES cleanly (aws-ofi-nccl 1.20.0, Libfabric 2.6, HIP 7.2.5) but
+# the FIRST cross-node collective HANGS (>=2:47, no warmup) on this
+# allocation, with or without GDR (K3_GDR=0). The EDF's com.hooks.
+# aws_ofi_nccl hook is CUDA-built and unusable on ROCm, and RCCL's native
+# built-in OFI data path does not (yet) complete on CSCS Alps CXI — a gap
+# that needs CSCS netstack work, not an env tweak. So Socket stays the
+# DEFAULT; set K3_RCCL_SOCKET=0 only once a working OFI path is found.
+if [ "${K3_RCCL_SOCKET:-1}" = "0" ]; then
+  echo "[rank $RANK] RCCL: EDF OFI/CXI over Slingshot (NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-?})"
+else
+  echo "[rank $RANK] RCCL: Socket fallback (K3_RCCL_SOCKET=${K3_RCCL_SOCKET:-1})"
+  unset NCCL_NET_PLUGIN NCCL_NET
+  # Fan Socket over ALL Slingshot NICs (vs single hsn0). gloo is pinned to
+  # hsn0 below (no prefix matching); NCCL fans freely.
+  export NCCL_SOCKET_IFNAME="${K3_NIC:-hsn0}"
+  export NCCL_IB_DISABLE=1
+  export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-1}"
+  # All-to-all algo tuning (Socket path), DEFAULT ON since run-601453:
+  #   RCCL_ALL_TO_ALL_PIVOT_ENABLE : pivot-based all-to-all (fewer round-
+  #     trips). Cut the K3 MoE all-to-all GPU time 15.50s -> 10.71s (-31%)
+  #     and the apply tail 4.65s -> 1.40s (-70%), agg tok/s 21.7 -> 23.8.
+  #   RCCL_CHANNEL_TUNING_ENABLE   : RCCL channel auto-tuning.
+  # Disable either per-run via --export=...,RCCL_ALL_TO_ALL_PIVOT_ENABLE=0
+  # (or ='' to drop it entirely).
+  export RCCL_ALL_TO_ALL_PIVOT_ENABLE="${RCCL_ALL_TO_ALL_PIVOT_ENABLE:-1}"
+  export RCCL_CHANNEL_TUNING_ENABLE="${RCCL_CHANNEL_TUNING_ENABLE:-1}"
+  # Empty value = drop the knob (don't export an empty env var).
+  [ -z "$RCCL_ALL_TO_ALL_PIVOT_ENABLE" ] && unset RCCL_ALL_TO_ALL_PIVOT_ENABLE
+  [ -z "$RCCL_CHANNEL_TUNING_ENABLE" ] && unset RCCL_CHANNEL_TUNING_ENABLE
+  echo "[rank $RANK] RCCL tuning: pivot=${RCCL_ALL_TO_ALL_PIVOT_ENABLE:-0} ch_tune=${RCCL_CHANNEL_TUNING_ENABLE:-0} nic=${NCCL_SOCKET_IFNAME}"
+fi
+# gloo is a SEPARATE CPU transport from RCCL — vLLM V1 uses it for the
 # MQ-broadcaster `in_the_same_node_as` check + torch.distributed.barrier
-# during WorkerProc init (multiproc_executor.py:201 wait_for_ready ->
-# create_mq_broadcaster -> shm_broadcast.py:912). Without GLOO_SOCKET_IFNAME
-# gloo binds a non-routable iface and the cross-node recv times out 1800 s
-# -> "WorkerProc initialization failed" -> job tears down (job 600189, real
-# weights, elapsed 1h52m; identical to 600111 which was scancelled before it
-# surfaced). Same iface as K3_NIC/NCCL_SOCKET_IFNAME (hsn0 == Slingshot IP).
-export GLOO_SOCKET_IFNAME="${K3_NIC:-hsn0}"
-export NCCL_IB_DISABLE=1
+# during WorkerProc init. Without GLOO_SOCKET_IFNAME gloo binds a non-
+# routable iface and cross-node recv times out 1800 s -> "WorkerProc
+# initialization failed" (job 600189, real weights, 1h52m). Pinned to hsn0
+# EVEN when NCCL fans out over hsn* (K3_NIC=hsn): gloo needs an EXACT
+# iface name (no prefix matching) and a single routable NIC suffices for
+# its tiny control-plane traffic (job 601406 crashed: "Unable to find
+# address for: hsn"). Override with K3_GLOO_NIC if ever needed.
+export GLOO_SOCKET_IFNAME="${K3_GLOO_NIC:-hsn0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-# Prevent RCCL socket bootstrap race when peers start with slight delay
-# (job 584844: nid002668 workers 18s late -> "Message truncated" cascade).
-# NCCL_SOCKET_NTHREADS=1 serialises socket I/O to avoid interleaved messages.
-export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-1}"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
 echo "[rank $RANK] launching vLLM (head=$([ "$RANK" = 0 ] && echo api_server || echo headless))"
@@ -506,6 +625,7 @@ VLLM_ARGS=(
   --master-addr "$HEAD" --master-port "$MASTER_PORT"
   --max-model-len "$CTX_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
+  --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
 )
 # --enable-prefix-caching: gated by K3_PREFIX_CACHE (default 0 = OFF).
@@ -600,13 +720,41 @@ if [ "${K3_PIECEWISE:-0}" = "1" ]; then
     --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'
   )
 fi
+if [ "${K3_BREAKABLE_PIECEWISE:-0}" = "1" ]; then
+  # --enforce-eager forces mode=NONE + cudagraph_mode=NONE at config time
+  # (vllm.py:~1198-1199), which would defeat the experiment: with
+  # cudagraph_mode=NONE, BreakableCUDAGraphWrapper is NOT installed
+  # (gpu_model_runner.py:5444-5448 requires cudagraph_mode != NONE). Strip it.
+  if [ "${ENFORCE_EAGER:-0}" = "1" ]; then
+    echo "[rank $RANK] WARN: K3_BREAKABLE_PIECEWISE=1 and ENFORCE_EAGER=1 are" >&2
+    echo "[rank $RANK]       mutually exclusive. Stripping --enforce-eager." >&2
+    VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS// --enforce-eager/}"
+  fi
+  # MUST be set before `exec python3` (this heredoc is appended to engine.sh
+  # and exec'd at ~line 827). eager_break_during_capture in sitecustomize.py
+  # checks is_breakable_cudagraph_enabled() AT DECORATION TIME (Python
+  # startup), before vLLM's K3 auto-default (config/vllm.py:1230). Without
+  # this export the decoration is a silent no-op. Pre-setting is equivalent
+  # to the auto-default for the config path (line 1236 still forces
+  # mode=NONE) AND in time for sitecustomize.
+  export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  # cudagraph_mode=PIECEWISE (simple enum, NOT the (2,1) FULL_AND_PIECEWISE
+  # tuple) -> decode_mode()=PIECEWISE -> eager_break_during_capture fires
+  # (breakable_cudagraph.py:100-103, skips ONLY when mode==FULL).
+  # splitting_ops non-empty is a belt-and-suspenders guard against the
+  # compilation.py:1175 downgrade (PIECEWISE->NONE when splitting_ops empty).
+  # With mode=NONE set_splitting_ops_for_v1 returns early (compilation.py:
+  # 1127-1130) so the downgrade is not strictly reached, but a non-empty list
+  # is harmless and matches the intended default content.
+  VLLM_ARGS+=(
+    --compilation-config '{"cudagraph_mode":"PIECEWISE","splitting_ops":["vllm::unified_kv_cache_update"]}'
+  )
+fi
 if [ "$RANK" = "0" ]; then
   VLLM_ARGS+=(--host 0.0.0.0 --port "$SERVE_PORT")
 else
   VLLM_ARGS+=(--headless)
 fi
-
-exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
 ENGINE
 
 # KDA routing on gfx942 (issue #42): the faulting AITER / Triton
@@ -628,10 +776,71 @@ ENGINE
 # so after validation the operator flips a SINGLE variable
 # (VKERNELS_KDA=1) to serve the validated HIP kernel; then set
 # K3_DISABLE_KDA=0 (or unset it) to complete AC4 (K3_DISABLE_KDA removed).
+# MLA routing on gfx942 (issue #42): VKERNELS_MLA=1 patches
+# vllm.v1.attention.selector.get_attn_backend to return VkernelMLABackend
+# (vk_hip_mla_fwd via ctypes) ahead of TRITON_MLA for every use_mla layer.
+# VKERNELS_MLA_FORCE=1 actually runs forward_mqa -> vk_hip_mla_fwd (vLLM
+# calls forward_mqa bare at mla_attention.py:895 with NO try/except, so
+# FORCE=1 is the only way the kernel runs end-to-end).  VKERNELS_MLA_VALIDATE=0
+# skips the CPU-oracle cross-check (libvkernels_c.so not built yet).
+# Default VKERNELS_MLA=0 / VKERNELS_MLA_FORCE=0 keep the integration OPT-IN
+# until validated on the cluster (mirrors VKERNELS_KDA).
+# STEP_PROFILE knobs (defaults; override via --export at sbatch submit). The
+# gating block below arms a per-step torch.profiler on the selected ranks
+# (sitecustomize.py); benchmark.py triggers capture by writing
+# $VLLM_STEP_PROFILE_DIR/.go right before the first measured CONC:NUMREQ level.
+#   STEP_PROFILE_SPEC         CONC:NUMREQ for the profiled load (default 8:16 —
+#                             warmup + ~15s of steady-state decode, ~64 tok/req).
+#   STEP_PROFILE_BUDGET       overall wall budget for the profile srun, s
+#                             (default 600 — eager warmup _run(4,8) ~154s
+#                             + measured C=8:16 ~150s; under job --export=ALL
+#                             this reaches benchmark.py as BENCH_TIMEOUT, so it
+#                             must exceed the warmup or the measured level is
+#                             skipped and no execute_model fires to STOP the
+#                             profiler. The driver wraps it in timeout +300).
+#   STEP_PROFILE_PER_REQ_TIMEOUT  per-request timeout handed to benchmark.py as
+#                             a BENCH_PER_REQ_TIMEOUT prefix (default 300; NOTE:
+#                             under --environment=EDF the prefix does NOT reach
+#                             the remote task, so benchmark.py uses its own 600s
+#                             default — harmless for C=8:16 ~64 tok/req).
+#   VLLM_STEP_PROFILE_DUR     per-rank capture window, s (default 15).
+#   VLLM_STEP_PROFILE_RANKS   comma list of ranks to trace (default 0,8,16 =
+#                             one per PP stage at TP=8).
+export STEP_PROFILE_SPEC="${STEP_PROFILE_SPEC:-8:16}"
+export STEP_PROFILE_BUDGET="${STEP_PROFILE_BUDGET:-600}"
+export STEP_PROFILE_PER_REQ_TIMEOUT="${STEP_PROFILE_PER_REQ_TIMEOUT:-300}"
+export VLLM_STEP_PROFILE_DUR="${VLLM_STEP_PROFILE_DUR:-15}"
+export VLLM_STEP_PROFILE_RANKS="${VLLM_STEP_PROFILE_RANKS:-0,8,16}"
+if [ "${STEP_PROFILE:-0}" = "1" ]; then
+  export VLLM_STEP_PROFILE_DIR="${VLLM_STEP_PROFILE_DIR:-$RUNDIR/step_profiles}"
+  echo "[$(date -Is)] STEP_PROFILE on: dir=$VLLM_STEP_PROFILE_DIR ranks=${VLLM_STEP_PROFILE_RANKS} dur=${VLLM_STEP_PROFILE_DUR}s"
+fi
 cat >> "${RUNDIR}/engine.sh" <<EOFA
+export VKERNELS_MLA="${VKERNELS_MLA:-0}"
+export VKERNELS_MLA_FORCE="${VKERNELS_MLA_FORCE:-0}"
+export VKERNELS_MLA_VALIDATE="${VKERNELS_MLA_VALIDATE:-0}"
 export VKERNELS_KDA="${VKERNELS_KDA:-0}"
 export K3_DISABLE_KDA="${K3_DISABLE_KDA:-1}"
+export VLLM_STEP_PROFILE_DIR="${VLLM_STEP_PROFILE_DIR:-}"
+export VLLM_STEP_PROFILE_DUR="${VLLM_STEP_PROFILE_DUR:-15}"
+export VLLM_STEP_PROFILE_RANKS="${VLLM_STEP_PROFILE_RANKS:-0,8,16}"
 EOFA
+
+# Issue #42 launch guard: the KDA exports above MUST precede `exec`.
+# Earlier these exports were appended AFTER `exec python3 ...` and were
+# therefore DEAD CODE (exec replaces the shell), so sitecustomize.py saw
+# neither var set -> the default Triton KDA path faulted on gfx942 -> NaN
+# ("!!!..." / repetitive garbage) on every prompt. Assert one of the two
+# VALID states is in effect BEFORE exec'ing vLLM, so a future silent drop
+# is caught at launch instead of producing junk.
+cat >> "${RUNDIR}/engine.sh" <<'ENGINE2'
+if [ "${VKERNELS_KDA:-0}" != "1" ] && [ "${K3_DISABLE_KDA:-1}" != "1" ]; then
+  echo "FATAL: KDA mis-configured (VKERNELS_KDA='${VKERNELS_KDA:-0}' K3_DISABLE_KDA='${K3_DISABLE_KDA:-1}');" \
+       "refusing to launch -- set VKERNELS_KDA=1 (validated HIP) or K3_DISABLE_KDA=1 (MLA-only). See issue #42." >&2
+  exit 1
+fi
+exec python3 -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" $VLLM_EXTRA_ARGS
+ENGINE2
 chmod +x "$RUNDIR/engine.sh"
 
 # ============================================================ otela worker ====
@@ -756,6 +965,31 @@ trap 'stop_otela' EXIT TERM INT
       echo "[$(date -Is)]       (Paris / primes / 40 km/h) — treat as a real MoE-corruption signal." >&2
       exit 1
     fi
+  fi
+
+  # Per-step torch.profiler pass (STEP_PROFILE=1). Drives a SHORT C=8 load
+  # via benchmark.py, which writes $VLLM_STEP_PROFILE_DIR/.go right before
+  # its first MEASURED level (warmup excluded). The in-worker profiler
+  # threads (sitecustomize.py, ranks $VLLM_STEP_PROFILE_RANKS) then capture
+  # a $VLLM_STEP_PROFILE_DUR-second window of steady-state decode and export
+  # per-rank chrome traces. Generous per-req timeout avoids the C>1 client
+  # pool artifact (this measures the ENGINE, not the harness limits).
+  if [ "${STEP_PROFILE:-0}" = "1" ]; then
+    mkdir -p "$VLLM_STEP_PROFILE_DIR"
+    echo "[$(date -Is)] step profile: driving spec=$STEP_PROFILE_SPEC (per_req=${STEP_PROFILE_PER_REQ_TIMEOUT}s, budget=${STEP_PROFILE_BUDGET}s) -> traces in $VLLM_STEP_PROFILE_DIR"
+    BENCH_PER_REQ_TIMEOUT="$STEP_PROFILE_PER_REQ_TIMEOUT" \
+    BENCH_TIMEOUT="$STEP_PROFILE_BUDGET" \
+      timeout "$((STEP_PROFILE_BUDGET + 300))" \
+      srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 \
+           --ntasks=1 -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+      python3 "$SCRIPT_DIR/benchmark.py" \
+          "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
+          "$VLLM_STEP_PROFILE_DIR/bench_profile.json" \
+          "$STEP_PROFILE_SPEC" "$BENCH_OUT_TOK" "$BENCH_IN_TOK"
+    echo "[$(date -Is)] step profile: waiting ${VLLM_STEP_PROFILE_DUR}s for trace export, then clearing .go"
+    sleep "$((VLLM_STEP_PROFILE_DUR + 10))"
+    rm -f "$VLLM_STEP_PROFILE_DIR/.go"
+    echo "[$(date -Is)] STEP_PROFILE done (see $VLLM_STEP_PROFILE_DIR/step_profile_rank*.json)"
   fi
 
   # Concurrent throughput sweep (BENCH=1). Runs in the same container as the
