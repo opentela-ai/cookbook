@@ -82,6 +82,83 @@ contribution makes work) and should become the default serving
 configuration. The C=32/C=64 timeout is a `BENCH_PER_REQ_TIMEOUT`/
 `max_num_seqs` harness limit, not a path defect.
 
+### Per-kernel profile — jobs 603394 (eager) vs 603395 (breakable)
+
+Apples-to-apples re-run of the **matched C=8, N=16** level with
+`LOAD_FORMAT=dummy + GEN_CORRECTNESS_SMOKE=1` and `STEP_PROFILE=1`
+(torch.profiler, 20 s steady-state capture, ranks 0/8/16). Same code in
+both jobs — only `K3_BREAKABLE_PIECEWISE=1` (and the resulting
+`VLLM_USE_BREAKABLE_CUDAGRAPH=1`) toggled. K3 has **93 hidden layers,
+PP=3 → 31 layers/PP**; PP0 (rank 0) is the pipeline bottleneck.
+
+**Throughput + latency (C=8, N=16, out=256, in≈50):**
+
+| job | path | wall | agg tok/s | per-req | lat p50 | lat max |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 603394 | eager | 162.2 s | 25.30 | 3.60 | 92.0 s | 92.0 s |
+| 603395 | breakable | 116.4 s | **35.20** | **4.70** | **62.5 s** | 62.5 s |
+| | **Δ** | **1.39×** | **1.39×** | **1.31×** | **1.47×** | |
+
+**Per-step breakdown on the PP0 gate (31 layers/step, wall = C/agg):**
+
+| component | eager (603394) | breakable (603395) | Δ |
+|:---|:---:|:---:|:---:|
+| wall / step | 316.8 ms | 227.3 ms | **1.39×** |
+| MoE / step (31 × `moe:vkernel_apply` mean) | 130.2 ms (41%) | 122.6 ms (54%) | 0.94× (unchanged) |
+| non-MoE / step (wall − MoE) | 186.6 ms (59%) | 104.7 ms (46%) | **1.78× (captured graph)** |
+
+**The entire 1.4× win is in the non-MoE part** (the captured
+attention+MLP+sampling majority runs as a graph replay with no per-op
+Python dispatch, and under breakable it is partially hidden under PP0's
+MoE sync waits). **The MoE region is unchanged (0.94×)** — it runs the
+same `VkernelFusedExperts.apply` eager-break body in both paths.
+
+**Per-call MoE means (µs, all threads on the traced rank):**
+
+| rank | path | `moe:vkernel_apply` | `cpu_copy` | `cpu_copy` % | `cpu_align` | `gpu_copy` | `launch` |
+|:---:|:---:|---:|---:|:---:|---:|---:|---:|
+| 0  PP0 | eager | 4199.4 | 4185.1 | **100%** | 83.5 | 174.1 | 238.7 |
+| 8  PP1 | eager |  242.6 |  214.5 | 88% | 85.5 | 175.6 | 237.8 |
+| 16 PP2 | eager |  234.4 |  189.5 | 81% | 86.9 | 175.4 | 254.7 |
+| 0  PP0 | breakable | 3953.3 | 3844.4 | **97%** | 110.5 | 153.0 | 301.6 |
+| 8  PP1 | breakable |  758.3 |  660.3 | 87% | 113.4 | 155.2 | 281.1 |
+| 16 PP2 | breakable |  802.0 |  727.2 | 91% | 98.5 | 148.8 | 281.0 |
+
+**Findings:**
+
+1. **PP0 is the pipeline gate** — its `moe:vkernel_apply` mean is
+   **17.3× (eager) / 5.2× (breakable)** slower than PP1/PP2. PP0 computes
+   the expert routing (`topk_ids`) on GPU and pays the full
+   GPU→host sync; PP1/PP2 receive the routing via `recv_object` (already
+   on host) and only do a ~190–760 µs memcpy.
+2. **`moe:apply.cpu_copy` dominates PP0's MoE (97–100%)** — it is the
+   `topk_ids.contiguous().view(-1).cpu().numpy()` host round-trip, and its
+   ~4 ms duration is dominated by **waiting for the dispatch all-to-all**
+   that produced `topk_ids`. `gpu_copy`/`launch`/`cpu_align` are each
+   <1%–8% of MoE.
+3. **The MoE region is unchanged between paths** (4199→3953 µs, 0.94×),
+   so the 1.4× throughput gain is entirely the non-MoE captured graph.
+4. **PP1/PP2 regressed ~3× under breakable** (234→758/802 µs) — currently
+   hidden under PP0's gate, but it becomes the new floor once PP0 is fixed.
+
+### Next optimization lever
+
+**Eliminate the PP0 `topk_ids.cpu()` host round-trip** by keeping the
+routing metadata on-device (a GPU `moe_align`, or a fused dispatch kernel
+that consumes `topk_ids` without a host copy). This targets the PP0 gate
+directly: the eager-break body's GPU work (`launch`) is only ~240–300 µs
+per layer (~7–9 ms/step), so removing the ~4 ms/layer sync could cut the
+MoE region by ~15× — **provided** the PP1/PP2 breakable regression is
+also addressed, otherwise it (760–800 µs/layer ≈ 24 ms/step) simply
+becomes the new gate. The PP0 `cpu_copy` sync is the single highest-value
+follow-up.
+
+Trace artifacts: `run-603394/step_profiles/step_profile_rank{0,8,16}.json`
+(eager) and `run-603395/step_profiles/step_profile_rank{0,8,16}.json`
+(breakable) under `$B=/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin`;
+`trace_rank.py` (per-rank per-call means) and `trace_cmp2.py`
+(head-to-head) in this directory.
+
 ## CUDA Graphs: NOT viable on gfx942 with PP=3 (SUPERSEDED — full-graph path; see "Breakable piecewise cudagraph" above)
 
 Tested across jobs 588153, 588154, 588156 with:
