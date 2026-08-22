@@ -175,7 +175,14 @@ echo "[$(date -Is)] BUILD_DONE"
 cat > "$RUNDIR/run.sh" <<RUN
 #!/bin/bash
 set -uo pipefail
-export LD_LIBRARY_PATH="$RUNDIR:$CRAY_OFI/lib64:\${LD_LIBRARY_PATH:-}"
+# /usr/lib/x86_64-linux-gnu EARLY: enroot bind-mounts the host's /usr/lib64
+# (SLES libcurl 4.8.0/OpenLDAP 2.4, libjson-c.so.4) into the container, and
+# ldconfig adds it to the cache at start — shadowing the image's libcurl4t64
+# (OpenLDAP 2.5) + libjson-c5. LD_LIBRARY_PATH is searched BEFORE ld.so.cache,
+# so listing the image's lib dir here makes libfabric.so.1 -> libcurl.so.4 /
+# libjson-c.so.5 resolve to the image's 2.5 closure (present) instead of the
+# host's 2.4 (libldap_r-2.4.so.2/liblber-2.4.so.2 missing; jobs 603818/604467).
+export LD_LIBRARY_PATH="$RUNDIR:/usr/lib/x86_64-linux-gnu:$CRAY_OFI/lib64:\${LD_LIBRARY_PATH:-}"
 # NCCL_NET/RCCL_NET select a network *type* (IB/Socket) in this RCCL 2.27.7
 # build; they do NOT load the external plugin (proven: RCCL still tried
 # IB+Socket with NCCL_NET=<path> set). The plugin is loaded below as

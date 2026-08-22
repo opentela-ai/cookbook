@@ -72,6 +72,15 @@ echo "[$(date -Is)] STEP 3: install system libs the minimal base lacks (unpriv c
 # zlib1g/libgcc-s1; the 22.04 SRC_ROOT is MISSING libtbb.so.12 + libunwind.so.1,
 # so apt (auto + transitive) is more reliable than hand-copying. 24.04's newer
 # libs are forward-compatible with the 22.04-built .so (same SONAMEs).
+# Also the bespoke python3.12 + torch/vllm runtime deps the 24.04 base lacks
+# (found via in-chroot ldd of python3.12 + lib-dynload + torch/lib + vllm;
+# jobs 604467 failed rc=127 on libexpat.so.1 before this fix):
+#  - libexpat1        python3.12 startup (binary links libexpat.so.1 directly)
+#  - libopenmpi3t64   torch built WITH MPI (libtorch_cpu.so NEEDEDs libmpi.so.40
+#                       + libmpi_cxx.so.40; hard dep even though smoke=RCCL)
+#  - libelf1t64       torch/ROCm GPU code-object loading (libtorch*.so, _C.abi3)
+#  - libnsl2/libtirpc3t64   python nis ext (soft; cheap to include)
+#  - libreadline8t64        python readline ext (soft; cheap to include)
 cp /etc/resolv.conf "$NEW/etc/resolv.conf" 2>/dev/null || true
 $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -qq 2>&1 | tail -3
 $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
@@ -79,6 +88,8 @@ $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::S
     libsqlite3-0 libzstd1 libffi8 libgomp1 libatomic1 libssl3t64 \
     ca-certificates \
     libcurl4t64 libjson-c5 \
+    libexpat1 libnsl2 libtirpc3t64 libreadline8t64 libelf1t64 \
+    libopenmpi3t64 \
     >/tmp/apt24.log 2>&1 || { echo "APT FAILED:"; tail -20 /tmp/apt24.log; rm -f "$NEW/etc/resolv.conf"; exit 1; }
 rm -f "$NEW/etc/resolv.conf"; rm -rf "$NEW/var/lib/apt/lists/"*
 echo "  system libs installed OK"
@@ -119,13 +130,21 @@ echo "  layered: /opt/rocm->rocm-7.2.3, python3.12+stdlib, dist-packages($(du -s
 echo "[$(date -Is)] STEP 5: verify glibc >= 2.38 + python imports the bespoke stack"
 echo "  glibc: $(strings "$NEW/lib/x86_64-linux-gnu/libc.so.6" 2>/dev/null | grep -m1 'GNU C Library')"
 # /etc/environment is read by PAM, not the unpriv chroot; set LD_LIBRARY_PATH.
-$UCH env LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib: \
-    /usr/bin/python3.12 - <<'PYC' 2>&1 | tail -6 || echo "  (import check non-fatal)"
+# FATAL: python3.12 must START (needs libexpat.so.1) AND import the bespoke
+# stack (torch needs libmpi.so.40+libmpi_cxx.so.40, libelf.so.1; vllm needs
+# libssl.so.3). The G23_REBASE_DLOPEN_OK test below copies the HOST /usr/lib64
+# closure (incl. libexpat) and would MASK a startup/import gap, so this MUST
+# gate the build: a missing runtime dep fails here instead of shipping a
+# broken sqsh that only surfaces at smoke time (cf. job 604467 rc=127).
+impout=$($UCH env LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib: \
+    /usr/bin/python3.12 - <<'PYC' 2>&1)
 import torch, vllm, vllm.models.kimi_k3
 print("IMPORT_OK torch", torch.__version__,
       "| vllm", getattr(__import__("vllm"), "__version__", "?"),
       "| kimi_k3 OK")
 PYC
+echo "$impout" | tail -6
+echo "$impout" | grep -q "IMPORT_OK" || { echo "FATAL: python3.12 import failed (missing runtime dep?) — see above; do NOT ship this sqsh"; exit 1; }
 # The decisive check: does the host Cray libfabric now dlopen (glibc wall gone)?
 # The EDF mounts /opt/cray/libfabric at RUNTIME; in this build chroot it is NOT
 # mounted, so copy the host Cray libfabric + its full /usr/lib64 closure into the
