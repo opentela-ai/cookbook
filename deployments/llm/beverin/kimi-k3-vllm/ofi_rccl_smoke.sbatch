@@ -175,14 +175,21 @@ echo "[$(date -Is)] BUILD_DONE"
 cat > "$RUNDIR/run.sh" <<RUN
 #!/bin/bash
 set -uo pipefail
-# /usr/lib/x86_64-linux-gnu EARLY: enroot bind-mounts the host's /usr/lib64
-# (SLES libcurl 4.8.0/OpenLDAP 2.4, libjson-c.so.4) into the container, and
-# ldconfig adds it to the cache at start — shadowing the image's libcurl4t64
-# (OpenLDAP 2.5) + libjson-c5. LD_LIBRARY_PATH is searched BEFORE ld.so.cache,
-# so listing the image's lib dir here makes libfabric.so.1 -> libcurl.so.4 /
-# libjson-c.so.5 resolve to the image's 2.5 closure (present) instead of the
-# host's 2.4 (libldap_r-2.4.so.2/liblber-2.4.so.2 missing; jobs 603818/604467).
-export LD_LIBRARY_PATH="$RUNDIR:/usr/lib/x86_64-linux-gnu:$CRAY_OFI/lib64:\${LD_LIBRARY_PATH:-}"
+# LD_LIBRARY_PATH ORDER (job 604480 root cause): /usr/lib/x86_64-linux-gnu
+# must be LAST, not first. The image ships an OLD libhsa-runtime64.so.1.11.0
+# there (leftover libhsa-runtime64-1 from the 22.04 bespoke-stack copy, dpkg
+# /var/lib/dpkg/info/libhsa-runtime64-1:amd64.list) that SHADOWS ROCm 7.2.3's
+# 1.18.70203 at /opt/rocm/lib — so libamdhip64.so.7's
+# hsa_amd_memory_get_preferred_copy_engine@ROCR_1 went unresolved and
+# import torch failed. $CRAY_OFI/lib64 is FIRST (after $RUNDIR) for
+# libfabric.so.1 -> Cray 1.29.1 (cxi builtin); it has NO libhsa (verified), so
+# it does not shadow ROCm. /opt/rocm/lib is EXPLICIT (not just inherited) so
+# the HSA runtime + libamdhip64.so.7 win even if the inherited env is empty.
+# /usr/lib/x86_64-linux-gnu is LAST but STILL in LD_LIBRARY_PATH, so the image's
+# 2.5 libcurl/libssh/libldap/libjson-c closure wins over the host's 2.4
+# (bind-mounted /usr/lib64, in ld.so.cache, searched AFTER LD_LIBRARY_PATH
+# — jobs 603818/604467).
+export LD_LIBRARY_PATH="$RUNDIR:$CRAY_OFI/lib64:/opt/rocm/lib:\${LD_LIBRARY_PATH:-}:/usr/lib/x86_64-linux-gnu"
 # NCCL_NET/RCCL_NET select a network *type* (IB/Socket) in this RCCL 2.27.7
 # build; they do NOT load the external plugin (proven: RCCL still tried
 # IB+Socket with NCCL_NET=<path> set). The plugin is loaded below as
