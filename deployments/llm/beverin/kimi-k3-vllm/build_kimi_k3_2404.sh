@@ -26,7 +26,7 @@ OLD_SQSH=/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k
 BUILD=/capstor/scratch/cscs/xyao/kimi-k3-vllm-beverin/2404-rebuild
 SRC_ROOT="$BUILD/src-rootfs"          # the 22.04 bespoke stack (extracted once)
 NEW="$BUILD/new-rootfs"               # the 2404 image under construction
-NEW_SQSH=/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3-2404.x86_64.sqsh
+NEW_SQSH="${NEW_SQSH:-/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3-2404.x86_64.sqsh}"
 mkdir -p "$BUILD" "$(dirname "$NEW_SQSH")" "$BUILD/logs"
 LOG="$BUILD/logs/build-2404.out"
 exec > >(tee -a "$LOG") 2>&1
@@ -77,7 +77,9 @@ $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::S
 $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
     libnuma1 libdrm2 libdrm-amdgpu1 librdmacm1 libtbb12 libunwind8 \
     libsqlite3-0 libzstd1 libffi8 libgomp1 libatomic1 libssl3t64 \
-    ca-certificates >/tmp/apt24.log 2>&1 || { echo "APT FAILED:"; tail -20 /tmp/apt24.log; rm -f "$NEW/etc/resolv.conf"; exit 1; }
+    ca-certificates \
+    libcurl4t64 libssh-4t64 libldap-2.5-0 libjson-c5 \
+    >/tmp/apt24.log 2>&1 || { echo "APT FAILED:"; tail -20 /tmp/apt24.log; rm -f "$NEW/etc/resolv.conf"; exit 1; }
 rm -f "$NEW/etc/resolv.conf"; rm -rf "$NEW/var/lib/apt/lists/"*
 echo "  system libs installed OK"
 
@@ -85,20 +87,28 @@ echo "[$(date -Is)] STEP 4: layer bespoke 22.04 stack onto the 24.04 base"
 # ROCm 7.2.3 (custom RCCL 1.0.70203, MIOpen, hipblaslt, aiter) - ~20G.
 # Replace any base /opt/rocm with a symlink to the real /opt/rocm-7.2.3 so
 # /etc/environment's LD_LIBRARY_PATH=/opt/rocm/lib resolves to the custom libs.
-rm -rf "$NEW/opt/rocm" "$NEW/opt/rocm-7.2.3"
-cp -a "$SRC_ROOT/opt/rocm-7.2.3" "$NEW/opt/"
-ln -s /opt/rocm-7.2.3 "$NEW/opt/rocm"
+if [ ! -f "$NEW/opt/rocm-7.2.3/lib/libamdhip64.so" ]; then
+  rm -rf "$NEW/opt/rocm" "$NEW/opt/rocm-7.2.3"
+  cp -a "$SRC_ROOT/opt/rocm-7.2.3" "$NEW/opt/"
+  ln -s /opt/rocm-7.2.3 "$NEW/opt/rocm"
+else echo "  /opt/rocm-7.2.3 already copied, reusing"; fi
 # Python 3.12 interpreter + stdlib (EXACT ABI for the bespoke .so extensions;
 # the base has none, and 24.04's python3.12 is a different patch build).
 mkdir -p "$NEW/usr/bin"
 cp -a "$SRC_ROOT/usr/bin/python3.12" "$NEW/usr/bin/python3.12"
 ln -sf python3.12 "$NEW/usr/bin/python3"      # vllm shebang is #!/usr/bin/python3
-rm -rf "$NEW/usr/lib/python3.12"; mkdir -p "$NEW/usr/lib/python3.12"
-cp -a "$SRC_ROOT/usr/lib/python3.12/." "$NEW/usr/lib/python3.12/"
+if [ ! -d "$NEW/usr/lib/python3.12/encodings" ]; then
+  rm -rf "$NEW/usr/lib/python3.12"; mkdir -p "$NEW/usr/lib/python3.12"
+  cp -a "$SRC_ROOT/usr/lib/python3.12/." "$NEW/usr/lib/python3.12/"
+else echo "  python3.12 stdlib already copied, reusing"; fi
 # Bespoke site-packages: vLLM fork + torch 2.11 + triton + kimi_k3 + deps (~7G).
-rm -rf "$NEW/usr/local/lib/python3.12"
-mkdir -p "$NEW/usr/local/lib/python3.12"
-cp -a "$SRC_ROOT/usr/local/lib/python3.12/." "$NEW/usr/local/lib/python3.12/"
+if [ -f "$NEW/usr/local/lib/python3.12/dist-packages/vllm/__init__.py" ] && \
+   [ -f "$NEW/usr/local/lib/python3.12/dist-packages/torch/__init__.py" ]; then
+  echo "  dist-packages already copied (vllm+torch present), reusing"
+else
+  rm -rf "$NEW/usr/local/lib/python3.12"; mkdir -p "$NEW/usr/local/lib/python3.12"
+  cp -a "$SRC_ROOT/usr/local/lib/python3.12/." "$NEW/usr/local/lib/python3.12/"
+fi
 # Bespoke CLIs (vllm, etc.) - merge over the base's (minimal) /usr/local/bin.
 mkdir -p "$NEW/usr/local/bin"
 cp -a "$SRC_ROOT/usr/local/bin/." "$NEW/usr/local/bin/" 2>/dev/null || true

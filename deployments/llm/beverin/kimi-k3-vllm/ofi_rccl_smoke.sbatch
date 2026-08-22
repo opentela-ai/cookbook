@@ -120,14 +120,16 @@ else
   exit 2
 fi
 echo "[build] ldd fabric:"; ldd "$RUNDIR/librccl-net-ofi.so" 2>/dev/null | grep -i fabric || true
-# libfabric.so.1 (Cray 1.29.1) NEEEDS libcxi.so.1, a host DSO at /usr/lib64
-# that the EDF does NOT mount into the container. Without it the plugin's
-# dlopen fails there with "libcxi.so.1: cannot open shared object file" and
-# RCCL silently falls back to the built-in Socket transport (job 603818:
-# every cross-node channel went "via NET/Socket" despite FI_PROVIDER=cxi).
-# Copy the real libcxi.so.1.* into $RUNDIR and recreate the .so / .so.1
-# symlinks; run.sh prepends $RUNDIR to LD_LIBRARY_PATH so libfabric finds
-# them in-container. (Runs on the head host where /usr/lib64 is present.)
+# On the glibc-2.39 rebased image the GLIBC_2.38 wall is GONE: the mounted
+# Cray libfabric 1.29.1 + libcxi load natively (jobs 603818/603820 were the
+# glibc-2.35 wall). The rebased image also apt-installed the Cray libfabric
+# -> libcurl -> {libssh, OpenLDAP 2.5, krb5} transitive closure
+# (libcurl4t64 libssh-4t64 libldap-2.5-0 libjson-c5 + deps), so at runtime
+# the ONLY host DSO the plugin still cannot get from the container is
+# libcxi.so.1 (Cray-only; not in any Ubuntu archive). Copy the real
+# libcxi.so.1.* into $RUNDIR (first on LD_LIBRARY_PATH) so libfabric finds
+# it in-container; run.sh's in-container ldd names any still-missing dep.
+# (Runs on the head host where /usr/lib64 is present.)
 CXI_SRC=\$(ls /usr/lib64/libcxi.so.1.* 2>/dev/null | head -1)
 if [ -n "\$CXI_SRC" ]; then
   cp -L "\$CXI_SRC" "$RUNDIR/libcxi.so.1.5.0"
@@ -138,15 +140,7 @@ if [ -n "\$CXI_SRC" ]; then
 else
   echo "[build] WARN: libcxi.so.1.* not found under /usr/lib64 - plugin will fail to dlopen in-container" >&2
 fi
-# OpenLDAP 2.4 trio: host Cray libfabric -> libcurl -> {libldap_r-2.4,
-# liblber-2.4, libsasl2.so.3}. The container ships OpenLDAP 2.5 (different
-# SONAME), so the host libcurl cannot resolve in-image -> "libldap_r-2.4.so.2:
-# cannot open" (job 603820) -> RCCL silently falls back to Socket. Copy the
-# host trio into $RUNDIR (first on LD_LIBRARY_PATH). An in-container ldd in
-# run.sh names any LATER gap so we stop guessing.
-cp -L /usr/lib64/libldap_r-2.4.so.2.10.9 "$RUNDIR/" 2>/dev/null && ln -sf libldap_r-2.4.so.2.10.9 "$RUNDIR/libldap_r-2.4.so.2" && echo "[build] copied libldap_r-2.4.so.2.10.9 (+soname)"
-cp -L /usr/lib64/liblber-2.4.so.2.10.9 "$RUNDIR/" 2>/dev/null && ln -sf liblber-2.4.so.2.10.9 "$RUNDIR/liblber-2.4.so.2" && echo "[build] copied liblber-2.4.so.2.10.9 (+soname)"
-cp -L /usr/lib64/libsasl2.so.3.0.0 "$RUNDIR/" 2>/dev/null && ln -sf libsasl2.so.3.0.0 "$RUNDIR/libsasl2.so.3" && echo "[build] copied libsasl2.so.3.0.0 (+soname)"
+"
 BUILD
 chmod +x "$RUNDIR/build.sh"
 

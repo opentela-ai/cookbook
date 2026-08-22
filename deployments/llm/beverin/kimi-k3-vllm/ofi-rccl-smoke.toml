@@ -1,23 +1,35 @@
 # OFI/CXI RCCL net-plugin smoke test on Beverin MI300A (gfx942).
 #
-# Reuses the kimi-k3-vllm image on PURPOSE: the point is to exercise the EXACT
-# RCCL that serve_kimi_k3_otela_beverin.sbatch runs (RCCL 1.0.70203 /
-# NCCL-compat 2.27.7, baked at /opt/rocm-7.2.3). The vkernels plugin
-# (plugins/rccl-net-ofi) redeclares the RCCL net-plugin ABI locally and links
-# libfabric alone, so whether RCCL 1.0.70203's loader accepts its v-table is
-# the make-or-break question for the beverin integration — it can only be
-# answered by loading the .so inside this image.
+# Runs on the glibc-2.39 REBASED image (build_kimi_k3_2404.sh, issue #19):
+# the original 22.04/glibc-2.35 image could not load the host Cray libfabric
+# 1.29.1 + libcxi at all (GLIBC_2.38 VERNEED bound to libc.so.6, commit
+# e8ec777), so RCCL silently fell back to Socket on every cross-node channel
+# (jobs 603818/603820). The rebased image is ubuntu:24.04/glibc-2.39 + the
+# ENTIRE bespoke 22.04 stack (custom ROCm 7.2.3, vLLM fork, torch 2.11,
+# kimi_k3) copied unchanged, PLUS apt libcurl4t64 libssh-4t64 libldap-2.5-0
+# libjson-c5 (the Cray libfabric -> libcurl -> {libssh,OpenLDAP 2.5,krb5}
+# transitive closure), so at runtime the ONLY host DSO the plugin still needs
+# copied is libcxi.so.1 (Cray-only; not in any Ubuntu archive). Everything
+# else (libcurl, libssl3, libcrypto3, libldap-2.5, libjson-c, libnl-3,
+# libatomic, the krb5 chain) resolves from the container's own 24.04 libs.
 #
-# /opt/cray/libfabric (1.29.1, has the cxi provider BUILTIN) is mounted into
-# the container: the image only ships libfabric 1.14.0 (no cxi), so the plugin
-# needs the Cray libfabric at both BUILD time (rdma/fabric.h headers) and
-# RUN time (libfabric.so.1.29.1 + the cxi provider). It is mounted read-write
-# like the other EDF binds; the plugin only reads it.
+# The point is to exercise the EXACT RCCL that serve_kimi_k3_otela_beverin.sbatch
+# runs (RCCL 1.0.70203 / NCCL-compat 2.27.7, baked at /opt/rocm-7.2.3). The
+# vkernels plugin (plugins/rccl-net-ofi) redeclares the RCCL net-plugin ABI
+# locally and links libfabric alone; whether RCCL 1.0.70203's loader accepts
+# its v6/v7-style 11-field v-table (no getDeviceMR/regHandle/flush) is the
+# make-or-break question for the beverin integration -- answerable only by
+# loading the .so inside this image now that the glibc wall is gone.
+#
+# /opt/cray/libfabric (1.29.1, cxi provider BUILTIN) is still mounted into the
+# container: the rebased image inherits ROCm 7.2.3's libfabric 1.14.0 (no cxi),
+# so the plugin needs the Cray libfabric at both BUILD time (rdma/fabric.h
+# headers) and RUN time (libfabric.so.1.29.1 + the cxi provider).
 #
 # This EDF is for the standalone smoke (ofi_rccl_smoke.sbatch) and is
 # intentionally separate from kimi-k3-vllm.toml so the proven serving recipe
 # is untouched until the smoke passes.
-image = "/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3.x86_64.sqsh"
+image = "/capstor/scratch/cscs/xyao/.edf_imagestore/vllm+vllm-openai-rocm+kimi-k3-2404.x86_64.sqsh"
 
 mounts = [
   "/capstor:/capstor",
