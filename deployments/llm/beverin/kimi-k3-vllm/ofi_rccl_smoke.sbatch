@@ -142,7 +142,6 @@ if [ -n "\$CXI_SRC" ]; then
 else
   echo "[build] WARN: libcxi.so.1.* not found under /usr/lib64 - plugin will fail to dlopen in-container" >&2
 fi
-"
 BUILD
 chmod +x "$RUNDIR/build.sh"
 
