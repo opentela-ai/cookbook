@@ -1,0 +1,7 @@
+GLIBC_2.38 {
+  global:
+    __isoc23_fscanf;
+    __isoc23_sscanf;
+    __isoc23_strtol;
+    __isoc23_strtoul;
+};
