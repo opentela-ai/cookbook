@@ -78,7 +78,7 @@ $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::S
     libnuma1 libdrm2 libdrm-amdgpu1 librdmacm1 libtbb12 libunwind8 \
     libsqlite3-0 libzstd1 libffi8 libgomp1 libatomic1 libssl3t64 \
     ca-certificates \
-    libcurl4t64 libssh-4t64 libldap-2.5-0 libjson-c5 \
+    libcurl4t64 libjson-c5 \
     >/tmp/apt24.log 2>&1 || { echo "APT FAILED:"; tail -20 /tmp/apt24.log; rm -f "$NEW/etc/resolv.conf"; exit 1; }
 rm -f "$NEW/etc/resolv.conf"; rm -rf "$NEW/var/lib/apt/lists/"*
 echo "  system libs installed OK"

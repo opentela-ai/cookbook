@@ -124,7 +124,9 @@ echo "[build] ldd fabric:"; ldd "$RUNDIR/librccl-net-ofi.so" 2>/dev/null | grep 
 # Cray libfabric 1.29.1 + libcxi load natively (jobs 603818/603820 were the
 # glibc-2.35 wall). The rebased image also apt-installed the Cray libfabric
 # -> libcurl -> {libssh, OpenLDAP 2.5, krb5} transitive closure
-# (libcurl4t64 libssh-4t64 libldap-2.5-0 libjson-c5 + deps), so at runtime
+# (libcurl4t64 libjson-c5 + deps: libcurl4t64 pulls libssh-4, libldap2,
+# libgssapi-krb5-2, libk5crypto3, libssl3t64, libnghttp2-14, libpsl5t64,
+# libbrotli1, libidn2-0, librtmp1, libzstd1 -- the whole noble closure), so at runtime
 # the ONLY host DSO the plugin still cannot get from the container is
 # libcxi.so.1 (Cray-only; not in any Ubuntu archive). Copy the real
 # libcxi.so.1.* into $RUNDIR (first on LD_LIBRARY_PATH) so libfabric finds
