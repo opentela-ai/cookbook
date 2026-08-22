@@ -80,7 +80,15 @@ echo "[$(date -Is)] STEP 3: install system libs the minimal base lacks (unpriv c
 #                       + libmpi_cxx.so.40; hard dep even though smoke=RCCL)
 #  - libelf1t64       torch/ROCm GPU code-object loading (libtorch*.so, _C.abi3)
 #  - libnsl2/libtirpc3t64   python nis ext (soft; cheap to include)
-#  - libreadline8t64        python readline ext (soft; cheap to include)
+# NOT installed: libreadline8t64 (+readline-common, pulled as its dep). Its
+# postinst FAILS in this unpriv chroot (dpkg-divert usr-is-merged quirk + the
+# install-info trigger) and, while in the apt list, its configure aborts the
+# whole install (E: dpkg 1). DROPPED because apt UNPACKED the .so into $NEW
+# anyway and libc-bin's trigger ran ldconfig, so
+# /usr/lib/x86_64-linux-gnu/libreadline.so.8 is in the cache — bash and
+# `import readline` work without the alternatives. Re-add (touch
+# $NEW/usr/share/info/dir; dpkg --force-all --configure readline-common) only
+# if a recipe needs the readline alternatives.
 cp /etc/resolv.conf "$NEW/etc/resolv.conf" 2>/dev/null || true
 $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root update -qq 2>&1 | tail -3
 $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
@@ -88,8 +96,7 @@ $UCH env TMPDIR=/tmp HOME=/root DEBIAN_FRONTEND=noninteractive apt-get -o APT::S
     libsqlite3-0 libzstd1 libffi8 libgomp1 libatomic1 libssl3t64 \
     ca-certificates \
     libcurl4t64 libjson-c5 \
-    libexpat1 libnsl2 libtirpc3t64 libreadline8t64 libelf1t64 \
-    libopenmpi3t64 \
+    libexpat1 libnsl2 libtirpc3t64 libelf1t64 libopenmpi3t64 \
     >/tmp/apt24.log 2>&1 || { echo "APT FAILED:"; tail -20 /tmp/apt24.log; rm -f "$NEW/etc/resolv.conf"; exit 1; }
 rm -f "$NEW/etc/resolv.conf"; rm -rf "$NEW/var/lib/apt/lists/"*
 echo "  system libs installed OK"
