@@ -201,9 +201,16 @@ PYC2
   rm -rf "$NEW/tmp/ldtest"
 fi
 
-echo "[$(date -Is)] STEP 6: mksquashfs the new image (zstd) -> $NEW_SQSH"
+echo "[$(date -Is)] STEP 6: mksquashfs the new image (zstd, no-xattrs, level 3) -> $NEW_SQSH"
 rm -f "$NEW_SQSH"
-mksquashfs "$NEW" "$NEW_SQSH" -comp zstd -noappend >/tmp/sqfs.log 2>&1 || { echo "MKSQUASHFS FAILED:"; tail -12 /tmp/sqfs.log; exit 1; }
+# -no-xattrs: skip per-file getfattr (system.posix_acl_*, lustre.lov) — on
+#   Lustre each xattr is a metadata RPC that starves the 64 compressor threads
+#   (build pid 118231 mksquashfs spent ~18min mostly on "Unrecognised xattr
+#   prefix" reads at only ~245% CPU). enroot handles perms at runtime; ACLs/
+#   xattrs in the sqsh are not needed. -Xcompression-level 3: ~5-10x faster
+#   than the zstd default (15-19) for a modestly larger sqsh (still << 29G
+#   original) — staging at 891 MB/s is unaffected.
+mksquashfs "$NEW" "$NEW_SQSH" -comp zstd -noappend -no-xattrs -Xcompression-level 3 >/tmp/sqfs.log 2>&1 || { echo "MKSQUASHFS FAILED:"; tail -12 /tmp/sqfs.log; exit 1; }
 ls -lh "$NEW_SQSH"
 echo "[$(date -Is)] DONE. New image: $NEW_SQSH"
 echo "  Next: re-point kimi-k3-vllm.toml + ofi-rccl-smoke.toml 'image =' to this,"
