@@ -143,13 +143,18 @@ echo "  glibc: $(strings "$NEW/lib/x86_64-linux-gnu/libc.so.6" 2>/dev/null | gre
 # closure (incl. libexpat) and would MASK a startup/import gap, so this MUST
 # gate the build: a missing runtime dep fails here instead of shipping a
 # broken sqsh that only surfaces at smoke time (cf. job 604467 rc=127).
-impout=$($UCH env LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib: \
-    /usr/bin/python3.12 - <<'PYC' 2>&1)
+# Write the script to a temp file + run it (NOT a heredoc inside $(...)):
+# heredoc-inside-$(...) with a line continuation before the operator is a bash
+# parsing edge case (PYC terminator not found, body parsed as shell) — build
+# pid 48579 hit this as `import: unable to open X server` + a syntax error.
+cat > "$NEW/tmp/imp_check.py" <<'PYC'
 import torch, vllm, vllm.models.kimi_k3
 print("IMPORT_OK torch", torch.__version__,
       "| vllm", getattr(__import__("vllm"), "__version__", "?"),
       "| kimi_k3 OK")
 PYC
+impout=$($UCH env LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib: /usr/bin/python3.12 /tmp/imp_check.py 2>&1)
+rm -f "$NEW/tmp/imp_check.py"
 echo "$impout" | tail -6
 echo "$impout" | grep -q "IMPORT_OK" || { echo "FATAL: python3.12 import failed (missing runtime dep?) — see above; do NOT ship this sqsh"; exit 1; }
 # The decisive check: does the host Cray libfabric now dlopen (glibc wall gone)?
