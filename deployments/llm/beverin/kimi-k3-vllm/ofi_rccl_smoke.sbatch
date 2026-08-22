@@ -46,8 +46,19 @@
 set -uo pipefail
 
 # ----------------------------------------------------------- script / dirs --
-# SLURM runs the sbatch from a spool copy; the real submit dir wins.
-export SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# rcc runs sbatch from the PUSHED COOKBOOK ROOT, so SLURM_SUBMIT_DIR = the
+# cookbook root (NOT this recipe dir). SLURM may also run the sbatch from a
+# spool copy (BASH_SOURCE = /var/spool/...). Resolve SCRIPT_DIR to the dir
+# that actually contains this sbatch's siblings (ofi_rccl_smoke.py,
+# ofi-rccl-smoke.toml) so the EDF lookup + `python3 $SCRIPT_DIR/...` work:
+_bsrc="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+_recipe="${SLURM_SUBMIT_DIR:-}/deployments/llm/beverin/kimi-k3-vllm"
+if   [ -f "$_bsrc/ofi_rccl_smoke.py" ];   then export SCRIPT_DIR="$_bsrc"
+elif [ -f "$_recipe/ofi_rccl_smoke.py" ]; then export SCRIPT_DIR="$_recipe"
+else export SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$_bsrc}"; fi
+unset _bsrc _recipe
+echo "[$(date -Is)] resolve: submit=${SLURM_SUBMIT_DIR:-<unset>} bsrc=${BASH_SOURCE[0]:-<unset>} pwd=$(pwd)"
+echo "[$(date -Is)]          -> SCRIPT_DIR=$SCRIPT_DIR (ofi_rccl_smoke.py: $([ -f "$SCRIPT_DIR/ofi_rccl_smoke.py" ] && echo yes || echo NO), ofi-rccl-smoke.toml: $([ -f "$SCRIPT_DIR/ofi-rccl-smoke.toml" ] && echo yes || echo NO))"
 export EDF_PATH="${SCRIPT_DIR}:${EDF_PATH:-${HOME}/.edf}"
 OTELA_EDF_NAME="${OTELA_EDF_NAME:-ofi-rccl-smoke}"
 
