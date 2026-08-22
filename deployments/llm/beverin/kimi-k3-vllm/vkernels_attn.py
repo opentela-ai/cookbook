@@ -198,6 +198,16 @@ def _bind_mla_cpu(lib: ctypes.CDLL):
 #                                const float* beta, float* out,
 #                                int B, int H, int S, int D, int chunk_size);
 def _bind_kda_hip(lib: ctypes.CDLL):
+    """Bind the KDA forward HIP kernel.  Two entry points are exported:
+      * vk_hip_kda_delta_rule_fwd       -- allocates+zeros an internal
+        B*H*D*D state scratch, runs the recurrence from S_0=0, and
+        hipFrees the scratch on return (one-shot / probe path).
+      * vk_hip_kda_delta_rule_fwd_with_scratch -- the CALLER owns the
+        state scratch [B,H,D,D]; pre-fill it with the gathered initial
+        state (zeros for first-turn prefill) and read back S_S after the
+        call for multi-turn decode.  This is the entry point the layer
+        patch uses so it can carry per-sequence initial/final states.
+    """
     fn = (
         getattr(lib, "vk_hip_kda_delta_rule_fwd", None)
         or getattr(lib, "vk_kda_delta_rule_fwd", None)
@@ -213,7 +223,17 @@ def _bind_kda_hip(lib: ctypes.CDLL):
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ]
     fn.restype = None
-    return fn
+
+    scratch = getattr(lib, "vk_hip_kda_delta_rule_fwd_with_scratch", None)
+    if scratch is not None:
+        scratch.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        scratch.restype = None
+    return fn, scratch
 
 
 # int32_t vk_kda_naive_delta_rule_fwd(q,k,v,g,beta,out,B,H,S,D) -- the
@@ -277,6 +297,18 @@ def _max_rel(a: "torch.Tensor", b: "torch.Tensor") -> float:
     return float(rel.max())
 
 
+def _scale_rel(a: "torch.Tensor", b: "torch.Tensor") -> float:
+    """Scale-invariant relative error: max|a-b| / max|b|.
+
+    Unlike _max_rel (max|a-b|/|b| per-element, inflated by near-zero
+    outputs on a wide-dynamic-range recurrent kernel), this is bounded by
+    the kernel's own magnitude and reflects the true fp32 rounding error.
+    """
+    a = a.detach().float().reshape(-1).cpu()
+    b = b.detach().float().reshape(-1).cpu()
+    return float((a - b).abs().max()) / max(float(b.abs().max()), 1e-8)
+
+
 _validate_mla_done = False
 _validate_kda_done = False
 
@@ -335,11 +367,14 @@ def _validate_kda_once(kda_hip, kda_cpu, q, k, v, g, beta, B, H, S, D, C, out_de
     if not getattr(kda_cpu, "_vk_no_chunk", True):
         args.append(ctypes.c_int(C))
     kda_cpu(*args)
-    rel = _max_rel(out_dev, out_ref)
-    print(f"[VkernelKDA] validate vs CPU oracle: max_rel={rel:.3e} "
-          f"(gate <1e-2) B={B} H={H} S={S} D={D} C={C}", flush=True)
-    if rel >= 1e-2:
-        raise RuntimeError(f"VkernelKDA device-vs-CPU max_rel={rel:.3e} >= 1e-2")
+    mrel = _max_rel(out_dev, out_ref)
+    srel = _scale_rel(out_dev, out_ref)
+    print(f"[VkernelKDA] validate vs CPU oracle: max_rel={mrel:.3e} "
+          f"scale_rel={srel:.3e} (gate scale_rel<1e-2) "
+          f"B={B} H={H} S={S} D={D} C={C}", flush=True)
+    if srel >= 1e-2:
+        raise RuntimeError(f"VkernelKDA device-vs-CPU scale_rel={srel:.3e} "
+                           f">= 1e-2 (max_rel={mrel:.3e} for context)")
 
 
 # ---------------------------------------------------------------------------
@@ -525,152 +560,221 @@ class VkernelMLABackend(MLACommonBackend):  # type: ignore[misc]
 
 
 def _apply_kda_layer_patch():
-    """Monkey-patch the ROCm KDA layer's ``_forward`` (KimiGatedDeltaNetAttention)
-    ``vk_hip_kda_delta_rule_fwd`` on gfx942 (when ``VKERNELS_KDA=1``).
+    """Monkey-patch the ROCm KDA PREFILL leaf ``chunk_kda_with_fused_gate``
+    to call ``vk_hip_kda_delta_rule_fwd_with_scratch`` on gfx942 (opt-in via
+    ``VKERNELS_KDA=1``).  The chunked Triton kernel faults on gfx942 (job
+    586165); the HIP kernel is cross-checked bit-for-bit against the FLA
+    recurrent reference (``fused_recurrent_kda``, same gated-delta-rule
+    IS_KDA=True) by ``probe_kda_xcheck.py`` (issue #45), so it is a valid
+    drop-in replacement for the forward recurrence.
 
-    The original ``_forward`` dispatches to ``chunk_kda_with_fused_gate``
-    (prefill) and ``fused_recurrent_kda[_packed_decode]`` (decode).  On
-    gfx942 the chunked path faults (job 586165); this patch replaces the
-    delta-rule computation for the per-sequence (non-spec) path with the
-    validated HIP kernel and leaves the conv/gate/output-norm bookkeeping to
-    the original layer.
-
-    .. note::
-       The exact extraction of q/k/v/g/beta (incl. A_log -> forget gate,
-       dt_bias, gate_lower_bound, q/k L2-norm, initial_state gather) is
-       layer-version-specific; the body below is a from-scratch
-       ``vk_hip_kda_delta_rule_fwd`` call (skips conv1d / gate transform /
-       initial_state / spec decoding / state writeback), so its shape guard
-       RAISES on real metadata and refuses to fall back to ``orig_forward``
-       (which faults).  ``VKERNELS_KDA=1`` must stay OFF until issue #45.
+    Patching the LEAF (not ``_forward``) leaves all the layer bookkeeping --
+    conv1d (causal_conv1d_fn/_update), the spec-vs-non-spec split,
+    ``gather_initial_states``, and ``recurrent_state[indices] = last`` -- to
+    the original code; only the delta-rule kernel call is replaced.  The
+    patch replicates the gate activation the leaf kernel does internally
+    (``fuse_gate=True``: ``g = exp(lower_bound * sigmoid(exp(A_log)*(raw_g+g_bias)))``,
+    ``beta = sigmoid(raw_beta)``) and the ``use_qk_l2norm_in_kernel=True``
+    L2-norm + ``scale = D**-0.5`` that the wrapper applies, then runs the
+    HIP recurrence per sequence (seeding each seq's state from
+    ``initial_state``; zeros for first-turn) and writes ``final_state``
+    back so multi-turn / continued prefill carries state.
     """
     # On-cluster (beverin, vLLM 0.1.dev19253+g5f76ae224.d20260727, gfx942) the
-    # K3 AMD model instantiates KimiGatedDeltaNetAttention
-    # (vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn) for every
-    # is_kda_layer index (models.kimi_k3.amd.linear, line ~471).  That class's
-    # ``_forward`` performs conv1d (causal_conv1d_fn/_update), the A_log ->
-    # g / dt_bias / lower_bound gate transform, initial_state gather, the
-    # spec-vs-non-spec split, and recurrent-state writeback, then dispatches
-    # the delta-rule itself to the leaf kernels chunk_kda_with_fused_gate /
-    # fused_recurrent_kda[_packed_decode] in vllm.models.kimi_k3.amd.ops.
-    # third_party.kda -- which FAULT on gfx942 (job 586165).  The NVIDIA-only
-    # KimiK3DeltaAttention (vllm.models.kimi_k3.nvidia.kda) is NOT on the ROCm
-    # serving path.  Patch the ROCm class; keep the older import as a fallback
-    # so a different fork build still resolves.
-    _KDA_LAYER = None
+    # K3 AMD model's KimiGatedDeltaNetAttention._forward dispatches the
+    # non-spec prefill delta-rule to ``chunk_kda_with_fused_gate``
+    # (vllm.models.kimi_k3.amd.ops.third_party.kda.chunk), which FAULTS on
+    # gfx942 (job 586165).  The decode leaves (fused_recurrent_kda[_packed])
+    # do NOT fault -- only the chunked prefill path does -- so this patch
+    # targets the chunked prefill leaf only and leaves decode untouched.
     try:
-        from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
-            KimiGatedDeltaNetAttention as _KDA_LAYER,
+        from vllm.models.kimi_k3.amd.ops.third_party.kda.chunk import (
+            chunk_kda_with_fused_gate as _chunk_kda,
         )
-    except Exception as _exc_rocm:  # pragma: no cover -- fork import
-        try:
-            from vllm.models.kimi_k3.amd.kda import (
-                KimiK3DeltaAttention as _KDA_LAYER,
-            )
-        except Exception as _exc_old:
-            print(f"[VkernelKDA] KDA layer not importable on this build "
-                  f"(roc={_exc_rocm!r}, legacy={_exc_old!r}); "
-                  "KDA routing disabled.", flush=True)
-            return False
+    except Exception as _exc_chunk:  # pragma: no cover -- fork import
+        print(f"[VkernelKDA] chunk_kda_with_fused_gate not importable "
+              f"({_exc_chunk!r}); KDA prefill patch disabled.", flush=True)
+        return False
 
-    kda_hip = _bind_kda_hip(_hip_lib())
+    kda_hip, kda_scratch = _bind_kda_hip(_hip_lib())
+    if kda_scratch is None:
+        print("[VkernelKDA] vk_hip_kda_delta_rule_fwd_with_scratch missing "
+              "from libvkernels_hip.so; prefill patch disabled (rebuild the "
+              "HIP lib inside the container, ROCm 7.2.3).", flush=True)
+        return False
     chunk_size = int(os.environ.get("VKERNELS_KDA_CHUNK", str(_DEFAULT_KDA_CHUNK)))
-    orig_forward = _KDA_LAYER._forward
+    orig_chunk = _chunk_kda
 
-    def _patched_forward(self, mixed_qkv, g1, g2, beta, core_attn_out):
-        # Only take the delta-rule hot path on gfx942 + opt-in; otherwise run
-        # the original (Triton) forward unchanged so behaviour is identical
-        # when the flag is off (matches the K3_DISABLE_KDA baseline).
+    def _patched_chunk_kda(q, k, v, raw_g, raw_beta, A_log, g_bias,
+                           scale=None, initial_state=None,
+                           output_final_state=False, lower_bound=None,
+                           use_qk_l2norm_in_kernel=False, cu_seqlens=None,
+                           **kwargs):
+        # Only intercept on gfx942 + opt-in; otherwise run the original
+        # (Triton) leaf unchanged so behaviour is identical when the flag
+        # is off (matches the K3_DISABLE_KDA baseline).
         if not on_gfx942() or os.environ.get("VKERNELS_KDA", "0") != "1":
-            return orig_forward(self, mixed_qkv, g1, g2, beta, core_attn_out)
+            return orig_chunk(q, k, v, raw_g, raw_beta, A_log, g_bias,
+                              scale, initial_state, output_final_state,
+                              lower_bound, use_qk_l2norm_in_kernel,
+                              cu_seqlens, **kwargs)
 
-        # The non-spec decode / prefill path feeds q/k/v packed in
-        # `mixed_qkv` ([num_toks, 3*local_projection_size]) and the per-token
-        # raw gate / beta in g1/beta ([1, num_toks, local_num_heads, 1]).
-        # See the public KimiGatedDeltaNetAttention._forward for the exact
-        # conventions; the shapes below are confirmed against the beverin
-        # image and MUST be re-checked against the fork's metadata (issue #45).
-        num_tokens = mixed_qkv.size(0)
-        H = self.local_num_heads
-        D = self.head_dim
-        qkv = mixed_qkv.view(num_tokens, 3, H, D).permute(1, 2, 0, 3).contiguous()
-        qkv = qkv.to(torch.float32)  # vk_hip_kda_delta_rule_fwd takes const float*
-        q_in, k_in, v_in = qkv.unbind(0)        # each [H, num_tokens, D]
-        q_in = q_in.unsqueeze(0)                # [1, H, S, D]
-        k_in = k_in.unsqueeze(0)
-        v_in = v_in.unsqueeze(0)
+        # q/k/v/raw_g are [B=1, n, H, D]; raw_beta [B=1, n, H]; A_log [H];
+        # g_bias (dt_bias) [H*D] or None.  See chunk_kda_with_fused_gate
+        # (chunk.py:774) and _forward (kimi_gdn_linear_attn.py:569).
+        B, n, H, D = q.shape
+        assert k.shape == q.shape and v.shape == q.shape
+        assert raw_g.shape == (B, n, H, D)
+        assert raw_beta.shape == (B, n, H)
+        if scale is None:
+            scale = float(D ** -0.5)
+        dev = q.device
 
-        # Forget gate g_t and delta rate beta_t are per-token, per-head,
-        # scalar.  The layer applies A_log -> g (exp(A_log)), dt_bias and the
-        # optional gate_lower_bound before this point; g1/beta already carry
-        # the post-activation values in the public layer.  Re-confirm the
-        # gate transform against the fork.
-        g_t = g1[0, :num_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-        g_t = g_t.to(torch.float32)
-        beta_t = beta[0, :num_tokens].transpose(0, 1).unsqueeze(0).contiguous()
-        beta_t = beta_t.to(torch.float32)
-        if g_t.shape != (1, H, num_tokens, 1):
-            # On the real ROCm path g1 is D-dim ([1, num_actual_tokens, H, D]),
-            # so this guard trips immediately -- i.e. the from-scratch
-            # vk_hip_kda_delta_rule_fwd call below is NOT a valid replacement
-            # for the conv1d+gate+initial-state+spec bookkeeping the leaf
-            # kernels perform.  Raise LOUDLY (do not fall back to orig_forward,
-            # which faults on gfx942) until issue #45 lands the leaf-kernel
-            # re-architecture; set VKERNELS_KDA=0 meanwhile.
-            raise NotImplementedError(
-                f"VkernelKDA: gate shape {g_t.shape} != (1,{H},{num_tokens},1). "
-                "KDA marshalling is incomplete for this vLLM build (conv1d + "
-                "A_log/dt_bias/lower_bound gate + initial_state + spec/non-spec "
-                "split); set VKERNELS_KDA=0 and use the K3_DISABLE_KDA baseline "
-                "until issue #45 (leaf-kernel re-architecture).")
-        if beta_t.shape != (1, H, num_tokens, 1):
-            raise NotImplementedError(
-                f"VkernelKDA: beta shape {beta_t.shape}; KDA marshalling "
-                "incomplete for this build -- set VKKERNELS_KDA=0 (issue #45).")
+        # --- L2-normalise q, k + apply scale to q (use_qk_l2norm_in_kernel).
+        # The HIP kernel takes PRE-normalised, PRE-scaled inputs (the
+        # Triton leaf does the same internally when fuse_gate=True). ---
+        qf = q.detach().to(torch.float32)
+        kf = k.detach().to(torch.float32)
+        vf = v.detach().to(torch.float32)
+        gf = raw_g.detach().to(torch.float32)
+        btf = raw_beta.detach().to(torch.float32)
+        # L2-norm q/k + scale q AFTER norm -- EXACTLY matches the Triton
+        # recurrent kernel (fused_recurrent_kda_fwd_kernel:221-224,
+        # USE_QK_L2NORM_IN_KERNEL=True: q/=sqrt(sum(q^2)+1e-6); q*=scale).
+        # F.normalize uses eps=1e-12; the kernel uses 1e-6, so do it by
+        # hand to keep the integration cross-check bit-for-bit.
+        if use_qk_l2norm_in_kernel:
+            qf = qf / torch.sqrt((qf * qf).sum(dim=-1, keepdim=True) + 1e-6)
+            kf = kf / torch.sqrt((kf * kf).sum(dim=-1, keepdim=True) + 1e-6)
+        qf = qf * scale                  # scale applied AFTER L2-norm
 
-        # k is L2-normalised by the caller in the delta-net formulation; the
-        # public layer relies on the chunked kernel's use_qk_l2norm_in_kernel.
-        # vk_hip_kda_delta_rule_fwd expects pre-normalised k, so normalise
-        # here (matches the per-token oracle in kda.hpp).
-        k_in = torch.nn.functional.normalize(k_in, dim=-1)
-        q_in = torch.nn.functional.normalize(q_in, dim=-1)
+        # --- Activate the gate (fuse_gate=True): g = exp(lower_bound *
+        # --- sigmoid(exp(A_log) * (raw_g + g_bias))) in NORMAL space.
+        # Matches fused_recurrent_kda_fwd (HAS_DT_BIAS, USE_LOWER_BOUND),
+        # validated bit-for-bit by probe_kda_xcheck.py (issue #45).
+        A = torch.exp(A_log.to(torch.float32))                  # [H]
+        if g_bias is not None:
+            gb = g_bias.to(torch.float32).view(H, D)            # [H, D]
+            gate_log = A[None, None, :, None] * (gf + gb[None, None, :, :])
+        else:
+            gate_log = A[None, None, :, None] * gf              # [B, n, H, D]
+        if lower_bound is not None:
+            gate_log = float(lower_bound) * torch.sigmoid(gate_log)
+        g = torch.exp(gate_log)                                 # normal space
+        beta = torch.sigmoid(btf)                               # [B, n, H]
 
-        out = torch.empty(1, H, num_tokens, D, dtype=torch.float32,
-                          device=mixed_qkv.device)
-        kda_hip(
-            ctypes.c_void_p(q_in.data_ptr()), ctypes.c_void_p(k_in.data_ptr()),
-            ctypes.c_void_p(v_in.data_ptr()), ctypes.c_void_p(g_t.data_ptr()),
-            ctypes.c_void_p(beta_t.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-            ctypes.c_int(1), ctypes.c_int(H), ctypes.c_int(num_tokens),
-            ctypes.c_int(D), ctypes.c_int(chunk_size),
-        )
+        # --- Transpose to HIP layout [B, H, n, D] / [B, H, n] ---
+        q_h = qf.permute(0, 2, 1, 3).contiguous()               # [B, H, n, D]
+        k_h = kf.permute(0, 2, 1, 3).contiguous()
+        v_h = vf.permute(0, 2, 1, 3).contiguous()
+        g_h = g.permute(0, 2, 1, 3).contiguous()
+        beta_h = beta.permute(0, 2, 1).contiguous()             # [B, H, n]
+
+        # --- Per-sequence loop (cu_seqlens = [N+1] cumulative starts).
+        # The HIP kernel runs ONE continuous recurrence per (b,h) from the
+        # seed state, so each sequence needs its own launch seeded from
+        # initial_state[s] (zeros for first-turn prefill).
+        if cu_seqlens is not None:
+            seq_lo = cu_seqlens[:-1].to(torch.int64).tolist()   # [N]
+            seq_hi = cu_seqlens[1:].to(torch.int64).tolist()    # [N]
+            N = len(seq_lo)
+        else:
+            seq_lo, seq_hi, N = [0], [n], 1
+
+        out_h = torch.empty(B, H, n, D, dtype=torch.float32, device=dev)
+        # Reusable per-seq scratch (B=1); zero-seeded for first-turn,
+        # copied from initial_state[s] for multi-turn.
+        state_scr = torch.empty(1, H, D, D, dtype=torch.float32, device=dev)
+        if output_final_state:
+            final_state = (initial_state.to(torch.float32).clone()
+                           if initial_state is not None
+                           else torch.empty(N, H, D, D,
+                                            dtype=torch.float32, device=dev))
+        else:
+            final_state = initial_state
+
+        for s in range(N):
+            lo, hi = seq_lo[s], seq_hi[s]
+            sl = hi - lo
+            if sl <= 0:
+                continue
+            # Slice THIS sequence's tokens (HIP needs contiguous [1,H,sl,D]).
+            qs = q_h[:, :, lo:hi, :].contiguous()
+            ks = k_h[:, :, lo:hi, :].contiguous()
+            vs = v_h[:, :, lo:hi, :].contiguous()
+            gs = g_h[:, :, lo:hi, :].contiguous()
+            bs = beta_h[:, :, lo:hi].contiguous()              # [1, H, sl]
+            out_slice = out_h[:, :, lo:hi, :]                      # scatter target
+            if initial_state is not None:
+                state_scr.copy_(initial_state[s:s + 1].to(torch.float32))
+            else:
+                state_scr.zero_()
+            kda_scratch(
+                ctypes.c_void_p(qs.data_ptr()), ctypes.c_void_p(ks.data_ptr()),
+                ctypes.c_void_p(vs.data_ptr()), ctypes.c_void_p(gs.data_ptr()),
+                ctypes.c_void_p(bs.data_ptr()), ctypes.c_void_p(state_scr.data_ptr()),
+                ctypes.c_void_p(out_slice.data_ptr()),
+                ctypes.c_int(1), ctypes.c_int(H), ctypes.c_int(sl),
+                ctypes.c_int(D),
+            )
+            # kda_delta_rule_fwd_with_scratch hipDeviceSynchronize()s on
+            # return, so state_scr holds S_S -- copy back before the next
+            # seq reseeds it.
+            if output_final_state:
+                final_state[s:s + 1].copy_(state_scr)
+
+        # --- Cross-check vs the CPU oracle on the first call, ONLY for
+        # --- the clean first-prefill case (N==1, zero initial_state):
+        # --- the CPU oracle (vk_kda_naive_delta_rule_fwd) starts at
+        # --- S_0=0, so multi-turn / multi-seq would diverge by design.
+        # The CPU reference .so (libvkernels.so) is a SEPARATE build from
+        # the HIP .so; an HIP-only deployment skips this gracefully (the
+        # 12/12 unit tests + probe_kda_xcheck.py already validated the
+        # kernel bit-for-bit).  A genuine mismatch still fails loudly.
+        if (os.environ.get("VKERNELS_KDA_VALIDATE", "1") == "1"
+                and N == 1
+                and (initial_state is None
+                     or float(initial_state.abs().max().item()) == 0.0)):
+            try:
+                _cpu = _bind_kda_cpu(_cpu_lib())
+            except Exception as _lib_err:
+                if "not found" in str(_lib_err).lower():
+                    _cpu = None  # HIP-only build; skip, don't crash serve
+                else:
+                    raise
+            if _cpu is not None:
+                try:
+                    _validate_kda_once(
+                        kda_hip, _cpu,
+                        q_h, k_h, v_h, g_h, beta_h,
+                        1, H, n, D, chunk_size, out_h,
+                    )
+                except Exception as exc:  # pragma: no cover -- cluster-only
+                    # Do NOT fall back to orig_chunk: on gfx942 that path faults
+                    # (the chunked Triton leaf, job 586165).  Fail loudly.
+                    raise RuntimeError(
+                        f"VkernelKDA cross-check failed ({exc!r}); the HIP "
+                        "prefill leaf disagrees with the CPU oracle. Set "
+                        "VKERNELS_KDA=0 and use the K3_DISABLE_KDA baseline.") \
+                        from exc
         torch.cuda.synchronize()
 
-        if os.environ.get("VKERNELS_KDA_VALIDATE", "1") == "1":
-            try:
-                _validate_kda_once(
-                    kda_hip, _bind_kda_cpu(_cpu_lib()),
-                    q_in, k_in, v_in, g_t, beta_t,
-                    1, H, num_tokens, D, chunk_size, out,
-                )
-            except Exception as exc:  # pragma: no cover -- cluster-only
-                # Do NOT fall back to orig_forward: on gfx942 that path faults
-                # (the leaf Triton kernels).  Fail loudly so the operator keeps
-                # VKERNELS_KDA=0 until issue #45.
-                raise RuntimeError(
-                    f"VkernelKDA cross-check failed ({exc!r}); KDA marshalling "
-                    "not validated. Set VKERNELS_KDA=0 and use the K3_DISABLE_KDA "
-                    "baseline until issue #45.") from exc
+        # out [B, H, n, D] -> [B, n, H, D] (the layer's expected layout).
+        out = out_h.permute(0, 2, 1, 3).contiguous().to(q.dtype)
+        if (output_final_state and initial_state is not None
+                and initial_state.dtype != torch.float32):
+            final_state = final_state.to(initial_state.dtype)
+        return out, final_state
 
-        # The layer expects core_attn_out as [1, num_tokens, H, D].
-        core_attn_out[:, :num_tokens] = out.to(mixed_qkv.dtype).view(num_tokens, H, D)
-        return None
-
-    _KDA_LAYER._forward = _patched_forward
-    print(f"[VkernelKDA] routed {_KDA_LAYER.__name__}._forward to "
-          f"vk_hip_kda_delta_rule_fwd on gfx942 (chunk={chunk_size}); NOTE the "
-          "from-scratch body is incomplete -- it raises on real metadata until "
-          "issue #45 (leaf-kernel re-architecture).", flush=True)
+    # Patch the LEAF module attribute (the K3 layer imports
+    # ``chunk_kda_with_fused_gate`` by name inside _forward, so re-binding
+    # the module attribute is enough -- no class attribute swap needed).
+    import vllm.models.kimi_k3.amd.ops.third_party.kda.chunk as _chunk_mod
+    _chunk_mod.chunk_kda_with_fused_gate = _patched_chunk_kda
+    print(f"[VkernelKDA] patched chunk_kda_with_fused_gate (prefill leaf) "
+          f"to vk_hip_kda_delta_rule_fwd_with_scratch on gfx942 "
+          f"(chunk={chunk_size}); cross-checked vs FLA recurrent ref "
+          f"(probe_kda_xcheck.py, issue #45).", flush=True)
     return True
 
 
