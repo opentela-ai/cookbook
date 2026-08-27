@@ -264,6 +264,38 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
     `SOFT_WATCHDOG_TIMEOUT` dump is the first diagnostic, not a kill at
     10 min.
 
+13. **PP `broadcast_pyobj` stall recurred; first trigger pinned to a single
+    large-context request (job 3151383, 2026-08-22).** The engine served 669
+    × `200 OK` for ~4 h20 m (decode 32 tok/s, CUDA graph on) then froze at
+    22:57:19 with zero log progress for 11 min. The soft watchdog fired on
+    time at 23:08:53 and py-spy captured the same MainThread block across
+    every PP stage:
+        pthread_cond_wait → torch.distributed.broadcast → broadcast_pyobj
+          (utils/common.py:2241) → _broadcast_reqs_across_ranks
+          (request_receiver.py:198) → recv_requests (request_receiver.py:90)
+          → event_loop_pp (scheduler_pp_mixin.py:101)
+    (identical to fixes 11/12 — the run carried `WATCHDOG_TIMEOUT=3600
+    SOFT_WATCHDOG_TIMEOUT=600 DIST_TIMEOUT=3600`, all of which behaved as
+    designed: the 600 s soft dump is the diagnostic, the 3600 s hard kill
+    would have followed at 23:57). **New lead, resolving the fix-12
+    `TODO(unverified)` trigger:** the stall began 26 s after a single
+    **289K-token** long-context request prefilled at 22:56:53
+    (`#cached-token: 286208, #new-token: 2432`), the largest context seen
+    this run and the first stall pinned to a specific large request (prior
+    stalls 3002366/3018155 left the trigger open). This does NOT contradict
+    the "1M context length is not the cause" note below — the 1M *pool*
+    held fine; a single large *request* (not pool size) is the new
+    candidate. **No code fix applied yet** — the broadcast stall remains
+    unmitigated. A bounded per-request input cap
+    (`SGLANG_EXTRA_ARGS="--max-input-tokens …"`) is a `TODO(unverified)`
+    hypothesis to test on the next recurrence, not a proven mitigation.
+    Operational: this run was `scancel`led at 23:15:09 (before the hard
+    watchdog) so otela did NOT announce LEFT → stale `connected: true`
+    row for peer-21. **Restart with the SAME seed (21, default)** so the
+    new worker re-adopts the peer ID and overwrites the stale row in the
+    CRDT; a fresh seed would leave the dead peer round-robin'ing traffic
+    into it (the exact anti-pattern fix 11 warns about).
+
 ## Files
 
 | File | Purpose |
@@ -455,7 +487,9 @@ crashing the healthy engine and leaving otela unable to announce LEFT. The
 stall was transient-shaped (steady `200 OK` through 12:23:53, then a sudden
 multi-minute broadcast hang) — not an OOM or KV exhaustion, and **1M context
 length is not the cause** (1M booted and served fine for 8 h). The real
-trigger is `TODO(unverified)`; the recipe now raises the hard watchdog to
+trigger is `TODO(unverified)` (first lead: fix 13's 3151383 recurrence,
+2026-08-22 — a single 289K-token request prefilled 26 s before the stall);
+the recipe now raises the hard watchdog to
 3600 s and adds a 600 s soft watchdog that dumps a stack trace without killing
 (see fix 11). If a future run stalls again, the soft-watchdog dump (the job
 log / `$RUNDIR`) is the diagnostic — do **not** `scancel` a merely-stalled
@@ -471,6 +505,19 @@ fired at its 600 s default (`--dist-timeout`, which the recipe did not pass)
 and aborted every rank — `WARN: otela did not announce LEFT` again. Fix 12
 passes `--dist-timeout 3600` so both watchdogs share the same floor; the
 soft-watchdog dump at 600 s is the first diagnostic on the next stall.
+
+**3151383 (2026-08-22) stalled at 4 h20 m on the same `broadcast_pyobj` hang
+— and was `scancel`led, so no LEFT.** Served 669 × `200 OK` cleanly (steady
+decode 32 tok/s), then a single 289K-token request prefilled at 22:56:53 and
+the engine froze 26 s later (22:57:19). The soft watchdog dumped a clean
+py-spy stack at 23:08:53 (root cause + verbatim trace in fix 13) and would
+have been followed by the 3600 s hard kill at 23:57; instead this run was
+`scancel`led at 23:15:09 to recover the nodes, so otela never announced LEFT
+→ stale `connected: true` row for peer-21. Restarted as 3153194 with the
+SAME seed (21) so the new worker re-adopts the peer ID and overwrites the
+stale row in the CRDT — do NOT use a fresh seed after a stale-LEFT scancel;
+it leaves the dead peer round-robin'ing traffic (the anti-pattern fix 11
+warns about).
 
 **Superseded numbers.** An earlier measurement (2026-07-28, run 2920471,
 `sglang.bench_serving`, 1024-in / 128-out, cold CUDA graphs) reported
@@ -526,7 +573,7 @@ step (or point `/proc/sys/kernel/core_pattern` at `|/bin/false` site-wide).
 | `UNBALANCED_MODEL_LOADING_TIMEOUT_S` | `3600` | sglang weight-load barrier (fix 10); patched via `$DEPLOY_DIR/patches/sitecustomize.py` |
 | `WATCHDOG_TIMEOUT` | `3600` | sglang HARD scheduler watchdog (s) — raises & kills the engine on a forward batch longer than this. Default 300 killed job 3002366 after 8 h of healthy serving on a >300 s PP request-broadcast stall; raised to 3600 (fix 11) so transient distributed stalls ride out, a true permanent hang still dies in 1 h |
 | `SOFT_WATCHDOG_TIMEOUT` | `600` | sglang SOFT watchdog (s) — dumps a stack trace at 600 s WITHOUT crashing (fix 11). Keep < `WATCHDOG_TIMEOUT` |
-| `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `python -m sglang.launch_server` command (array; word-split) |
+| `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `python -m sglang.launch_server` command (array; word-split). First candidate to test on the next `broadcast_pyobj` stall is `--max-input-tokens N` — a bounded per-request input cap (fix 13), `TODO(unverified)` as a mitigation. |
 | `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout (**BRANCH multinode-pp**, stdlib-only, runs via `PYTHONPATH` — no install). Stage once with egress: `git clone --depth=1 -b multinode-pp https://github.com/eth-easl/servekit $DEPLOY_DIR/servekit`. Only used when `PRESHARDED_ENABLE=1` (wraps the engine in `servekit launch --overlap` for presharded staging + per-node cold-start JSON); default 0 runs the engine directly from `$MODEL_PATH` with no servekit wrapping. Missing checkout + `PRESHARDED_ENABLE=1` → WARN, cold load, auto-bench skipped. |
 | `PRESHARDED_ROOT_BASE` | `/capstor/store/cscs/swissai/infra01/cold-start-experiments/kimi-k3-presharded` | root of the offline pre-sharded dump; `-tp${TP}pp${PP}` is appended (→ `kimi-k3-presharded-tp4pp8/TP-4-sig-<hash>/`). Only used when `PRESHARDED_ENABLE=1`: each PP stage stages its OWN file set (read from the dump's `checksum.json`) to `/dev/shm` via `servekit launch --overlap`. A config mismatch is a cache MISS (full re-load + re-dump), not a silent wrong-shape serve. |
 | `PRESHARDED_ENABLE` | `0` | **0 (default): the engine runs directly from `$MODEL_PATH` on Lustre — the proven path (jobs 3000965/3002366/3018155/3035026 each served ~970 requests before the recurring PP-pipeline stall). No servekit wrapping, no preshard, no per-node cold-start profile.** `1`: servekit `launch --overlap` stages each rank's pre-sharded slice from `$PRESHARDED_ROOT` to `/dev/shm` and wraps the engine for lifecycle + profiling. **Currently blocked:** the dump's `.safetensors` carry ACL `mask::---` (owner `yboughizane` only; group infra01/csstaff/infra01adm all effective `---`), so servekit's `dd` staging fails with `Permission denied` and the engine's cache-MISS re-dump crashes (`FileNotFoundError` in `_tmp_presharding`). Fix: `yboughizane` runs `setfacl -R -m m::r $PRESHARDED_ROOT` (or `setfacl -R -m u:xyao:r …`). |

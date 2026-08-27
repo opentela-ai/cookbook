@@ -24,3 +24,6 @@ opentela-amd64
 __pycache__/
 *.pyc
 test_llm.py
+
+# Core dumps from crashed jobs on HPC nodes (nid*)
+core_*
