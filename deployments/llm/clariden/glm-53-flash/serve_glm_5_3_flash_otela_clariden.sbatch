@@ -235,6 +235,24 @@ export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
 export CG_DECODE="${CG_DECODE:-full}"
 
+# Multimodal (vision-tower) attention backend. GLM-5.3-Flash is MULTIMODAL
+# (Glm5NextForConditionalGeneration); every prefill that touches an image
+# routes the vision patches through sglang.srt.layers.attention.vision.
+# _determine_attention_backend (vision.py:1221) picks the backend by:
+#   server arg (--mm-attention-backend) > constructor arg > platform default
+# and the platform default on CUDA Hopper (sm_90, our GH200) is "fa3"
+# (vision.py:1227) -> VisionFlash3Attention.forward (L579) ->
+# flash_attn_func (L60, ver=3) -> flash_attention_v3 -> sgl_kernel.flash_ops
+# -> ImportError (job 3209753). This is the THIRD FA3 path, completely
+# independent of the DSA backends above (those govern the TEXT/DSA layers;
+# the vision tower has its own dispatch). The image has no
+# sgl_kernel.flash_ops, so pin --mm-attention-backend triton_attn
+# (VisionTritonAttention, L1003; in STRIDED_QKV_BACKENDS L1016; the
+# documented non-FA3 CUDA default per vision.py:1229) to bypass the sm_90
+# -> fa3 auto-selection. triton_attn uses Triton kernels, no flash_ops dep
+# (verified: flash_attn_func has zero call sites in VisionTritonAttention).
+export GLM53_MM_ATTENTION="${GLM53_MM_ATTENTION:-triton_attn}"
+
 # Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
 # 1048576 (1M). The KV pool is sized by MEM_FRAC, not this value. Default
 # 32768 for a fast cold start + probe (shorter than the kimi-k3 1M default
@@ -706,6 +724,7 @@ ENGINE_CMD=(python -m sglang.launch_server
   --moe-runner-backend "$MOE_BACKEND"
   --dsa-prefill-backend "$GLM53_DSA_PREFILL"
   --dsa-decode-backend "$GLM53_DSA_DECODE"
+  --mm-attention-backend "$GLM53_MM_ATTENTION"
   --cuda-graph-backend-decode "$CG_DECODE"
   --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC"
   --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT"
