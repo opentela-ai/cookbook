@@ -473,6 +473,23 @@ mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
 # cause, faster diagnosis. Behavior-preserving on arches where fa3/trtllm
 # ARE present (e.g. an x86 GH200 run): _fa3_ok is probed once at patch time
 # and the perf override applies normally when True.
+#
+# === FOURTH FA3 path (job 3209880; the LAST one) ===
+# The DSA layer's FULL-MHA prefill is NOT governed by --dsa-*-backend (those
+# are the SPARSE MLA knobs). forward_extend -> _forward_standard_mha
+# (dsa_backend.py:4131) calls flash_attn_varlen_func with the module-top
+# default ver=3 -> flash_attention_v3 -> _load_fa3_kernels -> ImportError,
+# unconditionally on SM90 (comment "Use FA3 for SM90", L4130; no arch guard,
+# no CLI override). It is the ONLY real flash_attn_varlen_func( call in
+# dsa_backend.py (of 22 'fa3' hits, the rest are imports / fa3_* vars in the
+# sparse _forward_fa3 path, already bypassed by the tilelang pins above).
+# FIX (below, second patch block): reuse the method's EXISTING SM100+
+# (Blackwell) flashinfer branch (L4105-4128 -> flashinfer.prefill.
+# trtllm_ragged_attention_deepseek, verified present) by (1) allocating the
+# dsa_trtllm_workspace buffer the branch needs (L727 sets it None on SM90+
+# non-trtllm decode) and (2) wrapping _forward_standard_mha to force
+# device_sm_major=10 around the call. On aarch64-without-FA3, SM90 is
+# functionally Blackwell for this method. Behavior-preserving when _fa3_ok.
 cat > "$PATCH_DIR/sitecustomize.py" <<'PYEOF'
 import os
 
@@ -527,6 +544,74 @@ except Exception as _e:  # sglang/dsa_backend not importable yet (preflight)
     import sys
     sys.stderr.write(
         f"[sitecustomize] kpool-tail FA3-safe patch skipped: {_e!r}\n")
+
+# ---- GLM-5.3 clariden: _forward_standard_mha hard-codes FA3 on SM90 ----
+# The DSA layer's FULL-MHA prefill (forward_extend -> _forward_standard_mha,
+# dsa_backend.py:4131) calls flash_attn_varlen_func with the module-top
+# default ver=3 -> flash_attention_v3 -> _load_fa3_kernels -> ImportError
+# (job 3209880). NO CLI override exists: the method has an SM100+
+# (Blackwell) flashinfer branch (L4105-4128 -> flashinfer.prefill.
+# trtllm_ragged_attention_deepseek, verified PRESENT on this image) that on
+# SM90 (Hopper/H200, comment "Use FA3 for SM90", L4130) falls through to an
+# UNGUARDED flash_attn_varlen_func -> FA3 crash. On aarch64 (no
+# sgl_kernel.flash_ops), reuse the Blackwell branch two ways:
+#   (1) __init__ wrapper: SM90-without-FA3 needs the SAME
+#       dsa_trtllm_workspace buffer the SM100 branch allocates (L727 sets
+#       it None for SM90+non-trtllm decode). Allocate it here as a
+#       per-device singleton (SGLANG_FLASHINFER_WORKSPACE_SIZE torch.uint8,
+#       the exact size/type from L711-718) so all 11 DSA layers share one.
+#   (2) _forward_standard_mha wrapper: temporarily set device_sm_major=10
+#       around the original call so the flashinfer branch runs, then
+#       restore 9. This invokes the author's EXACT, tested Blackwell path
+#       (same metadata.cache_seqlens_int32 / batch_size / layer.scaling
+#       args) — just taken on SM90-without-FA3, which is functionally
+#       identical (both need a non-FA3 full-MHA prefill).
+# Behavior-preserving when _fa3_ok (set by the kpool-tail block above):
+# the `if not _fa3_ok:` guard makes both wrappers no-ops on x86, where the
+# original SM90->FA3 path runs unchanged.
+try:
+    if not _fa3_ok:  # set by the kpool-tail block above (same process)
+        import torch as _torch
+        from sglang.srt.environ import envs as _envs
+
+        _ws_cache = {}  # per-device singleton (all DSA layers share one)
+
+        def _get_trtllm_workspace(dev):
+            key = str(dev)
+            if key not in _ws_cache:
+                _ws_cache[key] = _torch.empty(
+                    _envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=_torch.uint8, device=dev,
+                )
+            return _ws_cache[key]
+
+        _dsa_init = _db.DeepseekSparseAttnBackend.__init__
+
+        def _dsa_init_ws(self, *a, **kw):
+            _dsa_init(self, *a, **kw)
+            if (self.device_sm_major == 9
+                    and getattr(self, "workspace_buffer", None) is None):
+                self.workspace_buffer = _get_trtllm_workspace(self.device)
+
+        _db.DeepseekSparseAttnBackend.__init__ = _dsa_init_ws
+
+        _fsm = _db.DeepseekSparseAttnBackend._forward_standard_mha
+
+        def _forward_standard_mha_fa3safe(self, *a, **kw):
+            if self.device_sm_major == 9:
+                saved = self.device_sm_major
+                self.device_sm_major = 10  # force the flashinfer branch
+                try:
+                    return _fsm(self, *a, **kw)
+                finally:
+                    self.device_sm_major = saved
+            return _fsm(self, *a, **kw)
+
+        _db.DeepseekSparseAttnBackend._forward_standard_mha = _forward_standard_mha_fa3safe
+except Exception as _e2:
+    import sys
+    sys.stderr.write(
+        f"[sitecustomize] _forward_standard_mha FA3-safe patch skipped: {_e2!r}\n")
 PYEOF
 export PATCH_DIR
 
