@@ -551,61 +551,68 @@ except Exception as _e:  # sglang/dsa_backend not importable yet (preflight)
 # default ver=3 -> flash_attention_v3 -> _load_fa3_kernels -> ImportError
 # (job 3209880). NO CLI override exists: the method has an SM100+
 # (Blackwell) flashinfer branch (L4105-4128 -> flashinfer.prefill.
-# trtllm_ragged_attention_deepseek, verified PRESENT on this image) that on
-# SM90 (Hopper/H200, comment "Use FA3 for SM90", L4130) falls through to an
-# UNGUARDED flash_attn_varlen_func -> FA3 crash. On aarch64 (no
-# sgl_kernel.flash_ops), reuse the Blackwell branch two ways:
-#   (1) __init__ wrapper: SM90-without-FA3 needs the SAME
-#       dsa_trtllm_workspace buffer the SM100 branch allocates (L727 sets
-#       it None for SM90+non-trtllm decode). Allocate it here as a
-#       per-device singleton (SGLANG_FLASHINFER_WORKSPACE_SIZE torch.uint8,
-#       the exact size/type from L711-718) so all 11 DSA layers share one.
-#   (2) _forward_standard_mha wrapper: temporarily set device_sm_major=10
-#       around the original call so the flashinfer branch runs, then
-#       restore 9. This invokes the author's EXACT, tested Blackwell path
-#       (same metadata.cache_seqlens_int32 / batch_size / layer.scaling
-#       args) — just taken on SM90-without-FA3, which is functionally
-#       identical (both need a non-FA3 full-MHA prefill).
-# Behavior-preserving when _fa3_ok (set by the kpool-tail block above):
-# the `if not _fa3_ok:` guard makes both wrappers no-ops on x86, where the
-# original SM90->FA3 path runs unchanged.
+# trtllm_ragged_attention_deepseek), but that is a Blackwell-only TRT-LLM
+# kernel -- job 3210211 crashed with tvm.error "TllmGenFmhaRunner ...
+# Unsupported architecture" on sm_90 (the earlier "device_sm_major=10"
+# trick was wrong: SM90 is NOT functionally Blackwell for this op). So on
+# this aarch64 Hopper image BOTH built-in paths are dead (FA3 absent,
+# trtllm Blackwell-only); sgl_kernel FA2, flash_attn_interface (FA2 pkg),
+# and flashinfer BatchPrefill/MLA are all ABSENT too (verified). The ONLY
+# universal, sm_90-runnable full-MHA kernel on this image is PyTorch SDPA
+# (torch.nn.functional.scaled_dot_product_attention). GLM-5.3's DSA layers
+# are pure MHA here (config: num_attention_heads==num_key_value_heads==64,
+# qk_nope_head_dim==v_head_dim==256, qk_rope_head_dim==0 -> head_dim
+# ==v_head_dim, no GQA), so a per-request SDPA ragged loop over
+# metadata.cu_seqlens_{q,k} with is_causal=True is a drop-in, correct
+# replacement (slower than a fused kernel -- correctness first for a
+# first-ever aarch64 serve). Behavior-preserving when _fa3_ok (x86 Hopper
+# runs the original FA3 path) and on SM100+ (x86 Blackwell runs the
+# original trtllm path): the replacement fires ONLY on not-_fa3_ok SM90.
 try:
     if not _fa3_ok:  # set by the kpool-tail block above (same process)
         import torch as _torch
-        from sglang.srt.environ import envs as _envs
-
-        _ws_cache = {}  # per-device singleton (all DSA layers share one)
-
-        def _get_trtllm_workspace(dev):
-            key = str(dev)
-            if key not in _ws_cache:
-                _ws_cache[key] = _torch.empty(
-                    _envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                    dtype=_torch.uint8, device=dev,
-                )
-            return _ws_cache[key]
-
-        _dsa_init = _db.DeepseekSparseAttnBackend.__init__
-
-        def _dsa_init_ws(self, *a, **kw):
-            _dsa_init(self, *a, **kw)
-            if (self.device_sm_major == 9
-                    and getattr(self, "workspace_buffer", None) is None):
-                self.workspace_buffer = _get_trtllm_workspace(self.device)
-
-        _db.DeepseekSparseAttnBackend.__init__ = _dsa_init_ws
-
+        _F = _torch.nn.functional
         _fsm = _db.DeepseekSparseAttnBackend._forward_standard_mha
 
-        def _forward_standard_mha_fa3safe(self, *a, **kw):
-            if self.device_sm_major == 9:
-                saved = self.device_sm_major
-                self.device_sm_major = 10  # force the flashinfer branch
-                try:
-                    return _fsm(self, *a, **kw)
-                finally:
-                    self.device_sm_major = saved
-            return _fsm(self, *a, **kw)
+        def _forward_standard_mha_fa3safe(self, q, k, v, layer,
+                                          forward_batch, metadata):
+            if self.device_sm_major != 9:
+                return _fsm(self, q, k, v, layer, forward_batch, metadata)
+            # aarch64 SM90 without FA3: PyTorch SDPA ragged loop.
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            cu_q, cu_k = metadata.cu_seqlens_q, metadata.cu_seqlens_k
+            causal = True
+            scale = layer.scaling
+            gqa = (q.shape[-2] != k.shape[-2])
+            out = _torch.empty_like(q)
+            for _i in range(len(cu_q) - 1):
+                _qs, _qe = int(cu_q[_i]), int(cu_q[_i + 1])
+                if _qe <= _qs:
+                    continue
+                _ks, _ke = int(cu_k[_i]), int(cu_k[_i + 1])
+                # FA stores (total, H, D); SDPA wants (batch, H, seq, D).
+                _qi = q[_qs:_qe].transpose(0, 1)[None]  # (1, H,  sl_q, D)
+                _ki = k[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, D)
+                _vi = v[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, Dv)
+                _sl_q, _sl_k = _qe - _qs, _ke - _ks
+                if causal and _sl_q == _sl_k:
+                    _oi = _F.scaled_dot_product_attention(
+                        _qi, _ki, _vi, is_causal=True, scale=scale,
+                        enable_gqa=gqa)
+                elif causal:  # sl_q < sl_k: bottom-right additive mask
+                    _m = _torch.full((_sl_q, _sl_k), float("-inf"),
+                                     device=q.device, dtype=q.dtype).tril(
+                        diagonal=_sl_k - _sl_q)[None, None]
+                    _oi = _F.scaled_dot_product_attention(
+                        _qi, _ki, _vi, attn_mask=_m, scale=scale,
+                        enable_gqa=gqa)
+                else:
+                    _oi = _F.scaled_dot_product_attention(
+                        _qi, _ki, _vi, scale=scale, enable_gqa=gqa)
+                out[_qs:_qe] = _oi[0].transpose(0, 1)  # back to (sl_q, H, D)
+            return out
 
         _db.DeepseekSparseAttnBackend._forward_standard_mha = _forward_standard_mha_fa3safe
 except Exception as _e2:

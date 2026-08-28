@@ -1,77 +1,99 @@
 #!/usr/bin/env python3
-"""Verify the kpool-tail FA3-safe patch (correct class: DeepseekSparseAttnBackend).
-Also checks whether the MTP/multistep subclasses inherit _resolve_kpool_tail_backend
-from the parent, so a single patch covers GLM-5.3's num_nextn_predict_layers=1 path."""
-import importlib, torch
-
-def _importable(name):
+"""Round 8h: verify the SDPA ragged re-impl of _forward_standard_mha runs
+on sm_90 with the EXACT GLM-5.3 DSA dims (64 heads, head_dim=v_head_dim=256,
+no GQA), single + multi-request, sl_q==sl_k (one-shot prefill)."""
+import torch, types
+from sglang.srt.layers.attention import dsa_backend as _db
+import importlib as _il
+def _importable(n):
     try:
-        importlib.import_module(name); return True
+        _il.import_module(n); return True
     except Exception:
         return False
-
 _fa3_ok = _importable("sgl_kernel.flash_ops")
-print(f"_fa3_ok (sgl_kernel.flash_ops importable) = {_fa3_ok}")
+print(f"_fa3_ok = {_fa3_ok}  (expect False on aarch64)")
+print(f"cuda: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'none'}  "
+      f"sm={torch.cuda.get_device_capability() if torch.cuda.is_available() else '-'}")
 
-from sglang.srt.layers.attention import dsa_backend as _db
-CLS = _db.DeepseekSparseAttnBackend
-print(f"\nTarget class = {CLS.__name__}  (was wrongly 'DsaBackend' in patch v1)")
-print(f"  _resolve_kpool_tail_backend original = {CLS._resolve_kpool_tail_backend!r}")
+# --- replicate the patched method (same code as the sbatch heredoc) ---
+_F = torch.nn.functional
+def _forward_standard_mha_fa3safe(self, q, k, v, layer, forward_batch, metadata):
+    if self.device_sm_major != 9:
+        raise RuntimeError("non-SM90 branch should not run in this verify")
+    q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+    k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+    v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+    cu_q, cu_k = metadata.cu_seqlens_q, metadata.cu_seqlens_k
+    causal = True
+    scale = layer.scaling
+    gqa = (q.shape[-2] != k.shape[-2])
+    out = torch.empty_like(q)
+    for _i in range(len(cu_q) - 1):
+        _qs, _qe = int(cu_q[_i]), int(cu_q[_i + 1])
+        if _qe <= _qs:
+            continue
+        _ks, _ke = int(cu_k[_i]), int(cu_k[_i + 1])
+        _qi = q[_qs:_qe][None]; _ki = k[_ks:_ke][None]; _vi = v[_ks:_ke][None]
+        _sl_q, _sl_k = _qe - _qs, _ke - _ks
+        if causal and _sl_q == _sl_k:
+            _oi = _F.scaled_dot_product_attention(_qi, _ki, _vi, is_causal=True, scale=scale, enable_gqa=gqa)
+        elif causal:
+            _m = torch.ones(_sl_q, _sl_k, device=q.device, dtype=torch.bool).tril(diagonal=_sl_k - _sl_q)[None, None]
+            _oi = _F.scaled_dot_product_attention(_qi, _ki, _vi, attn_mask=_m, scale=scale, enable_gqa=gqa)
+        else:
+            _oi = _F.scaled_dot_product_attention(_qi, _ki, _vi, scale=scale, enable_gqa=gqa)
+        out[_qs:_qe] = _oi[0]
+    return out
 
-# Do the MTP / multistep backends inherit it (so one patch covers GLM-5.3 MTP)?
-for sub in ("DeepseekSparseAttnMultiStepBackend",
-            "DeepseekSparseAttnBackendMTPPrecomputeMixin"):
-    s = getattr(_db, sub, None)
-    if s is None:
-        print(f"  {sub}: NOT in module"); continue
-    own = "_resolve_kpool_tail_backend" in s.__dict__
-    via = getattr(s, "_resolve_kpool_tail_backend", None)
-    via_src = via.__qualname__ if via else "?"
-    print(f"  {sub}: own={own}  resolves via {via_src}")
+# REAL GLM-5.3 DSA dims (config.json text_config)
+NUM_Q = NUM_KV = 64           # num_attention_heads == num_key_value_heads
+HEAD_DIM = V_HEAD_DIM = 256   # qk_nope_head_dim == v_head_dim, qk_rope=0
+dev = "cuda"; dt = torch.bfloat16
+self_ = types.SimpleNamespace(device_sm_major=9, device=dev)
+layer = types.SimpleNamespace(tp_q_head_num=NUM_Q, tp_k_head_num=NUM_KV,
+                              tp_v_head_num=NUM_KV, head_dim=HEAD_DIM,
+                              v_head_dim=V_HEAD_DIM, scaling=1.0/HEAD_DIM**0.5)
 
-# Apply the EXACT patch from sitecustomize.py (corrected class name).
-def _resolve_kpool_tail_backend_fa3safe(self, topk_indices, dsa_impl):
-    if (topk_indices is None or self.dsa_index_kpool <= 1
-            or dsa_impl != "flashmla_sparse"):
-        return dsa_impl
-    target = ("trtllm" if self.device_sm_major >= 10 else
-              "fa3" if self.device_sm_major == 9 else dsa_impl)
-    if target == dsa_impl:
-        return dsa_impl
-    if target == "fa3" and not _fa3_ok:
-        return dsa_impl
-    if target == "trtllm" and not _importable("tensorrt_llm"):
-        return dsa_impl
-    return target
+# --- single request, sl_q == sl_k (one-shot prefill, no prefix) ---
+sl = 128
+q = torch.randn(sl, NUM_Q, HEAD_DIM, device=dev, dtype=dt)
+k = torch.randn(sl, NUM_KV, HEAD_DIM, device=dev, dtype=dt)
+v = torch.randn(sl, NUM_KV, V_HEAD_DIM, device=dev, dtype=dt)
+md = types.SimpleNamespace(
+    cu_seqlens_q=torch.tensor([0, sl], device=dev, dtype=torch.int32),
+    cu_seqlens_k=torch.tensor([0, sl], device=dev, dtype=torch.int32))
+o = _forward_standard_mha_fa3safe(self_, q, k, v, layer, None, md)
+print(f"\n[single req, sl={sl}] out {tuple(o.shape)}  expect ({sl},{NUM_Q},{HEAD_DIM})  "
+      f"{'OK' if tuple(o.shape)==(sl,NUM_Q,HEAD_DIM) else 'FAIL'}  "
+      f"finite={torch.isfinite(o).all().item()}")
 
-CLS._resolve_kpool_tail_backend = _resolve_kpool_tail_backend_fa3safe
-# Verify subclasses now see the patched method (inheritance).
-for sub in ("DeepseekSparseAttnBackendMultiStepBackend"
-            if False else "DeepseekSparseAttnMultiStepBackend",):
-    s = getattr(_db, sub, None)
-    if s: print(f"  after patch, {sub}._resolve_kpool_tail_backend = {getattr(s,'_resolve_kpool_tail_backend',None)!r}")
+# --- 3 requests, ragged, sl_q == sl_k each ---
+s_q = [0, 32, 96, 64+0]; s_k = [0, 32, 96, 64+0]
+# build distinct seq lens: 32, 64, 128
+cu_q = torch.tensor([0, 32, 96, 224], device=dev, dtype=torch.int32)
+cu_k = torch.tensor([0, 32, 96, 224], device=dev, dtype=torch.int32)
+tot = int(cu_q[-1])
+q3 = torch.randn(tot, NUM_Q, HEAD_DIM, device=dev, dtype=dt)
+k3 = torch.randn(tot, NUM_KV, HEAD_DIM, device=dev, dtype=dt)
+v3 = torch.randn(tot, NUM_KV, V_HEAD_DIM, device=dev, dtype=dt)
+md3 = types.SimpleNamespace(cu_seqlens_q=cu_q, cu_seqlens_k=cu_k)
+o3 = _forward_standard_mha_fa3safe(self_, q3, k3, v3, layer, None, md3)
+print(f"[3 ragged reqs 32/64/128] out {tuple(o3.shape)}  expect ({tot},{NUM_Q},{HEAD_DIM})  "
+      f"{'OK' if tuple(o3.shape)==(tot,NUM_Q,HEAD_DIM) else 'FAIL'}  "
+      f"finite={torch.isfinite(o3).all().item()}")
 
-class _Fake:
-    def __init__(self, sm, kpool):
-        self.device_sm_major, self.dsa_index_kpool = sm, kpool
-
-topk = torch.zeros(1, dtype=torch.int32)
-cases = [
-    ("sm9 kpool2 flashmla_sparse (THE CRASH)", _Fake(9, 2), "flashmla_sparse", topk),
-    ("sm9 kpool2 fa3 (explicit wrong)",        _Fake(9, 2), "fa3",            topk),
-    ("sm9 kpool1 flashmla_sparse (guard)",     _Fake(9, 1), "flashmla_sparse", topk),
-    ("sm9 kpool2 none-topk (guard)",           _Fake(9, 2), "flashmla_sparse", None),
-    ("sm10 kpool2 flashmla_sparse",            _Fake(10,2), "flashmla_sparse", topk),
-    ("sm8 kpool2 flashmla_sparse (no ovrd)",   _Fake(8, 2), "flashmla_sparse", topk),
-]
-print("\n=== patched method behavior ===")
-crash_case_ok = None
-for label, fake, impl, tk in cases:
-    got = _resolve_kpool_tail_backend_fa3safe(fake, tk, impl)
-    if "THE CRASH" in label:
-        crash_case_ok = (got == "flashmla_sparse")
-    print(f"  {label:44s} -> {got}")
-
-print(f"\nVERDICT: {'PASS' if crash_case_ok else 'FAIL'} — crash case "
-      f"returns {'flashmla_sparse (no FA3 crash)' if crash_case_ok else 'fa3 (WOULD CRASH)'}")
-print(f"FA3 present on this arch: {_fa3_ok} (perf override would be ACTIVE here if True)")
+# --- sl_q < sl_k (prefix+current) via the explicit-mask branch ---
+sl_q2, sl_k2 = 16, 64
+q2 = torch.randn(sl_q2, NUM_Q, HEAD_DIM, device=dev, dtype=dt)
+k2 = torch.randn(sl_k2, NUM_KV, HEAD_DIM, device=dev, dtype=dt)
+v2 = torch.randn(sl_k2, NUM_KV, V_HEAD_DIM, device=dev, dtype=dt)
+md2 = types.SimpleNamespace(
+    cu_seqlens_q=torch.tensor([0, sl_q2], device=dev, dtype=torch.int32),
+    cu_seqlens_k=torch.tensor([0, sl_k2], device=dev, dtype=torch.int32))
+try:
+    o2 = _forward_standard_mha_fa3safe(self_, q2, k2, v2, layer, None, md2)
+    print(f"[prefix+current sl_q=16<sl_k=64] out {tuple(o2.shape)}  expect (16,{NUM_Q},{HEAD_DIM})  "
+          f"{'OK' if tuple(o2.shape)==(16,NUM_Q,HEAD_DIM) else 'FAIL'}  "
+          f"finite={torch.isfinite(o2).all().item()}")
+except Exception as e:
+    print(f"[prefix+current sl_q=16<sl_k=64] FAIL: {type(e).__name__}: {str(e)[:160]}")
