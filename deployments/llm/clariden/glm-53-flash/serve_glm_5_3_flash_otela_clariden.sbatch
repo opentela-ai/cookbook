@@ -217,6 +217,37 @@ export MEM_FRAC="${MEM_FRAC:-0.88}"
 # CXI independently of this setting.
 export GLM53_NIC="${GLM53_NIC:-hsn0}"
 
+# --- HiCache: offload evicted radix prefixes to Grace LPDDR ----------------
+# On GH200 the Grace CPU's ~870 GiB LPDDR (RealMemory, verified in the kimi-k3
+# clariden README) is connected to the 4 GPUs over NVLink-C2C at ~900 GB/s —
+# NOT Slingshot (~50 GB/s) and NOT PCIe (~64 GB/s). SGLang's HiCache offloads
+# EVICTED radix-cache prefixes (MLA KV pages + KDA state for the linear-SSM
+# layers) from HBM to that LPDDR, growing the prefix cache, NOT
+# max_total_num_tokens (the live batch KV stays in HBM, sized by --mem-
+# fraction-static). Post-eviction hits on a reused prefix are pulled from
+# LPDDR instead of recomputed — dramatic under concurrent shared-prefix
+# traffic. This is the mechanism that makes a 1-node (TP4 PP1, ~19 GiB HBM
+# headroom after 306 GiB weights) serve viable: the small HBM pool holds the
+# live working set, HiCache extends the cold-prefix tail onto 870 GiB LPDDR.
+#
+# HICACHE_ENABLE=0 by default to match the proven kimi-k3 run (2920471). Enable
+# with HICACHE_ENABLE=1 for the real 1-node serve (and for any 2-node run that
+# wants the extra prefix-cache headroom). Verified on clariden 2026-08-05
+# (kimi-k3 jobs 3008263/3009024/3010201): boots cleanly, no measured throughput
+# cost, ~59 GB/node LPDDR at ratio 1.0.
+#   - HICACHE_WRITE_POLICY=write_back is the ONLY working policy on the
+#     kimi-k3 image: write_through_selective never backs up (hit-count trigger
+#     is dead in the UnifiedRadixCache hybrid-SSM path) — do not use it.
+#     TODO(unverified): confirm the same on the glm-5.3-flash image; if it
+#     differs, override HICACHE_WRITE_POLICY.
+#   - HICACHE_IO_BACKEND=kernel uses sgl_kernel.kvcacheio ops (verified present
+#     in the aarch64 kimi-k3 image; the preflight below checks them on this image).
+# Defaults: ratio 1.0, policy write_back, io kernel.
+export HICACHE_ENABLE="${HICACHE_ENABLE:-0}"
+export HICACHE_RATIO="${HICACHE_RATIO:-1.0}"
+export HICACHE_WRITE_POLICY="${HICACHE_WRITE_POLICY:-write_back}"
+export HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
+
 # --- Scheduler + NCCL watchdogs (fixes 11/12/13 from kimi-k3 clariden) ------
 # sglang's HARD scheduler watchdog (ServerArgs.watchdog_timeout, default 300 s,
 # soft=False) raises on any forward batch longer than the limit, and that
@@ -375,7 +406,7 @@ echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME  ctx=$CTX_LE
 echo "[$(date -Is)] edf=$OTELA_EDF_NAME  image=$IMAGE"
 echo "[$(date -Is)] otela=$OTELA_BIN  bootstrap=$OTELA_RELAY_ADDR"
 echo "[$(date -Is)] watchdog=$WATCHDOG_TIMEOUT soft=$SOFT_WATCHDOG_TIMEOUT dist=$DIST_TIMEOUT  health_timeout=$HEALTH_TIMEOUT"
-echo "[$(date -Is)] gen_probe=$GEN_PROBE  smoke=$GEN_CORRECTNESS_SMOKE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  load_format=$LOAD_FORMAT  speculative=$GLM53_SPECULATIVE"
+echo "[$(date -Is)] gen_probe=$GEN_PROBE  smoke=$GEN_CORRECTNESS_SMOKE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  load_format=$LOAD_FORMAT  speculative=$GLM53_SPECULATIVE  hicache=$HICACHE_ENABLE/$HICACHE_RATIO/$HICACHE_WRITE_POLICY"
 echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
 
 # ----------------------------------------------------------------- preflight --
@@ -572,6 +603,20 @@ if [ "${GLM53_SPECULATIVE:-0}" = "1" ]; then
                --speculative-num-draft-tokens 8)
   echo "[rank $RANK] WARN: speculative decoding ENABLED — GLM-5.3 EAGLE draft path is TODO(unverified) on sm_90." >&2
 fi
+
+# --- HiCache args (Grace LPDDR prefix-cache extension; see top-level) ------
+# Gated on HICACHE_ENABLE=1. The := fallbacks MATCH the proven defaults
+# (write_back, 1.0, kernel) — NOT write_through_selective, which the kimi-k3
+# image docs say never backs up in the hybrid-SSM path.
+HICACHE_ARGS=()
+if [ "${HICACHE_ENABLE:-0}" = "1" ]; then
+  HICACHE_ARGS+=(--enable-hierarchical-cache
+                 --hicache-ratio "${HICACHE_RATIO:-1.0}"
+                 --hicache-write-policy "${HICACHE_WRITE_POLICY:-write_back}"
+                 --hicache-io-backend "${HICACHE_IO_BACKEND:-kernel}")
+  echo "[rank $RANK] hicache: ENABLED ratio=${HICACHE_RATIO:-1.0} policy=${HICACHE_WRITE_POLICY:-write_back} io=${HICACHE_IO_BACKEND:-kernel}" >&2
+fi
+ENGINE_CMD+=(${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"})
 
 ENGINE_CMD+=(${SGLANG_EXTRA_ARGS:+ $SGLANG_EXTRA_ARGS})
 
