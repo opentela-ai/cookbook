@@ -838,9 +838,10 @@ ENGINE_CMD=(python -m sglang.launch_server
   --host 0.0.0.0 --port "$SERVE_PORT")
 
 # GLM-5.3 reasoning + tool-call parsers (cookbook: glm45 / glm47).
+# NOTE: this sglang build has NO --enable-auto-tool-choice (that's a vLLM
+# flag); tool_choice is handled per-request. Just the two parser flags.
 if [ "${GLM53_ENABLE_PARSERS:-1}" = "1" ]; then
   ENGINE_CMD+=(
-    --enable-auto-tool-choice
     --reasoning-parser "$GLM53_REASONING_PARSER"
     --tool-call-parser "$GLM53_TOOL_CALL_PARSER"
   )
