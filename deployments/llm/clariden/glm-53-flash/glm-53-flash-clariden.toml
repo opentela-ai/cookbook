@@ -1,0 +1,60 @@
+# GLM-5.3-Flash on clariden (GH200 / sm_90, aarch64). The image is
+# docker://lmsysorg/sglang:glm-5.3-flash (a GLM-5.3-specific SGLang build,
+# multi-arch amd64 + arm64 — on aarch64 enroot import pulls the arm64
+# manifest) imported to a local .sqsh ONCE so a multi-node serving job does
+# not re-pull per node. See build_glm_5_3_flash_image.sbatch (run once on a
+# login node) to produce the .sqsh this points at.
+#
+# Netstack selection (CSCS docs: software/container-engine/resource-hook/
+# #hpe-slingshot-interconnect): the Clariden vCluster defaults to
+# com.hooks.netstack.source="artifact", so the aws_ofi_nccl hook bind-mounts a
+# standalone, dynamically-linked (+dl) netstack (libfabric + aws-ofi-ccl plugin)
+# from /capstor/store/cscs/cscs/public/containers/netstack/. The default aarch64
+# artifact is gpu:cuda13,cxi:12.0.1,ofi:2.5.1,aws:1.18.0+dl — the +dl plugin is
+# CUDA-version-portable, so it matches this image regardless of the image's own
+# CUDA version (TODO(unverified): confirm the image's CUDA/sm_90 cubin set on
+# first import). On artifact source the com.hooks.aws_ofi_nccl.variant
+# annotation is IGNORED; on the rare source=host, the docs' recommended variant
+# is cuda-dl (not static cuda13).
+image = "/capstor/scratch/cscs/xyao/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/glm-53-flash"
+
+[env]
+# Per-rank HOME on /capstor (NOT /users — quota-limited NFS). otela writes a
+# libp2p identity + a badger DB under $HOME/.config/opentela / $HOME/.ocfcore;
+# a shared HOME across ranks/jobs collides, and a quota HOME eventually returns
+# ESTALE which freezes the CRDT (the JSC recipe documents this failure in
+# detail). The serve script overrides this per rank (SLURM_PROCID); the value
+# here is the base for rank 0 / single-rank runs.
+HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/xdg"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/triton"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+PYTHONNOUSERSITE = "1"
+PYTHONPATH = ""
+NCCL_DEBUG = "WARN"
+
+[annotations]
+# com.hooks.aws_ofi_nccl is the CSCS Slurm/enroot hook that, at container start,
+# bind-mounts the netstack artifact's libfabric + dynamically-linked (+dl)
+# libnccl-net.so and sets the CXI/NCCL env that gives NCCL the native Slingshot
+# transport and helps prevent application stalls (per CSCS resource-hook docs).
+# The hook implicitly enables the CXI hook, so it need not be set separately.
+# Without it NCCL falls back to TCP sockets over hsn0 — works for PP pipeline
+# P2P but is much slower and cannot do cross-node allreduce in a CUDA graph
+# (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only supports RDMA
+# transport protocol"). SCOPE: this hook configures the NCCL DATA plane only;
+# it does NOT cover Gloo, which carries the PP control plane over TCP (hsn0) —
+# see README fix #11/#12 for the Gloo peer-disconnect stalls (carried from the
+# kimi-k3 clariden recipe, same site/fabric).
+com.hooks.aws_ofi_nccl.enabled = "true"

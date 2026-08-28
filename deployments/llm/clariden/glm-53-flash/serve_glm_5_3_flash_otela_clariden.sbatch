@@ -93,7 +93,7 @@
 # -----------------------------------------------------------------------------
 # CONTAINER + NCCL ON SLINGSHOT (the clariden-specific part)
 # -----------------------------------------------------------------------------
-# Image is docker://lmsysorg/sglang:glm-5.3-Flash (a GLM-5.3-specific SGLang
+# Image is docker://lmsysorg/sglang:glm-5.3-flash (a GLM-5.3-specific SGLang
 # build, multi-arch amd64 + arm64 — on aarch64 enroot import pulls the arm64
 # manifest with sm_90 cubins for GH200) imported to a local .sqsh ONCE
 # (build_glm_5_3_flash_image.sbatch). The EDF (glm-53-flash-clariden.toml,
@@ -416,7 +416,7 @@ echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
   echo "FATAL: image not found: $IMAGE" >&2
   echo "       Import it ONCE on a login node with build_glm_5_3_flash_image.sbatch" >&2
   echo "       (next to this sbatch), which runs:" >&2
-  echo "         enroot import -o $IMAGE docker://lmsysorg/sglang:glm-5.3-Flash" >&2
+  echo "         enroot import -o $IMAGE docker://lmsysorg/sglang:glm-5.3-flash" >&2
   exit 1
 }
 if [ "$LOAD_FORMAT" != "dummy" ]; then
@@ -453,7 +453,7 @@ echo "[$(date -Is)] container preflight (EDF=$OTELA_EDF_NAME) ..."
 if ! srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --environment="$OTELA_EDF_NAME" python3 -c '
 import sglang
-# GLM-5.3 model class. The image is docker://lmsysorg/sglang:glm-5.3-Flash,
+# GLM-5.3 model class. The image is docker://lmsysorg/sglang:glm-5.3-flash,
 # so its transformers MUST ship the glm5_next architecture. We check the
 # text model class (Glm5NextForCausalLM) — the multimodal wrapper
 # (Glm5NextForConditionalGeneration) wraps it.
