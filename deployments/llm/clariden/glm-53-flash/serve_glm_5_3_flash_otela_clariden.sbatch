@@ -400,14 +400,89 @@ mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
 # 3600 s (1 h) so even a non-zero slow rank gets up to 1 h to finish loading
 # from Lustre. Verified on kimi-k3 (job 3000965, all 32 ranks reached "Load
 # weight end" with a 29-min spread, zero exceptions).
+#
+# GLM-5.3 clariden fix (kpool-tail backend must respect FA3 availability):
+# Root cause of smoke job 3208291, which crashed during CUDA-graph
+# capture ~6 min in (no 2.5h real-weight load) with:
+#   ImportError: cannot import name 'flash_ops' from 'sgl_kernel'
+#   ImportError: Can not import FA3 in sgl_kernel.
+# DeepseekSparseAttnBackend._resolve_kpool_tail_backend (sglang/srt/layers/attention/
+# dsa_backend.py:887) hard-overrides dsa_impl "flashmla_sparse" -> "fa3"
+# on sm_90 (and -> "trtllm" on sm_100+), ASSUMING FA3/TRT-LLM is
+# installed. GLM-5.3 is MULTIMODAL (topk_indices != None,
+# dsa_index_kpool > 1), so the override fires on GH200 (sm_90) NO MATTER
+# what CLI flag we pass: --dsa-decode-backend flashmla_sparse DID take
+# effect in server_args (verified) but was then clobbered to fa3. The
+# aarch64 lmsysorg/sglang:glm-5.3-flash image ships sgl_kernel.flash_mla
+# (flash_mla_sparse_fwd, flash_mla_with_kvcache — NO FA3 dep) but NOT
+# sgl_kernel.flash_ops (sgl_kernel/flash_attn.py raises ImportError). So
+# _forward_fa3 -> flash_attn_v3._load_fa3_kernels -> ImportError at
+# capture, killing all 4 TP ranks. kimi-k3 (also hybrid linear+DSA) did
+# NOT hit this: its kpool is <= 1, so the override's guard returns early
+# and flashmla wins — which is why the same site served kimi-k3 but
+# crashes GLM-5.3.
+# FIX (below): monkey-patch _resolve_kpool_tail_backend to be AVAILABILITY-
+# AWARE — keep flashmla_sparse (the image's own auto-selection, which uses
+# sgl_kernel.flash_mla — verified FA3-free) when the target backend can't
+# be imported. Behavior-preserving on arches where fa3/trtllm ARE present
+# (e.g. an x86 GH200 run). Mirrors the kimi-k3 clariden fix-3 philosophy
+# ("force flashmla where fa3 was auto-selected") applied to the kpool-tail
+# override specifically — the exact analog of the kimi-k3
+# --decode-attention-backend flashmla fix, one override deeper.
 cat > "$PATCH_DIR/sitecustomize.py" <<'PYEOF'
 import os
+
+# ---- kimi-k3 fix 10: dist barrier timeout after model load ------------
 try:
     import sglang.srt.model_executor.model_runner_components.load_model_utils as _lm
     _lm.UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
         os.environ.get("UNBALANCED_MODEL_LOADING_TIMEOUT_S", "3600"))
 except Exception:
     pass  # sglang not installed yet (e.g. preflight) — skip
+
+# ---- GLM-5.3 clariden: kpool-tail backend must respect FA3 availability
+try:
+    import importlib as _il
+
+    def _importable(name):
+        try:
+            _il.import_module(name)
+            return True
+        except Exception:
+            return False
+
+    # sgl_kernel.flash_ops is the symbol FA3 actually needs. On aarch64 it
+    # is MISSING (only flash_mla is present); on x86 it is present. Probe
+    # once at patch time — availability is fixed for the process lifetime.
+    _fa3_ok = _importable("sgl_kernel.flash_ops")
+    from sglang.srt.layers.attention import dsa_backend as _db
+
+    def _resolve_kpool_tail_backend_fa3safe(self, topk_indices, dsa_impl):
+        # Replicate the original guard verbatim (all pass-through cases).
+        if (topk_indices is None
+                or self.dsa_index_kpool <= 1
+                or dsa_impl != "flashmla_sparse"):
+            return dsa_impl
+        target = ("trtllm" if self.device_sm_major >= 10 else
+                  "fa3" if self.device_sm_major == 9 else dsa_impl)
+        if target == dsa_impl:
+            return dsa_impl
+        # Apply the perf override ONLY when the target is importable on this
+        # arch. On aarch64 (no flash_ops/FA3) keep flashmla_sparse — the
+        # image's own auto-selection, which routes to
+        # sgl_kernel.flash_mla.flash_mla_sparse_fwd (no FA3 dep) — instead of
+        # crashing at CUDA-graph capture (job 3208291).
+        if target == "fa3" and not _fa3_ok:
+            return dsa_impl
+        if target == "trtllm" and not _importable("tensorrt_llm"):
+            return dsa_impl
+        return target
+
+    _db.DeepseekSparseAttnBackend._resolve_kpool_tail_backend = _resolve_kpool_tail_backend_fa3safe
+except Exception as _e:  # sglang/dsa_backend not importable yet (preflight)
+    import sys
+    sys.stderr.write(
+        f"[sitecustomize] kpool-tail FA3-safe patch skipped: {_e!r}\n")
 PYEOF
 export PATCH_DIR
 
@@ -482,7 +557,12 @@ except Exception as e:
 # depend on the image build; presence (or absence) here guides which
 # backend the image auto-resolves to. Missing ops are NOT fatal — the
 # image may provide them under different names or via Triton.
-for mod in ["sgl_kernel.flash_mla", "sgl_kernel.kvcacheio"]:
+# sgl_kernel.flash_ops is the symbol FA3 needs. On aarch64 it is MISSING
+# (only flash_mla is present); the sitecustomize kpool-tail FA3-safe patch
+# is ACTIVE precisely when flash_ops is absent on sm_90. Printing the
+# import result here makes this fix self-documenting at runtime
+# (job 3208291 crashed because the override assumed fa3 present).
+for mod in ["sgl_kernel.flash_mla", "sgl_kernel.kvcacheio", "sgl_kernel.flash_ops"]:
     try:
         __import__(mod)
         print(f"preflight: {mod} OK")
