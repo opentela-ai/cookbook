@@ -253,6 +253,20 @@ export CG_DECODE="${CG_DECODE:-full}"
 # (verified: flash_attn_func has zero call sites in VisionTritonAttention).
 export GLM53_MM_ATTENTION="${GLM53_MM_ATTENTION:-triton_attn}"
 
+# Reasoning + tool-call parsers (mirrors the GLM-5.2 beverin recipe:
+# --reasoning-parser glm45 --tool-call-parser glm47). Verified present in this
+# aarch64 image: Glm45Detector (sglang/srt/parser/reasoning_parser.py:657,
+# delimiters imd/</think>; tool_start_token <arg_key>) and
+# Glm47MoeDetector (sglang/srt/function_call/glm47_moe_detector.py,
+# <tool_call>...</tool_call> XML framing). Gated: set GLM53_ENABLE_PARSERS=0
+# if a future image bump drops them (startup errors 'invalid reasoning
+# parser' / 'invalid tool call parser' first). The /v1/completions probe
+# below is unaffected (no chat template / tools applied), so parsing stays
+# out of the mandatory gate; these flags only affect /v1/chat/completions.
+export GLM53_REASONING_PARSER="${GLM53_REASONING_PARSER:-glm45}"
+export GLM53_TOOL_CALL_PARSER="${GLM53_TOOL_CALL_PARSER:-glm47}"
+export GLM53_ENABLE_PARSERS="${GLM53_ENABLE_PARSERS:-1}"
+
 # Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
 # 1048576 (1M). The KV pool is sized by MEM_FRAC, not this value. Default
 # 32768 for a fast cold start + probe (shorter than the kimi-k3 1M default
@@ -633,7 +647,7 @@ echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME  ctx=$CTX_LE
 echo "[$(date -Is)] edf=$OTELA_EDF_NAME  image=$IMAGE"
 echo "[$(date -Is)] otela=$OTELA_BIN  bootstrap=$OTELA_RELAY_ADDR"
 echo "[$(date -Is)] watchdog=$WATCHDOG_TIMEOUT soft=$SOFT_WATCHDOG_TIMEOUT dist=$DIST_TIMEOUT  health_timeout=$HEALTH_TIMEOUT"
-echo "[$(date -Is)] gen_probe=$GEN_PROBE  smoke=$GEN_CORRECTNESS_SMOKE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  load_format=$LOAD_FORMAT  speculative=$GLM53_SPECULATIVE  hicache=$HICACHE_ENABLE/$HICACHE_RATIO/$HICACHE_WRITE_POLICY"
+echo "[$(date -Is)] parsers=$GLM53_REASONING_PARSER/$GLM53_TOOL_CALL_PARSER/$GLM53_ENABLE_PARSERS  gen_probe=$GEN_PROBE  smoke=$GEN_CORRECTNESS_SMOKE  min_pass=$GEN_CORRECTNESS_MIN_PASS  max_tokens=$GEN_CORRECTNESS_MAX_TOKENS  load_format=$LOAD_FORMAT  speculative=$GLM53_SPECULATIVE  hicache=$HICACHE_ENABLE/$HICACHE_RATIO/$HICACHE_WRITE_POLICY"
 echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
 
 # ----------------------------------------------------------------- preflight --
@@ -822,6 +836,15 @@ ENGINE_CMD=(python -m sglang.launch_server
   --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT"
   --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health
   --host 0.0.0.0 --port "$SERVE_PORT")
+
+# GLM-5.3 reasoning + tool-call parsers (cookbook: glm45 / glm47).
+if [ "${GLM53_ENABLE_PARSERS:-1}" = "1" ]; then
+  ENGINE_CMD+=(
+    --enable-auto-tool-choice
+    --reasoning-parser "$GLM53_REASONING_PARSER"
+    --tool-call-parser "$GLM53_TOOL_CALL_PARSER"
+  )
+fi
 
 # LOAD_FORMAT override (e.g. dummy for a fast forward-path smoke run).
 if [ -n "${LOAD_FORMAT:-}" ] && [ "${LOAD_FORMAT:-}" != "auto" ]; then
