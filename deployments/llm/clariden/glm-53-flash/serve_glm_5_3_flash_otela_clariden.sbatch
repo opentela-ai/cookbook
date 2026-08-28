@@ -192,31 +192,47 @@ export MOE_BACKEND="${MOE_BACKEND:-auto}"
 #     head_dim 128, short_conv_kernel_size 4, with KDA on 34 of them)
 #   - 11/45 layers are DeepSeek Sparse Attention (DSA) — every 4th layer
 #     (indices 3,7,11,...,43)
-# The glm-5.3-flash image auto-resolves the attention backends from the
-# model's layer_types + index_types config. Verified on the first smoke
-# (job 3208159, dummy weights): it set attention_backend=dsa,
-# dsa_prefill_backend=flashmla_sparse, mamba_backend=triton (all fine —
-# sgl_kernel.flash_mla is present on this aarch64 image) BUT it chose
-# dsa_decode_backend=fa3, and FA3 is ABSENT on aarch64 sgl_kernel (only
-# flash_mla, no flash_ops) — the SAME root cause as kimi-k3 clariden fix 3,
-# manifesting on the DSA DECODE backend instead of the general decode one.
-# The engine crashed during CUDA-graph capture: "cannot import name
-# 'flash_ops' from 'sgl_kernel' ... Can not import FA3".
+# The glm-5.3-flash image auto-resolves attention_backend=dsa,
+# mamba_backend=triton (the 34 linear/KDA layers — no flash dep) and the
+# DSA backends from the model's layer_types + index_types config.
 #
-# FIX (GLM-5.3 analog of kimi-k3 fix 3): pin BOTH DSA backends to
-# flashmla_sparse (which uses sgl_kernel.flash_mla, confirmed present).
-# Set BOTH --dsa-prefill-backend AND --dsa-decode-backend together, mirroring
-# the kimi-k3 "set both prefill+decode or auto-resolution cancels" lesson —
-# setting only one DSA knob risks the other reverting to fa3. Do NOT pass
-# the kimi-k3 GENERAL knobs (--prefill/decode-attention-backend): those
-# target non-DSA models and would break GLM-5.3's linear-attention layers.
-# The linear (mamba/KDA) layers are unaffected — mamba_backend=triton needs
-# no flash dependency.
-# Valid DSA backend choices (from the glm52 beverin recipe):
-# flashmla_sparse, flashmla_sparse_q8, flashmla_kv, flashmla_auto, fa3,
-# tilelang, aiter, trtllm (fa3/trtllm are NVIDIA-only -> crash on aarch64).
-export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-flashmla_sparse}"
-export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-flashmla_sparse}"
+# THE kpool>1 HARD GATE (the load-bearing constraint, jobs 3208159 /
+# 3208291 / 3209156):
+# GLM-5.3 is MULTIMODAL with dsa_index_kpool > 1. sglang's
+# DeepseekSparseAttnBackend has TWO guards around kpool>1:
+#   1. _resolve_kpool_tail_backend (L887): perf override flashmla_sparse
+#      -> fa3 on sm_90 (-> trtllm on sm_100+). Fixed by sitecustomize.py
+#      (availability-aware: keeps flashmla_sparse when FA3 absent).
+#   2. _check_kpool_tail_backend (L869): a HARD correctness gate, raised on
+#      EVERY forward (not just capture) when kpool>1 and dsa_impl is NOT in
+#      {fa3, tilelang, trtllm}: "index_kpool > 1 appends tail tokens to
+#      topk_indices and is currently only supported by the FA3/TileLang/
+#      TRTLLM DSA backend." flashmla_sparse is NOT in that set — it does
+#      not implement the tail-token append. So forcing flashmla_sparse
+#      (the kimi-k3 fix, one level up) is WRONG here: job 3209156 got a
+#      clean NotImplementedError at capture instead of the cryptic FA3
+#      ImportError, proving BOTH guards and pinpointing the real fix.
+#
+# aarch64 availability of the kpool>1-legal backends (verified on this
+# image):
+#   fa3         -> sgl_kernel.flash_ops MISSING    (ImportError)
+#   trtllm      -> tensorrt_llm MISSING             (NVIDIA-only)
+#   tilelang    -> IMPORTABLE (sglang.kernels.ops.attention.dsa.
+#                  tilelang_kernel.tilelang_sparse_fwd). _forward_tilelang
+#                  (L4143) explicitly handles the kpool tail (mask-pads to
+#                  next 64-col block) and has NO FA3 dependency.
+# => tilelang is the ONLY kpool>1 DSA backend both supported AND present
+#    on aarch64. Pin BOTH --dsa-prefill-backend AND --dsa-decode-backend to
+#    it: forward_extend (L3080) AND forward_decode (L3409) both hit the
+#    hard gate, so the prefill backend must be tilelang too.
+# Do NOT pass the kimi-k3 GENERAL knobs (--prefill/decode-attention-backend):
+# those target non-DSA models and would break the 34 linear-attention layers
+# (mamba_backend=triton, no flash dep — needs no override).
+# PERF TODO(unverified): tilelang on sm_90 may be slower than the fa3 path
+# is on x86. If a future GLM-5.3 aarch64 image adds sgl_kernel.flash_ops,
+# revisit (fa3 would then pass both guards AND run).
+export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
+export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
 export CG_DECODE="${CG_DECODE:-full}"
 
 # Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
@@ -421,14 +437,24 @@ mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
 # NOT hit this: its kpool is <= 1, so the override's guard returns early
 # and flashmla wins — which is why the same site served kimi-k3 but
 # crashes GLM-5.3.
-# FIX (below): monkey-patch _resolve_kpool_tail_backend to be AVAILABILITY-
-# AWARE — keep flashmla_sparse (the image's own auto-selection, which uses
-# sgl_kernel.flash_mla — verified FA3-free) when the target backend can't
-# be imported. Behavior-preserving on arches where fa3/trtllm ARE present
-# (e.g. an x86 GH200 run). Mirrors the kimi-k3 clariden fix-3 philosophy
-# ("force flashmla where fa3 was auto-selected") applied to the kpool-tail
-# override specifically — the exact analog of the kimi-k3
-# --decode-attention-backend flashmla fix, one override deeper.
+#
+# PRIMARY FIX (above, in the attention-backends block): pin BOTH DSA
+# backends to `tilelang` — the ONLY kpool>1-legal backend (per the
+# _check_kpool_tail_backend hard gate at L869) that is both supported AND
+# present on aarch64 (fa3/trtllm missing; flashmla_sparse doesn't
+# implement the tail-token append and trips the same hard gate).
+#
+# THIS PATCH (below) is a DEFENSIVE guard, not the primary mechanism — it
+# is INERT when the tilelang pins are in effect (the override's third
+# guard, dsa_impl != "flashmla_sparse", returns early). Its job: if a
+# future operator overrides GLM53_DSA_*_BACKEND back to flashmla_sparse on
+# aarch64, this keeps flashmla_sparse past _resolve_kpool_tail_backend so
+# the engine dies with the CLEAR _check_kpool_tail_backend
+# NotImplementedError ("...only supported by the FA3/TileLang/TRTLLM DSA
+# decode backend") instead of the cryptic FA3 ImportError — same root
+# cause, faster diagnosis. Behavior-preserving on arches where fa3/trtllm
+# ARE present (e.g. an x86 GH200 run): _fa3_ok is probed once at patch time
+# and the perf override applies normally when True.
 cat > "$PATCH_DIR/sitecustomize.py" <<'PYEOF'
 import os
 
@@ -652,12 +678,15 @@ python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_
 # --mamba-ssm-dtype). Those target non-DSA models and would break GLM-5.3's
 # 34 linear-attention layers (mamba_backend=triton, no flash dependency).
 # We DO pin the DSA-SPECIFIC backends (--dsa-prefill-backend /
-# --dsa-decode-backend) to flashmla_sparse, because the aarch64 sgl_kernel
-# has no FA3 (smoke job 3208159: auto-resolution chose dsa_decode_backend=
-# fa3 and crashed at CUDA-graph capture with "cannot import flash_ops from
-# sgl_kernel" — the kimi-k3 fix-3 root cause, one layer up). Set BOTH DSA
-# knobs together, mirroring the kimi-k3 "set both or auto-resolution
-# cancels" lesson — setting only one risks the other reverting to fa3.
+# --dsa-decode-backend) to tilelang — the ONLY kpool>1-legal DSA backend
+# (per _check_kpool_tail_backend's hard gate, L869) that is both supported
+# AND present on aarch64 (fa3: sgl_kernel.flash_ops MISSING; trtllm:
+# tensorrt_llm MISSING; flashmla_sparse: doesn't implement the tail-token
+# append and trips the same hard gate). See the attention-backends block
+# above for the full jobs-3208159/3208291/3209156 trail and the
+# availability table. Set BOTH DSA knobs together: forward_extend (L3080)
+# AND forward_decode (L3409) each hit the hard gate, so the prefill
+# backend must be tilelang too.
 #
 # CRITICAL DIFFERENCE vs GLM-5.2 on beverin: we do NOT pass --disable-cuda-graph
 # or --skip-server-warmup. Those were MI300A (gfx942) workarounds for the
