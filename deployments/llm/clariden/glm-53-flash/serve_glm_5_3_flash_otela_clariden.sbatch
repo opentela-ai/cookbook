@@ -192,15 +192,31 @@ export MOE_BACKEND="${MOE_BACKEND:-auto}"
 #     head_dim 128, short_conv_kernel_size 4, with KDA on 34 of them)
 #   - 11/45 layers are DeepSeek Sparse Attention (DSA) — every 4th layer
 #     (indices 3,7,11,...,43)
-# The glm-5.3-Flash image is purpose-built and auto-resolves the attention
-# backends from the model's layer_types + index_types config. Unlike kimi-k3
-# (which REQUIRED explicit --prefill/decode-attention-backend flashmla on
-# clariden because the aarch64 sgl_kernel has no FA3), GLM-5.3's linear+DSA
-# path is handled by image-specific backends. DO NOT pass the kimi-k3
-# flashmla knobs here — they would cancel GLM-5.3's auto-resolution and
-# break the linear-attention layers. TODO(unverified): on the first run,
-# check the "attention backend" log lines per layer type; if the image does
-# not auto-resolve, add the image-specific backend flags it expects.
+# The glm-5.3-flash image auto-resolves the attention backends from the
+# model's layer_types + index_types config. Verified on the first smoke
+# (job 3208159, dummy weights): it set attention_backend=dsa,
+# dsa_prefill_backend=flashmla_sparse, mamba_backend=triton (all fine —
+# sgl_kernel.flash_mla is present on this aarch64 image) BUT it chose
+# dsa_decode_backend=fa3, and FA3 is ABSENT on aarch64 sgl_kernel (only
+# flash_mla, no flash_ops) — the SAME root cause as kimi-k3 clariden fix 3,
+# manifesting on the DSA DECODE backend instead of the general decode one.
+# The engine crashed during CUDA-graph capture: "cannot import name
+# 'flash_ops' from 'sgl_kernel' ... Can not import FA3".
+#
+# FIX (GLM-5.3 analog of kimi-k3 fix 3): pin BOTH DSA backends to
+# flashmla_sparse (which uses sgl_kernel.flash_mla, confirmed present).
+# Set BOTH --dsa-prefill-backend AND --dsa-decode-backend together, mirroring
+# the kimi-k3 "set both prefill+decode or auto-resolution cancels" lesson —
+# setting only one DSA knob risks the other reverting to fa3. Do NOT pass
+# the kimi-k3 GENERAL knobs (--prefill/decode-attention-backend): those
+# target non-DSA models and would break GLM-5.3's linear-attention layers.
+# The linear (mamba/KDA) layers are unaffected — mamba_backend=triton needs
+# no flash dependency.
+# Valid DSA backend choices (from the glm52 beverin recipe):
+# flashmla_sparse, flashmla_sparse_q8, flashmla_kv, flashmla_auto, fa3,
+# tilelang, aiter, trtllm (fa3/trtllm are NVIDIA-only -> crash on aarch64).
+export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-flashmla_sparse}"
+export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-flashmla_sparse}"
 export CG_DECODE="${CG_DECODE:-full}"
 
 # Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
@@ -402,7 +418,7 @@ export HEAD_IP="$(getent hosts "$HEAD" | awk '{print $1}' | head -1)"
 
 echo "[$(date -Is)] job=$SLURM_JOB_ID nodes=$SLURM_JOB_NODELIST"
 echo "[$(date -Is)] head=$HEAD ($HEAD_IP)  tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE nnodes=$NNODES"
-echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME  ctx=$CTX_LEN  mem=$MEM_FRAC  moe=$MOE_BACKEND  cg_decode=$CG_DECODE"
+echo "[$(date -Is)] model=$MODEL_PATH  served_as=$SERVED_MODEL_NAME  ctx=$CTX_LEN  mem=$MEM_FRAC  moe=$MOE_BACKEND  dsa=$GLM53_DSA_PREFILL/$GLM53_DSA_DECODE  cg_decode=$CG_DECODE"
 echo "[$(date -Is)] edf=$OTELA_EDF_NAME  image=$IMAGE"
 echo "[$(date -Is)] otela=$OTELA_BIN  bootstrap=$OTELA_RELAY_ADDR"
 echo "[$(date -Is)] watchdog=$WATCHDOG_TIMEOUT soft=$SOFT_WATCHDOG_TIMEOUT dist=$DIST_TIMEOUT  health_timeout=$HEALTH_TIMEOUT"
@@ -551,16 +567,17 @@ python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_
 # model_type=glm5_next, 45 layers, 288 experts top-8, DSA+linear+KDA hybrid,
 # MTP, FP8 e4m3 dynamic quant — read directly from disk, NOT hardcoded here).
 #
-# CRITICAL DIFFERENCE vs kimi-k3 clariden: we do NOT pass
-# --prefill-attention-backend / --decode-attention-backend / --mamba-ssm-dtype.
-# kimi-k3 needed explicit flashmla because the aarch64 sgl_kernel has no FA3
-# and setting only one knob cancels auto-resolution. GLM-5.3-Flash has a
-# HYBRID attention scheme (34 linear + 11 DSA layers, with KDA) that the
-# purpose-built image auto-resolves from the model's layer_types config.
-# Passing the kimi-k3 flashmla knobs here would break the linear-attention
-# layers. TODO(unverified): on the first run, check the per-layer attention
-# backend log lines; if the image does NOT auto-resolve, add the
-# image-specific backend flags it expects (do not copy from kimi-k3).
+# CRITICAL DIFFERENCE vs kimi-k3 clariden: we do NOT pass the GENERAL
+# knobs (--prefill-attention-backend / --decode-attention-backend /
+# --mamba-ssm-dtype). Those target non-DSA models and would break GLM-5.3's
+# 34 linear-attention layers (mamba_backend=triton, no flash dependency).
+# We DO pin the DSA-SPECIFIC backends (--dsa-prefill-backend /
+# --dsa-decode-backend) to flashmla_sparse, because the aarch64 sgl_kernel
+# has no FA3 (smoke job 3208159: auto-resolution chose dsa_decode_backend=
+# fa3 and crashed at CUDA-graph capture with "cannot import flash_ops from
+# sgl_kernel" — the kimi-k3 fix-3 root cause, one layer up). Set BOTH DSA
+# knobs together, mirroring the kimi-k3 "set both or auto-resolution
+# cancels" lesson — setting only one risks the other reverting to fa3.
 #
 # CRITICAL DIFFERENCE vs GLM-5.2 on beverin: we do NOT pass --disable-cuda-graph
 # or --skip-server-warmup. Those were MI300A (gfx942) workarounds for the
@@ -578,6 +595,8 @@ ENGINE_CMD=(python -m sglang.launch_server
   --dist-init-addr "$HEAD_IP:$DIST_PORT"
   --dist-timeout "$DIST_TIMEOUT"
   --moe-runner-backend "$MOE_BACKEND"
+  --dsa-prefill-backend "$GLM53_DSA_PREFILL"
+  --dsa-decode-backend "$GLM53_DSA_DECODE"
   --cuda-graph-backend-decode "$CG_DECODE"
   --context-length "$CTX_LEN" --mem-fraction-static "$MEM_FRAC"
   --watchdog-timeout "$WATCHDOG_TIMEOUT" --soft-watchdog-timeout "$SOFT_WATCHDOG_TIMEOUT"
