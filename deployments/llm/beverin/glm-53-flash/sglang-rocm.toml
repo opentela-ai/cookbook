@@ -1,0 +1,124 @@
+# EDF for serving GLM-5.3-Flash (zai-org/GLM-5.3-Flash, FP8 e4m3 ~306 GB,
+# DeepSeek Sparse Attention + linear/KDA attention + MTP, MULTIMODAL) on
+# Beverin (AMD MI300A / gfx942) compute nodes — via a **Python-source overlay
+# of the CUDA-only `glm-5.3-flash` image onto the upstream ROCm image**.
+#
+# Why an overlay (the load-bearing design decision):
+#   * GLM-5.3-Flash needs a sglang build that SHIPS the `glm5_next` model +
+#     config + `communicator_mhc*` modules. The ONLY such image on CSCS is the
+#     Clariden aarch64/CUDA build `sglang-glm-5.3-flash.aarch64.sqsh`
+#     (sglang 0.0.0.dev1+g033446bb05, transformers 5.16.0.dev0, python 3.12).
+#     No upstream ROCm image has them (verified: v0.5.16 AND v0.5.18 lack
+#     `sglang/srt/configs/glm5_next.py`, `models/glm5_next{,_nextn}.py`,
+#     `srt/layers/communicator_mhc*.py`, `transformers/models/glm5_next/`).
+#   * The clariden build is cp312/CUDA — it CANNOT run on MI300A. But its
+#     sglang + transformers are PURE PYTHON (no ABI), so they import on the
+#     ROCm image's cp310 as long as the compiled deps (torch, sgl_kernel) come
+#     from the ROCm image and the few skewed pure/compiled deps
+#     (tokenizers, huggingface_hub, safetensors, regex, accelerate) are bumped
+#     to clariden's pinned versions as cp310 wheels.
+#   * The overlay (build_overlay.sh, sibling) extracts the clariden sglang +
+#     transformers source to $OVERLAY/sgl-workspace/{sglang/python,
+#     transformers/src} and `pip install --no-deps` the cp310 dep bumps to
+#     $OVERLAY/pkgs310. The EDF's PYTHONPATH below prepends BOTH over the
+#     image's defaults so:
+#       import sglang        -> $OVERLAY/sgl-workspace/sglang/python   (GLM-5.3)
+#       import transformers  -> $OVERLAY/sgl-workspace/transformers/src (5.16)
+#       import tokenizers/hub/safetensors/regex/accelerate -> $OVERLAY/pkgs310
+#       import torch/sgl_kernel/numpy/... -> image /opt/venv (ROCm, cp310)
+#   * `import kernels` is intentionally NOT installed: clariden transformers
+#     guards `from kernels import (...)` behind `if is_kernels_available()`;
+#     with no `kernels` present the guard is False and the integration is
+#     skipped (the version of `kernels` on PyPI needs a `kernels_data`
+#     companion that's easy to miss, and the kernel-from-Hub feature is not
+#     needed to serve GLM-5.3).
+#   * Import gate VERIFIED (job ran in this EDF): all of sglang, transformers,
+#     sgl_kernel, torch, sglang.srt.configs.glm5_next.Glm5NextConfig,
+#     sglang.srt.models.glm5_next.EntryClass[0] = Glm5NextForConditionalGeneration,
+#     sglang.srt.models.glm5_next_nextn, sglang.srt.function_call.glm47_moe_detector,
+#     transformers.models.glm5_next.Glm5NextForConditionalGeneration, and
+#     AutoConfig.from_pretrained(GLM-5.3-Flash) import/load OK on ROCm.
+#
+# Image (the ROCm RUNTIME base — only the compiled torch/sgl_kernel/aiter/
+# tilelang from here are used; all GLM-5.3 Python comes from the overlay):
+#   lmsysorg/sglang:v0.5.18-rocm720-mi30x (ROCm 7.2 userspace, gfx942/cp310).
+#   Pinned by MANIFEST digest (resolved 2026-08-29 from Docker Hub via the
+#   Docker-Content-Digest header, NOT the config digest — a config digest
+#   makes Pyxis 400 on `manifests/<sha256:...>`). Same pattern as glm52.
+#   The sqsh is already imported to .edf_imagestore under this exact tag;
+#   a moving tag would silently invalidate the Triton/tilelang JIT caches on
+#   shared /capstor. Manifest digest = sha256:2a4b6896...; config (NOT used
+#   here) = sha256:24787f3d... .
+image = "lmsysorg/sglang@sha256:2a4b6896f2d69e5562545b5abaaf00e8d8dbb14da736fa2f5f5bd47ce00bfb0f"
+
+mounts = [
+  "/capstor:/capstor",
+  "/users/xyao:/users/xyao",
+  "/iopsstor:/iopsstor",
+]
+
+workdir = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin"
+
+# --- the overlay (built once by build_overlay.sh, cached on /capstor) ----
+# The [env] PYTHONPATH below is literal (absolute) so the srun'd engine.sh
+# (CWD=$WORKDIR) resolves it the same way the preflight and the host-side
+# gen_correctness probe do.
+
+[env]
+# PYTHONPATH precedence (left wins). The clariden sglang + transformers are
+# PREPENDED so GLM-5.3's model/config/communicator_mhc modules resolve there
+# (not the image's GLM-5.3-less copies), and pkgs310 is FIRST so the bumped
+# tokenizers/hub/safetensors/regex/accelerate satisfy clariden transformers
+# 5.16's pins (tokenizers>=0.23.1, huggingface_hub>=1.5.0, safetensors>=0.8.0,
+# regex>=2025.10.22, accelerate>=1.1.0). torch/sgl_kernel/numpy are NOT in
+# pkgs310, so they fall through to the image's /opt/venv (ROCm, cp310).
+PYTHONPATH = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/pkgs310:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/sglang/python:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/transformers/src"
+PYTHONNOUSERSITE = "1"
+PIP_BREAK_SYSTEM_PACKAGES = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+
+# Per-rank HOME on /capstor (NOT /users — quota-limited). otela writes a libp2p
+# identity key + a badger DB under $HOME/.config/opentela; a shared HOME across
+# ranks/jobs collides. The serve script overrides this per rank (SLURM_PROCID)
+# for the otela worker; the value here is the base for rank 0 / single-node runs.
+HOME = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/home"
+HF_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/hf"
+XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/xdg"
+XDG_CONFIG_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/config"
+TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/triton"
+# Tilelang (a DSA prefill/decode backend candidate for GLM-5.3's kpool>1
+# layers — see the serve script) keeps its own compiled-kernel cache, separate
+# from Triton. Shared on /capstor so only the first run pays the JIT.
+TILELANG_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/tilelang"
+PIP_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/pip"
+# tempfile goes on /capstor, NOT the default /users/<u>/.tmp that Slurm hands
+# the container (home is quota-limited and sglang's tempfile cleanup on quota
+# dirs throws OSError [Errno 39]). The serve script also re-exports this.
+TMPDIR = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/cache/tmp"
+# MI300A + ROCm 7.2 hard-requires this or HIP/RCCL aborts at kernel launch
+# (mandatory on Beverin; see ~/.edf/minisgl-rocm.toml and tokenspeed-rocm*).
+HSA_NO_SCRATCH_RECLAIM = "1"
+ROCM_PATH = "/opt/rocm"
+HIP_PATH = "/opt/rocm"
+# /opt/rocm/lib MUST come first: some base images ship a stale libhsa-runtime64
+# in /lib/x86_64-linux-gnu that breaks torch import on MI300A.
+LD_LIBRARY_PATH = "/opt/rocm/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib"
+# Cross-node TP allreduce runs over RCCL Socket transport on Slingshot. The
+# engine.sh wrapper unsets NCCL_NET_PLUGIN/NCCL_NET (the image ships a
+# CUDA-built aws_ofi_nccl plugin that cannot init on ROCm), pins
+# NCCL_SOCKET_IFNAME=hsn0 and NCCL_IB_DISABLE=1. Keep IFNAME=hsn here as the
+# single-node default (engine.sh's export wins for the multi-node case).
+NCCL_SOCKET_IFNAME = "hsn"
+# SGLANG_USE_AITER governs the DSA indexer's preshuffle paged-MQA path
+# (aiter_can_use_preshuffle_paged_mqa() in dsa/utils.py checks it FIRST).
+# On MI300A, GLM-5.2 saw BOTH values misbehave (0 -> decode hang @100% GPU;
+# 1 -> first forward never starts @0% GPU). GLM-5.3's DSA backends are pinned
+# to tilelang (kpool>1-legal; see serve script), which does NOT go through the
+# aiter preshuffle path, so SGLANG_USE_AITER is mostly inert here — kept at 1
+# (the GLM-5.2 default) and overridable for diagnosis.
+SGLANG_USE_AITER = "1"
+
+[annotations]
+com.pyxis.entrypoint_log = "true"
