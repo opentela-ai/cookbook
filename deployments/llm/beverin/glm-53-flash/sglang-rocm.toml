@@ -119,6 +119,20 @@ NCCL_SOCKET_IFNAME = "hsn"
 # aiter preshuffle path, so SGLANG_USE_AITER is mostly inert here — kept at 1
 # (the GLM-5.2 default) and overridable for diagnosis.
 SGLANG_USE_AITER = "1"
+# SGLANG_OPT_DEEPGEMM_HC_PRENORM = "0"  (the GLM-5.3-on-ROCm load-bearing knob)
+# GLM-5.3's MHC hybrid-attention pre-norm (mhc.py) has TWO deep_gemm paths
+# (mhc_pre:850 + _hc_pre:1450), both gated by this flag (default EnvBool True).
+# deep_gemm is DeepSeek's CUDA-only (SM90+/TMEM) GEMM library: _compute_enable-
+# deep_gemm() (configurer.py:24) returns False on ROCm (neither cuda nor musa),
+# so `import deep_gemm` is SKIPPED and the name is unbound -> a True default
+# makes the very first forward NameError at mhc_pre:850 (observed, job 612093).
+# =0 takes the `else:` Triton/tilelang fallbacks: mhc_pre uses the sglang
+# splitk kernel (hc_hidden_size=hc_mult*hidden_size=4*4096=16384, in the
+# supported {16384,28672} set; num_tokens<=2048), and _hc_pre uses
+# mhc_pre_gemm_sqrsum_tilelang. Both need only the image's Triton/tilelang,
+# no deep_gemm. (Production long-context prefills with num_tokens>2048 hit
+# the OTHER mhc_pre else branch — a separate, addressable path.)
+SGLANG_OPT_DEEPGEMM_HC_PRENORM = "0"
 
 [annotations]
 com.pyxis.entrypoint_log = "true"

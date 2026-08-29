@@ -37,6 +37,19 @@ else
     "sgl-workspace/transformers/src" 2>&1 | tail -2
 fi
 
+# 1b. Apply Beverin MI300A patches to the extracted sglang source. These are
+#     the minimal, version-controlled deviations from the Clariden CUDA build
+#     needed to run on MI300A. Each patch lives next to this script; apply
+#     idempotently (patch -p1 --forward skips already-applied hunks).
+PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for p in "$PATCH_DIR"/tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch; do
+  [ -f "$p" ] || continue
+  echo "[$(date -Is)] applying patch: $(basename "$p")"
+  ( cd "$OVL" && patch -p1 --forward < "$p" ) 2>&1 | grep -viE '^(patching file|Reversed.*previously applied|hunk.*succeeded at| hunk ignored)$' || true
+  # Re-check: the last line from patch is normally empty/grep-filtered; a real
+  # failure (FAILED / can't find file) would have printed above.
+done
+
 # 2. Bump the skewed deps to clariden transformers 5.16's pins as cp310 wheels.
 #    The login node's only pip is python3.6's (20.0.2) — too old for
 #    --python-version/--ignore-requires-python, and uv is a wrong-arch binary

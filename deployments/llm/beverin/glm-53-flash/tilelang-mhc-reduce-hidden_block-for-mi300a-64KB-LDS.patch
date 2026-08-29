@@ -1,0 +1,48 @@
+--- a/sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -859,8 +859,24 @@
+     else:
+         if num_tokens <= 2048:
+             assert n_splits == 1
++            # Beverin MI300A (gfx942) has 64 KB *non-optin* shared memory per
++            # block: tilelang's HIP codegen (jit/adapter/wrapper.py
++            # PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY_HIP) only QUERIES
++            # hipDeviceAttributeMaxSharedMemoryPerBlock and aborts if the
++            # request exceeds it — it never calls hipFuncSetAttribute to opt in
++            # to the larger (~228 KB) dynamic-shared cap (a known tilelang HIP
++            # gap; the CUDA template PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY does
++            # opt in). At num_stages=2 the splitk stage-0 kernel's per-stage
++            # shared (x_smem 16 KB bf16 + fn_smem 32 KB fp32 = 49152) doubles to
++            # 98304 > 65536, so the JIT init() aborts with "Requested dynamic
++            # shared memory 98304 exceeds device limit 65536" (job 612201).
++            # hidden_block 256->128 keeps per-stage at 24.5 KB -> 49152 < 65536
++            # and is the largest power-of-2 divisor of hc_hidden_size (16384)
++            # and of split_size (16384 // n_splits_pre = 512) that fits. The
++            # proper fix is tilelang HIP dynamic-smem opt-in; this is the
++            # contained sglang-side workaround for the Beverin MI300A overlay.
+             if hc_hidden_size == 16384:
+-                hidden_block = 256
++                hidden_block = 128
+             elif hc_hidden_size == 28672:
+                 hidden_block = 128
+             else:
+@@ -910,6 +926,10 @@
+             assert (
+                 n_splits == 1
+             ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
++            # Mirror the splitk path's hidden_block=128 above: the tilelang
++            # (num_tokens>2048) path used the default hidden_block=256, which
++            # is the SAME 98304-B dynamic-shared request that aborts init() on
++            # MI300A's 64-KB non-optin LDS (see the splitk comment above).
+             mhc_pre_gemm_sqrsum_tilelang(
+                 residual_flat.view(num_tokens, hc_mult * hidden_size),
+                 fn_flat,
+@@ -917,6 +937,8 @@
+                 gemm_out_sqrsum.squeeze(0),
+                 hc_mult3,
+                 hc_mult * hidden_size,
++                token_block=32,
++                hidden_block=128,
+             )
+             gemm_last_dim = hc_mult3
+             big_fuse_n_splits = n_splits

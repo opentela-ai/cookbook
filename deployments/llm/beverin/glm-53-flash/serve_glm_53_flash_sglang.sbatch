@@ -94,6 +94,40 @@
 #   flashmla_auto, fa3, tilelang, aiter, trtllm (fa3/trtllm NVIDIA-only;
 #   flashmla_*/aiter NOT kpool>1-legal -> will fail _check_kpool_tail_backend).
 #
+# EMPIRICAL RESULTS (beverin, v0.5.18 overlay, jobs 612093/612201/612262):
+#   * 612093 (no SGLANG_OPT_DEEPGEMM_HC_PRENORM): crashed at the VERY FIRST
+#     forward — NameError 'deep_gemm' in mhc.py:850/1450 (MHC pre-norm's
+#     deep_gemm path; deep_gemm is CUDA-only, NOT imported on ROCm).
+#     FIX: SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 -> tilelang/Triton MHC fallback.
+#   * 612201 (DEEPGEMM_HC_PRENORM=0): crashed at MHC pre-norm's tilelang kernel —
+#     "Requested dynamic shared memory 98304 exceeds device limit 65536 for
+#     mhc_pre_gemm_sqrsum_splitk_stage_0_kernel". tilelang's HIP codegen
+#     (jit/adapter/wrapper.py PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY_HIP) only
+#     QUERIES hipDeviceAttributeMaxSharedMemoryPerBlock (the 64 KB *non-optin*
+#     cap on MI300A) and never calls hipFuncSetAttribute to opt in to the
+#     larger ~228 KB dynamic cap (known tilelang HIP gap).
+#     FIX: tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch (applied
+#     by build_overlay.sh) reduces hidden_block 256->128 in BOTH MHC pre-norm
+#     tilelang kernels (splitk for num_tokens<=2048, simple for >2048) ->
+#     per-stage 24.5 KB -> 49152 < 65536 (largest power-of-2 divisor of
+#     hc_hidden_size=16384 and split_size=512 that fits).
+#   * 612262 (BOTH fixes): got PAST the deep_gemm NameError AND the MHC smem
+#     abort, all the way through KV/Mamba/radix-cache alloc to the FIRST
+#     forward's DSA DECODE kernel — the load-bearing gate above. NEW BLOCKER:
+#     sparse_mla_fwd_decode_partial (sglang/kernels/ops/attention/dsa/
+#     tilelang_kernel.py:830) hits a tilelang/TVM *vectorizer* bug during JIT:
+#     tvm::tl::VectorizePlanner::ComputeBufferVectorSize -> IsExprInvariantIn-
+#     VectorBoundary -> CanonicalSimplifier::VisitExpr_(FloorModNode) raises
+#     'Check failed: pb->value != 0 (0 vs. 0) : Divide by zero' (a symbolic
+#     FloorMod divisor folds to 0 for GLM-5.3's kpool>1 decode shape). This is
+#     a DIFFERENT tilelang issue from the MHC smem one and has NO flag-switch
+#     escape (tilelang is the ONLY kpool>1-legal DSA decode backend on MI300A;
+#     fa3/trtllm are NVIDIA-only, flashmla_*/aiter fail _check_kpool_tail_backend).
+#     NEXT: read sparse_mla_fwd_decode_partial (L830-1088) for the FloorMod
+#     divisor (a head_dim/num_kv_heads/kpool sub-expr that folds to 0) and
+#     either patch it or force-skip the TVM vectorize pass (TL_DISABLE_VECTORIZE
+#     / a tilelang PassConfig) on this kernel.
+#
 # -----------------------------------------------------------------------------
 # GLM-5.3 vs GLM-5.2 (why the args differ)
 # -----------------------------------------------------------------------------
@@ -310,6 +344,33 @@ echo "[rank $RANK] $(hostname) node-rank=$RANK dist-init=$HEAD:$MASTER_PORT serv
 
 # --- MI300A + RCCL environment ----------------------------------------------
 export HSA_NO_SCRATCH_RECLAIM="${HSA_NO_SCRATCH_RECLAIM:-1}"   # mandatory MI300A
+# GLM-5.3's MHC hybrid-attention pre-norm has two deep_gemm paths (mhc.py
+# 850/1450), gated by this flag. deep_gemm is CUDA-only and NOT imported on
+# ROCm (the name is unbound), so the default EnvBool(True) -> NameError on the
+# first forward (job 612093). =0 takes the Triton/tilelang fallbacks (no
+# deep_gemm). See sglang-rocm.toml for the full rationale.
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-0}"
+# That =0 selects tilelang's MHC pre-norm kernels (mhc.py: mhc_pre_gemm_sqrsum_
+# {splitk_kernel,tilelang}). They request 98304 B dynamic shared at the default
+# hidden_block=256 + num_stages=2 (x_smem 16 KB bf16 + fn_smem 32 KB fp32,
+# doubled). MI300A (gfx942) has only 64 KB *non-optin* shared/block, and
+# tilelang's HIP codegen (jit/adapter/wrapper.py PREDEF_ATTRIBUTE_SET_DYNAMIC_
+# MEMORY_HIP) only QUERIES hipDeviceAttributeMaxSharedMemoryPerBlock and aborts
+# if the request exceeds it — it never calls hipFuncSetAttribute to opt in to
+# the larger (~228 KB) dynamic cap (a known tilelang HIP gap; the CUDA template
+# PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY does opt in). So the JIT init() aborted:
+# "Requested dynamic shared memory 98304 exceeds device limit 65536" (job 612201).
+# Fix (applied by build_overlay.sh via tilelang-mhc-reduce-hidden_block-for-
+# mi300a-64KB-LDS.patch to the overlay's mhc.py): hidden_block 256->128 in BOTH
+# the num_tokens<=2048 splitk path and the num_tokens>2048 tilelang path ->
+# per-stage 24.5 KB -> 49152 B < 65536 (largest power-of-2 divisor of
+# hc_hidden_size=16384 and split_size=512 that fits). All six MHC-forward
+# tilelang kernels then fit MI300A's non-optin LDS. NOTE: hidden_block=128 is
+# ~2x more GEMM iterations than 256 -> lower arithmetic intensity; the proper
+# fix is the tilelang HIP dynamic-smem opt-in (emit hipFuncSetAttribute + check
+# against hipDeviceAttributeMaxSharedMemoryPerBlockOptin), which would restore
+# hidden_block=256 at full speed. Patches are version-controlled next to this
+# script; build_overlay.sh applies them to the extracted overlay source.
 # Shared Triton + tilelang caches on /capstor (all workers load the same
 # compiled kernels; only the first run pays the LLVM/tilelang JIT cost).
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DEPLOY_DIR/cache/triton}"
