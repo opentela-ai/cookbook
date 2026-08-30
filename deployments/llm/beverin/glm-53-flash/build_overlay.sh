@@ -50,6 +50,19 @@ for p in "$PATCH_DIR"/tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch
   # failure (FAILED / can't find file) would have printed above.
 done
 
+# 1c. Install the PR #52 DSA-vkernels shim (sitecustomize.py + vkernels_dsa.py)
+#     onto $OVL/pylib, which the sglang-rocm EDF prepends FIRST on PYTHONPATH
+#     (sglang-rocm.toml [env]). sitecustomize.py is auto-imported by CPython at
+#     startup (before any sglang import) and, on gfx942, rebinds sglang's DSA
+#     tilelang_sparse_fwd -> vkernels_dsa.tilelang_sparse_fwd (a ctypes adapter
+#     for vk_hip_dsa_sparse_fwd in libvkernels_hip.so), bypassing the
+#     tilelang/TVM FloorMod(_, 0) JIT abort (vkernels issue #51, the job-612262
+#     blocker). VKERNELS_DIR (exported by the sbatch) points the adapter at the
+#     rebuilt .so. Mirrors the Kimi-K3 recipe's $K3/home/pylib/sitecustomize.py.
+mkdir -p "$OVL/pylib"
+cp -f "$PATCH_DIR/sitecustomize.py" "$PATCH_DIR/vkernels_dsa.py" "$OVL/pylib/"
+echo "[$(date -Is)] installed DSA-vkernels shim -> $OVL/pylib/{sitecustomize,vkernels_dsa}.py"
+
 # 2. Bump the skewed deps to clariden transformers 5.16's pins as cp310 wheels.
 #    The login node's only pip is python3.6's (20.0.2) — too old for
 #    --python-version/--ignore-requires-python, and uv is a wrong-arch binary

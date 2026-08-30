@@ -65,14 +65,24 @@ workdir = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin"
 # gen_correctness probe do.
 
 [env]
-# PYTHONPATH precedence (left wins). The clariden sglang + transformers are
-# PREPENDED so GLM-5.3's model/config/communicator_mhc modules resolve there
-# (not the image's GLM-5.3-less copies), and pkgs310 is FIRST so the bumped
-# tokenizers/hub/safetensors/regex/accelerate satisfy clariden transformers
-# 5.16's pins (tokenizers>=0.23.1, huggingface_hub>=1.5.0, safetensors>=0.8.0,
-# regex>=2025.10.22, accelerate>=1.1.0). torch/sgl_kernel/numpy are NOT in
-# pkgs310, so they fall through to the image's /opt/venv (ROCm, cp310).
-PYTHONPATH = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/pkgs310:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/sglang/python:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/transformers/src"
+# PYTHONPATH precedence (left wins). pylib is FIRST so CPython auto-imports
+# sitecustomize.py at startup (before any sglang import); sitecustomize.py
+# rebinds sglang's DSA tilelang_sparse_fwd -> vkernels_dsa.tilelang_sparse_fwd
+# (the vk_hip_dsa_sparse_fwd ctypes adapter, PR #52) on gfx942, bypassing the
+# tilelang/TVM FloorMod(_, 0) JIT abort (vkernels issue #51). Then pkgs310 (the
+# bumped tokenizers/hub/safetensors/regex/accelerate satisfying clariden
+# transformers 5.16's pins), then the clariden sglang + transformers sources
+# (GLM-5.3's model/config/communicator_mhc resolve here, NOT the image's
+# GLM-5.3-less copies). torch/sgl_kernel/numpy are NOT in pylib/pkgs310, so
+# they fall through to the image's /opt/venv (ROCm, cp310).
+PYTHONPATH = "/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/pylib:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/pkgs310:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/sglang/python:/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/transformers/src"
+# vkernels HIP .so for the PR #52 DSA kernel — built INSIDE this v0.5.18
+# container (ROCm 7.2 / libamdhip64.so.7) so it dlopens at runtime. The
+# login-node build/hip links libamdhip64.so.6 (absent in the container) and
+# FAILS. Set in [env] (not just the sbatch export) so the engine ALWAYS sees
+# it regardless of --environment merge semantics. vkernels_dsa._find_libvkernels_hip
+# checks VKERNELS_LIB FIRST.
+VKERNELS_LIB = "/capstor/scratch/cscs/xyao/vkernels/build/hip-roc72/src/c/libvkernels_hip.so"
 PYTHONNOUSERSITE = "1"
 PIP_BREAK_SYSTEM_PACKAGES = "1"
 HF_HUB_OFFLINE = "1"

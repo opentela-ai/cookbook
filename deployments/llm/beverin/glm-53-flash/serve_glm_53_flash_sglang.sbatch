@@ -123,10 +123,18 @@
 #     a DIFFERENT tilelang issue from the MHC smem one and has NO flag-switch
 #     escape (tilelang is the ONLY kpool>1-legal DSA decode backend on MI300A;
 #     fa3/trtllm are NVIDIA-only, flashmla_*/aiter fail _check_kpool_tail_backend).
-#     NEXT: read sparse_mla_fwd_decode_partial (L830-1088) for the FloorMod
-#     divisor (a head_dim/num_kv_heads/kpool sub-expr that folds to 0) and
-#     either patch it or force-skip the TVM vectorize pass (TL_DISABLE_VECTORIZE
-#     / a tilelang PassConfig) on this kernel.
+#     RESOLVED via vkernels PR #52 (commit d76517c): the DSA forward is
+#     re-implemented as a plain gfx942 HIP kernel (vk_hip_dsa_sparse_fwd in
+#     libvkernels_hip.so) that takes tail_dim==0 as a RUNTIME branch (the
+#     rope-tail dot loop runs zero iterations — no zero-size GEMM, so the
+#     TVM vectorizer is never invoked). Validated on beverin (test_dsa_correct
+#     11/11, both tail_dim==0 GLM-5.3 and tail_dim>0 DeepSeek-V3). Wired in by
+#     sitecustomize.py + vkernels_dsa.py on $OVL/pylib (FIRST on PYTHONPATH,
+#     installed by build_overlay.sh); sitecustomize rebinds sglang's
+#     tilelang_sparse_fwd -> vk_hip_dsa_sparse_fwd on gfx942 at startup, before
+#     the first DSA forward (forward_extend L3223 + forward_decode L3525).
+#     See the header's "PR #52 wiring" note + vkernels issue #51 for the ABI.
+#     FIRST SERVE SMOKE: pending re-run (VKERNELS_LIB=.../build/hip-roc72/src/c/libvkernels_hip.so, SMOKE=1).
 #
 # -----------------------------------------------------------------------------
 # GLM-5.3 vs GLM-5.2 (why the args differ)
@@ -185,6 +193,17 @@ export MOE_BACKEND="${MOE_BACKEND:-auto}"
 # --- DSA backends (THE kpool>1 gate — see the header block) -----------------
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
+# vkernels library (PR #52 DSA HIP kernel). VKERNELS_LIB is the EXACT path to
+# the libvkernels_hip.so built INSIDE this v0.5.18 container (ROCm 7.2,
+# libamdhip64.so.7) — the adapter (_find_libvkernels_hip) checks it FIRST.
+# The login-node build/hip links libamdhip64.so.6 (ROCm 6.3, absent in the
+# container) and FAILS dlopen; hip-roc72 is the clean container-ROCm build.
+# sitecustomize.py (on $OVL/pylib, FIRST on PYTHONPATH) rebinds sglang's DSA
+# tilelang_sparse_fwd -> vk_hip_dsa_sparse_fwd on gfx942, bypassing the
+# tilelang/TVM FloorMod(_,0) JIT abort (issue #51, job 612262's blocker).
+# The adapter calls the kernel with torch.cuda.synchronize() before/after
+# (stream-0 launch, no stream arg yet — the #44 threading is the follow-up).
+export VKERNELS_LIB="${VKERNELS_LIB:-/capstor/scratch/cscs/xyao/vkernels/build/hip-roc72/src/c/libvkernels_hip.so}"
 # Multimodal vision-tower attention. GLM-5.3 auto-defaults to fa3 on gfx942,
 # which is MISSING on ROCm -> ImportError. Pin triton_attn (Triton kernels,
 # no flash_ops dep; VisionTritonAttention in STRIDED_QKV_BACKENDS).
@@ -304,20 +323,24 @@ _sib sglang-rocm.toml "The EDF (v0.5.18 image + overlay PYTHONPATH + MI300A env)
 _sib sglang_launcher_mi300a.py "The is_integrated MI300A memory-accounting fix launcher."
 
 # Quick in-container preflight: the image + overlay actually import the GLM-5.3
-# model (catches a stale/wrong overlay BEFORE the ~5 min srun cold start). ~20 s.
+# model (catches a stale/wrong overlay BEFORE the ~5 min srun cold start). ~20 s
+# on a warm TILELANG/AITER cache; the first run on a cold node can take
+# several minutes (tilelang/TVM JIT) so the gate is 15 min (one-time on /capstor).
 echo "[$(date -Is)] container preflight: import sglang + glm5_next + AutoConfig ..."
 srun --nodes="$NNODES" --ntasks-per-node=1 --cpus-per-task=2 --gpus-per-task=0 \
-     --environment="$OTELA_EDF_NAME" -N1 -n1 -t0:05:00 \
-  python3 - <<'PREFLIGHT' || { echo "[$(date -Is)] PREFLIGHT FAILED — see above" >&2; exit 1; }
-import importlib, sys
+     --environment="$OTELA_EDF_NAME" -N1 -n1 -t0:15:00 \
+  python3 -u - <<'PREFLIGHT' || { echo "[$(date -Is)] PREFLIGHT FAILED — see above" >&2; exit 1; }
+import time, importlib, sys
+_t0=time.time()
 ok, fail = [], []
 def chk(name, imp="import "):
+    _s=time.time()
     try:
         m = importlib.import_module(name)
-        ok.append(name)
+        ok.append(name); print(f"  [preflight t={time.time()-_t0:.1f}s] +{name} ({time.time()-_s:.1f}s)", flush=True)
         return m
     except Exception as e:
-        fail.append(f"{name}: {type(e).__name__}: {e}")
+        fail.append(f"{name}: {type(e).__name__}: {e}"); print(f"  [preflight t={time.time()-_t0:.1f}s] FAIL {name} ({time.time()-_s:.1f}s): {e}", flush=True)
 chk("sglang"); chk("transformers")
 chk("sglang.srt.configs.glm5_next")
 chk("sglang.srt.models.glm5_next")
@@ -326,9 +349,9 @@ chk("sglang.srt.function_call.glm47_moe_detector")
 chk("transformers.models.glm5_next")
 from transformers import AutoConfig
 import os
-cfg = AutoConfig.from_pretrained(os.environ["MODEL_PATH"], trust_remote_code=True)
+_s=time.time(); cfg = AutoConfig.from_pretrained(os.environ["MODEL_PATH"], trust_remote_code=True); print(f"  [preflight t={time.time()-_t0:.1f}s] AutoConfig ({time.time()-_s:.1f}s) -> {type(cfg).__name__}", flush=True)
 ok.append(f"AutoConfig({os.environ['MODEL_PATH']!r}) -> {type(cfg).__name__}")
-print("PREFLIGHT OK:", *ok, sep="\n  ")
+print("PREFLIGHT OK:", *ok, sep="\n  ", flush=True)
 if fail:
     print("PREFLIGHT FAIL:", *fail, sep="\n  ", file=sys.stderr); sys.exit(1)
 PREFLIGHT
