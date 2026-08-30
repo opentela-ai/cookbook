@@ -193,11 +193,45 @@ export MOE_BACKEND="${MOE_BACKEND:-auto}"
 # --- DSA backends (THE kpool>1 gate — see the header block) -----------------
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
+# DSA top-k TRANSFORM (the THIRD DSA path, after the paged-MQA scorer
+# vk_hip_dsa_topk_logits (#51) and the sparse fwd vk_hip_dsa_sparse_fwd (PR
+# #52)). sgl-kernel (the default) JIT-compiles sgl_kernel_jit_kpool_topk_
+# transform_512 from dsa/kpool_topk_transform.cuh, which #include <cuda_fp16.h>
+# — absent on the ROCm container — so the JIT build fails (RuntimeError:
+# Failed to build JIT module ... 'cuda_fp16.h' file not found) and the engine
+# SIGQUITs at the first DeepseekV2AttentionMLA (the kpool>1 indexer).
+# 'torch' routes to topk_transform_512_pytorch_vectorized (pure torch.topk,
+# no JIT, no hang risk — same fallback pattern as the two vkernels rebinds in
+# sitecustomize.py). The 'torch' backend currently requires
+# SGLANG_DSA_FUSE_TOPK=false (avoids _append_kpool_tail_to_topk_kernel crash);
+# set it explicitly since sglang only auto-forces that under deterministic
+# inference (server_args.py:8913), not under --dsa-topk-backend torch itself.
+export GLM53_DSA_TOPK_BACKEND="${GLM53_DSA_TOPK_BACKEND:-torch}"
+export SGLANG_DSA_FUSE_TOPK="${SGLANG_DSA_FUSE_TOPK:-0}"
 # MoE runner: the auto pick (aiter) JIT-hangs ~52min on gfx942 for GLM-5.3's
 # fp8-e4m3 ck2stages kernel (Current hipcc not support: -amdgpu-coerce-
 # illegal-types=1, skip it). Pin triton (pure Triton, no CK JIT, ROCm-mature)
 # to bypass until the aiter hang is fixed. Override: GLM53_MOE_RUNNER=<b>.
 export GLM53_MOE_RUNNER="${GLM53_MOE_RUNNER:-triton}"
+# Mamba SSM kernel backend. Choices: triton (default, pure Triton; the
+# stochastic-rounding sub-path needs SM100/Blackwell but the base scan does
+# not) | flashinfer (needs `import flashinfer.mamba`, often absent on ROCm).
+# Override: GLM53_MAMBA_BACKEND=<b>. The job-612826 first-forward stall is
+# suspected in this layer's mamba/SSM scan OR its TritonKDA (linear-attn)
+# kernel; flashinfer isolates the SSM scan from KDA (KDA is triton-only on
+# gfx942 -> no backend switch for it; the forward-probe localises it).
+export GLM53_MAMBA_BACKEND="${GLM53_MAMBA_BACKEND:-triton}"
+# Forward-probe (sitecustomize.py): logs each decoder layer + self_attn + mlp
+# ENTER/EXIT on the FIRST forward only, so the last line before a silent
+# stall names the exact hanging op (mamba-linear-attn / DSA / MoE / NCCL).
+# Default ON while we diagnose the job-612826 first-forward stall; set
+# GLM53_FWD_PROBE=0 for production serving (zero-cost when off).
+export GLM53_FWD_PROBE="${GLM53_FWD_PROBE:-1}"
+# tilelang DSA-topk JIT probe (GLM53_TILELANG_PROBE=1) + DEBUG log
+# (GLM53_TL_LOG=DEBUG) to localize the fp8_paged_mqa_logits JIT hang on
+# gfx942. Default ON for this diagnostic run; remove after diagnosis.
+export GLM53_TILELANG_PROBE="${GLM53_TILELANG_PROBE:-1}"
+export GLM53_TL_LOG="${GLM53_TL_LOG:-DEBUG}"
 # vkernels library (PR #52 DSA HIP kernel). VKERNELS_LIB is the EXACT path to
 # the libvkernels_hip.so built INSIDE this v0.5.18 container (ROCm 7.2,
 # libamdhip64.so.7) — the adapter (_find_libvkernels_hip) checks it FIRST.
@@ -288,7 +322,7 @@ export HEAD_IP="${HEAD_IP:-127.0.0.1}"
 
 echo "[$(date -Is)] started=$(date --iso-8601=seconds) smoke=$SMOKE load_format=$LOAD_FORMAT"
 echo "[$(date -Is)] parsers=$GLM53_REASONING_PARSER/$GLM53_TOOL_CALL_PARSER/$GLM53_ENABLE_PARSERS gen_probe=$GEN_PROBE smoke_probe=$GEN_CORRECTNESS_SMOKE min_pass=$GEN_CORRECTNESS_MIN_PASS"
-echo "[$(date -Is)] DSA=$GLM53_DSA_PREFILL/$GLM53_DSA_DECODE mm=$GLM53_MM_ATTENTION tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE ctx=$CTX_LEN mem=$GPU_MEM_UTIL"
+echo "[$(date -Is)] DSA=$GLM53_DSA_PREFILL/$GLM53_DSA_DECODE topk=$GLM53_DSA_TOPK_BACKEND fuse_topk=$SGLANG_DSA_FUSE_TOPK mm=$GLM53_MM_ATTENTION mamba=$GLM53_MAMBA_BACKEND moe=$GLM53_MOE_RUNNER probe=$GLM53_FWD_PROBE tlp=$GLM53_TILELANG_PROBE tl=$GLM53_TL_LOG tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE ctx=$CTX_LEN mem=$GPU_MEM_UTIL"
 
 # ----------------------------------------------------------------- preflight --
 # SMOKE=0 requires otela; SMOKE=1 (default) skips the otela binary check so a
@@ -454,7 +488,9 @@ fi
 SGLANG_ARGS+=(
   --dsa-prefill-backend "$GLM53_DSA_PREFILL"
   --dsa-decode-backend "$GLM53_DSA_DECODE"
+  --dsa-topk-backend "$GLM53_DSA_TOPK_BACKEND"
   --moe-runner-backend "$GLM53_MOE_RUNNER"
+  --mamba-backend "$GLM53_MAMBA_BACKEND"
 )
 # --- multimodal vision-tower attention (fa3 MISSING on ROCm) ----------------
 SGLANG_ARGS+=( --mm-attention-backend "$GLM53_MM_ATTENTION" )
