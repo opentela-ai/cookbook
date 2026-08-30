@@ -193,6 +193,11 @@ export MOE_BACKEND="${MOE_BACKEND:-auto}"
 # --- DSA backends (THE kpool>1 gate — see the header block) -----------------
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
+# MoE runner: the auto pick (aiter) JIT-hangs ~52min on gfx942 for GLM-5.3's
+# fp8-e4m3 ck2stages kernel (Current hipcc not support: -amdgpu-coerce-
+# illegal-types=1, skip it). Pin triton (pure Triton, no CK JIT, ROCm-mature)
+# to bypass until the aiter hang is fixed. Override: GLM53_MOE_RUNNER=<b>.
+export GLM53_MOE_RUNNER="${GLM53_MOE_RUNNER:-triton}"
 # vkernels library (PR #52 DSA HIP kernel). VKERNELS_LIB is the EXACT path to
 # the libvkernels_hip.so built INSIDE this v0.5.18 container (ROCm 7.2,
 # libamdhip64.so.7) — the adapter (_find_libvkernels_hip) checks it FIRST.
@@ -449,6 +454,7 @@ fi
 SGLANG_ARGS+=(
   --dsa-prefill-backend "$GLM53_DSA_PREFILL"
   --dsa-decode-backend "$GLM53_DSA_DECODE"
+  --moe-runner-backend "$GLM53_MOE_RUNNER"
 )
 # --- multimodal vision-tower attention (fa3 MISSING on ROCm) ----------------
 SGLANG_ARGS+=( --mm-attention-backend "$GLM53_MM_ATTENTION" )
