@@ -78,7 +78,7 @@ import os
 
 import torch
 
-__all__ = ["tilelang_sparse_fwd"]
+__all__ = ["tilelang_sparse_fwd", "tilelang_fp8_paged_mqa_logits"]
 
 # log2(e) = 1.44269504...; the tilelang kernel folds the raw MLA scale by
 # this constant (tilelang_kernel.py: ``sm_scale = sm_scale * 1.44269504``),
@@ -285,3 +285,147 @@ def tilelang_sparse_fwd(
     if return_lse:
         return out, lse
     return out
+
+
+# ---------------------------------------------------------------------------
+# DSA paged-MQA gated top-k logits (vkernels issue #51, the kpool>1 indexer).
+# Drop-in for sglang's ``tilelang_fp8_paged_mqa_logits``
+# (sglang/kernels/ops/attention/dsa/tilelang_kernel.py:1519) — the FIRST stage
+# of the DSA decode top-k: score each query against its paged KV tiles and
+# return the ``(batch_size, max_seq_len)`` fp32 logits that
+# ``topk_from_pooled_history_logits`` selects over. The tilelang kernel
+# JIT-compiles on gfx942 but never returns for num_heads in {32, 64}; this
+# routes through ``vk_hip_dsa_topk_logits`` (feat/issue-51-dsa-topk).
+# ---------------------------------------------------------------------------
+def _bind_dsa_topk_fn(lib):
+    """Bind vk_hip_dsa_topk_logits (vkernels feat/issue-51-dsa-topk)."""
+    fn = getattr(lib, "vk_hip_dsa_topk_logits", None)
+    if fn is None:
+        raise RuntimeError(
+            "vk_hip_dsa_topk_logits not found in libvkernels_hip.so — "
+            "rebuild vkernels at feat/issue-51-dsa-topk with VKERNELS_HAS_HIP=ON"
+        )
+    # void vk_hip_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
+    #   int block, int max_table_len, int max_seq_len, int split_kv,
+    #   const void* q_fp8, const void* kvcache_u8, const void* weight,
+    #   const void* seq_lens, const void* page_table, void* out)
+    fn.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    fn.restype = None
+    return fn
+
+
+def tilelang_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+    clean_logits: bool = True,
+):
+    """gfx942 HIP DSA paged-MQA gated top-k logits — drop-in for sglang's
+    ``tilelang_fp8_paged_mqa_logits`` (tilelang_kernel.py:1519).
+
+    Contract (mirror of the tilelang wrapper's asserts, L1530-1539):
+      q_fp8        (bs, 1, nh, hd)    fp8 e4m3fnuz  -> viewed (bs, nh, hd)
+      kvcache_fp8  (num_blocks, block, 1, hd+4) fp8 -> viewed (-1, block*(hd+4)) u8
+      weight       (bs, nh)            fp32  (the indexer's gated head weight)
+      seq_lens     (bs,)               int   (POOLED valid KV count per batch)
+      page_table   (bs, max_table_len) int   (pool_block_tables)
+      deep_gemm_metadata  Any  (UNUSED — the wrapper does `_ = deep_gemm_metadata`)
+      max_seq_len  int   (= max_table_len * block_size; passed by the caller)
+      clean_logits bool  (asserted False — the wrapper asserts the same)
+
+    Output: (bs, max_seq_len) fp32. The tilelang wrapper allocates with
+    ``new_empty`` (UNINITIALISED); we use ``torch.zeros`` (strictly safer —
+    tokens t >= seq_lens[b] are masked by sglang's
+    ``topk_from_pooled_history_logits`` via group_lengths/topk_offsets before
+    the top-k, so zero/garbage are all excluded). split_kv (perf only,
+    grouping-independent) = max(1, min(max_seq_len//block_size, NUM_CU//bs))
+    with NUM_CU = 256, matching the wrapper L1552-1553. See the module
+    docstring for the two-sync stream-handling rationale.
+    """
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    # Mirror the tilelang wrapper's asserts (tilelang_kernel.py L1532-1539).
+    assert head_dim == 128, f"head_dim must be 128 (got {head_dim})"
+    assert block_size == 64, f"block_size must be 64 (got {block_size})"
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False, (
+        "vk_hip_dsa_topk_logits writes only t < seq_lens[b]; pass "
+        "clean_logits=False (the tilelang wrapper asserts the same)."
+    )
+
+    # Device guard (only on gfx942; sitecustomize.py only patches there).
+    if not _supports_current_device():
+        raise RuntimeError(
+            "vkernels_dsa.tilelang_fp8_paged_mqa_logits requires gfx942 (MI300A); "
+            f"current device is not gfx942 (gcn="
+            f"{getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '?')})."
+        )
+
+    max_table_len = int(page_table.shape[1])
+    # The C kernel reads raw int32. Cast defensively (no-op when already int32);
+    # a different dtype would otherwise corrupt the raw int32 reads.
+    if seq_lens.dtype != torch.int32:
+        seq_lens = seq_lens.to(torch.int32)
+    if page_table.dtype != torch.int32:
+        page_table = page_table.to(torch.int32)
+
+    # The SAME views the tilelang wrapper makes (L1563-1564): q_fp8
+    # (bs,1,nh,hd) -> (bs, nh, hd); kvcache_fp8 (num_blocks,block,1,hd+4) ->
+    # (-1, block*(hd+4)) raw uint8 (B*D fp8 keys then B fp32 per-token scales).
+    q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
+    kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+
+    # ZEROED output (strictly safer than the wrapper's new_empty; tokens
+    # >= seq_lens[b] are excluded from the top-k by sglang's masking).
+    logits = torch.zeros(
+        (batch_size, max_seq_len), dtype=torch.float32, device=page_table.device
+    )
+
+    # split_kv (perf only): max(1, min(max_seq_len//block_size, NUM_CU//bs)) —
+    # mirrors the tilelang wrapper L1552-1553 exactly.
+    NUM_CU = 256
+    split_kv = max(1, min(max_seq_len // block_size, NUM_CU // batch_size))
+
+    # contiguity (raw-pointer reads require row-major; the views above are
+    # contiguous iff the underlying tensors are).
+    if not q_fp8.is_contiguous():
+        q_fp8 = q_fp8.contiguous()
+    if not kvcache_u8.is_contiguous():
+        kvcache_u8 = kvcache_u8.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+
+    # stream-correct launch (see module docstring): the C kernel launches on
+    # HIP stream 0; synchronize before (inputs from sglang's compute stream
+    # are done) and after (stream-0 output is done before sglang reads it).
+    torch.cuda.synchronize()
+    lib = _get_lib()
+    fn = _bind_dsa_topk_fn(lib)
+    fn(
+        ctypes.c_int(batch_size), ctypes.c_int(num_heads),
+        ctypes.c_int(head_dim), ctypes.c_int(block_size),
+        ctypes.c_int(max_table_len), ctypes.c_int(max_seq_len),
+        ctypes.c_int(split_kv),
+        ctypes.c_void_p(q_fp8.data_ptr()), ctypes.c_void_p(kvcache_u8.data_ptr()),
+        ctypes.c_void_p(weight.data_ptr()), ctypes.c_void_p(seq_lens.data_ptr()),
+        ctypes.c_void_p(page_table.data_ptr()), ctypes.c_void_p(logits.data_ptr()),
+    )
+    torch.cuda.synchronize()
+
+    return logits
