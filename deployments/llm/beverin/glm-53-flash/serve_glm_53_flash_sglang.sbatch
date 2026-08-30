@@ -207,6 +207,21 @@ export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
 # set it explicitly since sglang only auto-forces that under deterministic
 # inference (server_args.py:8913), not under --dsa-topk-backend torch itself.
 export GLM53_DSA_TOPK_BACKEND="${GLM53_DSA_TOPK_BACKEND:-torch}"
+# NOTE: --dsa-topk-backend torch (above) is the sglang server flag, but the
+# ACTIVE GLM-5.3 kpool path (kpool_fp8_index.py:topk_from_pooled_history_logits)
+# calls fast_kpool_topk_transform_fused (the TVM JIT) UNCONDITIONALLY for
+# group_topk in (128,160,192,224,256,512) — the 'torch' routing is aspirational
+# (it targets the dsv4/C4 indexer, not this path). The ACTUAL torch bridge for
+# the kpool top-k transform (vkernels #56) is the sitecustomize.py rebind,
+# gated here:
+export GLM53_TOPK_TRANSFORM_BACKEND="${GLM53_TOPK_TRANSFORM_BACKEND:-torch}"
+# 'torch' rebinds sglang.kernels.ops.moe.kpool_topk_transform.
+# fast_kpool_topk_transform_fused to vkernels_dsa_topk.fast_kpool_topk_transform_fused
+# (pure torch, numerically equal to kpool_topk_transform.cuh:249-310, 7/7 by
+# test_vkernels_dsa_topk.py; NOT graph-safe — fine for the smoke probe).
+# Goals: (1) UNBLOCK decode if the JIT hangs; (2) LOCALISE the hang to a
+# bookend kernel if it persists; (3) REFERENCE for the future HIP kernel (#56).
+# Set GLM53_TOPK_TRANSFORM_BACKEND=sgl (or empty) to keep the JIT as the control.
 export SGLANG_DSA_FUSE_TOPK="${SGLANG_DSA_FUSE_TOPK:-0}"
 # MoE runner: the auto pick (aiter) JIT-hangs ~52min on gfx942 for GLM-5.3's
 # fp8-e4m3 ck2stages kernel (Current hipcc not support: -amdgpu-coerce-

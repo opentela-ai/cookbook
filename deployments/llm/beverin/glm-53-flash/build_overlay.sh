@@ -64,8 +64,11 @@ done
 #     blocker). VKERNELS_DIR (exported by the sbatch) points the adapter at the
 #     rebuilt .so. Mirrors the Kimi-K3 recipe's $K3/home/pylib/sitecustomize.py.
 mkdir -p "$OVL/pylib"
-cp -f "$PATCH_DIR/sitecustomize.py" "$PATCH_DIR/vkernels_dsa.py" "$OVL/pylib/"
-echo "[$(date -Is)] installed DSA-vkernels shim -> $OVL/pylib/{sitecustomize,vkernels_dsa}.py"
+cp -f "$PATCH_DIR/sitecustomize.py" "$PATCH_DIR/vkernels_dsa.py" "$PATCH_DIR/vkernels_dsa_topk.py" "$OVL/pylib/"
+# The self-contained CPU test for the torch top-k bridge (run manually inside
+# the container: `python3 /capstor/.../glm-53-flash-beverin/test_vkernels_dsa_topk.py`).
+cp -f "$PATCH_DIR/test_vkernels_dsa_topk.py" "$OVL/" 2>/dev/null || true
+echo "[$(date -Is)] installed DSA-vkernels shim -> $OVL/pylib/{sitecustomize,vkernels_dsa,vkernels_dsa_topk}.py"
 
 # 2. Bump the skewed deps to clariden transformers 5.16's pins as cp310 wheels.
 #    The login node's only pip is python3.6's (20.0.2) — too old for
