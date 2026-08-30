@@ -1,0 +1,27 @@
+sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py | 14 ++++++++++++--
+1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py b/sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/quantization/unquant.py
+@@ -265,8 +265,18 @@
+                 output = output.view(x_shapes[0], x_shapes[1], -1)
+             return output
+
+-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+-            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
++        elif (
++            # Respect an explicit --bf16-gemm-backend choice (e.g. `torch`
++            # to bypass aiter's tuned-GEMM dispatcher, which has no tuned
++            # config for the M:1 MLA decode shapes on gfx942 and falls back
++            # to an untuned aiter GEMM that SIGKILLs). Only take the aiter
++            # bf16 path when the backend is left at `auto` (the default),
++            # preserving existing behaviour for users who do not override.
++            _use_aiter
++            and get_bf16_gemm_backend().is_auto()
++            and type(layer.weight.data) is torch.Tensor
++        ):
++            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+
+         elif (
+             get_bf16_gemm_backend().is_cutedsl()

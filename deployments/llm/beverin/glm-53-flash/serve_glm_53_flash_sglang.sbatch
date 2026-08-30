@@ -263,6 +263,19 @@ export VKERNELS_LIB="${VKERNELS_LIB:-/capstor/scratch/cscs/xyao/vkernels/build/h
 # no flash_ops dep; VisionTritonAttention in STRIDED_QKV_BACKENDS).
 export GLM53_MM_ATTENTION="${GLM53_MM_ATTENTION:-triton_attn}"
 
+# Unquantized BF16 GEMM backend. GLM-5.3 keeps the MLA projections
+# (q_a/kv_a/q_b/kv_b/o_proj, etc., listed in config.json modules_to_not_convert)
+# in bf16 while the experts are FP8. On ROCm with SGLANG_USE_AITER=1 the
+# sglang UnquantLinearMethod.apply routes EVERY bf16 GEMM through aiter's
+# tuned-GEMM dispatcher (tgemm.mm), which has no tuned config for the M:1
+# decode shapes (M:1,N:6144,K:4096 and friends) and falls back to an untuned
+# aiter GEMM that SIGKILLs on gfx942 (beverin job 613339, ~336 s stall then
+# exit -9 in DeepseekV2AttentionMLA). Routing bf16 to `torch` (rocBLAS) keeps
+# FP8 aiter on for the experts and lets the MLA forward complete. The
+# underlying sglang bug (the _use_aiter branch short-circuited --bf16-gemm-backend)
+# is fixed by sglang-unquant-bf16-gemm-respect-backend-flag.patch.
+export GLM53_BF16_GEMM_BACKEND="${GLM53_BF16_GEMM_BACKEND:-torch}"
+
 # Reasoning + tool-call parsers (verified present in the clariden overlay).
 export GLM53_REASONING_PARSER="${GLM53_REASONING_PARSER:-glm45}"
 export GLM53_TOOL_CALL_PARSER="${GLM53_TOOL_CALL_PARSER:-glm47}"
@@ -509,6 +522,8 @@ SGLANG_ARGS+=(
 )
 # --- multimodal vision-tower attention (fa3 MISSING on ROCm) ----------------
 SGLANG_ARGS+=( --mm-attention-backend "$GLM53_MM_ATTENTION" )
+# Route unquantized bf16 GEMMs to rocBLAS (see GLM53_BF16_GEMM_BACKEND above):
+SGLANG_ARGS+=( --bf16-gemm-backend "$GLM53_BF16_GEMM_BACKEND" )
 # --- reasoning + tool-call parsers (verified in the clariden overlay) -------
 if [ "${GLM53_ENABLE_PARSERS:-1}" = "1" ]; then
   SGLANG_ARGS+=(
