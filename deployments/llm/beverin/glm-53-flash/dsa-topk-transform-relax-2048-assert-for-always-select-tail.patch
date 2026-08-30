@@ -1,0 +1,34 @@
+--- a/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsa/transform_index.py
++++ b/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsa/transform_index.py
+@@ -191,7 +191,14 @@
+     """
+     assert page_size == 1
+     assert page_table.shape[0] == topk_indices.shape[0]
+-    assert topk_indices.shape[1] == 2048
++    # topk_indices may hold `index_topk` score-selected pages PLUS the
++    # index_kpool-1 tail pages forced by index_kpool_always_select_tail
++    # (GLM-5.3: 2048 + (4-1) = 2051). The kernel below and
++    # _allocate_prefill_result both index off topk_indices.shape[1], so guard a
++    # positive width rather than pinning a model-specific literal.
++    assert topk_indices.shape[1] > 0, (
++        f"topk_indices has zero topk columns: shape={tuple(topk_indices.shape)}"
++    )
+     qo_len = topk_indices.shape[0]
+     if result is None:
+         result = torch.empty_like(topk_indices, dtype=torch.int32)
+@@ -217,7 +224,14 @@
+     cu_seqlens_q: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     assert page_size == 1
+-    assert topk_indices.shape[1] == 2048
++    # topk_indices may hold `index_topk` score-selected pages PLUS the
++    # index_kpool-1 tail pages forced by index_kpool_always_select_tail
++    # (GLM-5.3: 2048 + (4-1) = 2051). The kernel below and
++    # _allocate_prefill_result both index off topk_indices.shape[1], so guard a
++    # positive width rather than pinning a model-specific literal.
++    assert topk_indices.shape[1] > 0, (
++        f"topk_indices has zero topk columns: shape={tuple(topk_indices.shape)}"
++    )
+     real_num_tokens = sum(extend_lens_cpu)
+     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
+     if real_num_tokens == 0:
