@@ -45,7 +45,8 @@ PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for p in "$PATCH_DIR"/tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch \
          "$PATCH_DIR"/dsa-kpool-hip-paged-mqa-logits.patch \
          "$PATCH_DIR"/dsa-kpool-tilelang-probe.patch \
-         "$PATCH_DIR"/dsa-topk-transform-relax-2048-assert-for-always-select-tail.patch; do
+         "$PATCH_DIR"/dsa-topk-transform-relax-2048-assert-for-always-select-tail.patch \
+         "$PATCH_DIR"/sglang-dsa-kpool-topk-transform-cuda_fp16-to-hip-guard.patch; do
   [ -f "$p" ] || continue
   echo "[$(date -Is)] applying patch: $(basename "$p")"
   ( cd "$OVL" && patch -p1 --forward < "$p" ) 2>&1 | grep -viE '^(patching file|Reversed.*previously applied|hunk.*succeeded at| hunk ignored)$' || true

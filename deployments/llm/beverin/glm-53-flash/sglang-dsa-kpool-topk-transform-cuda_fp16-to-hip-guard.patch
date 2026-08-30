@@ -1,0 +1,14 @@
+--- a/sgl-workspace/sglang/python/sglang/kernels/jit/csrc/dsa/kpool_topk_transform.cuh
++++ b/sgl-workspace/sglang/python/sglang/kernels/jit/csrc/dsa/kpool_topk_transform.cuh
+@@ -19,7 +19,11 @@
+ #include <bit>
+ #include <cstddef>
+ #include <cstdint>
++#ifdef __HIP_PLATFORM_AMD__
++#include <hip/hip_runtime.h>
++#else
+ #include <cuda_fp16.h>
++#endif
+ 
+ namespace sglang {
+ namespace {
