@@ -539,6 +539,13 @@ if [ "${GLM53_ENABLE_PARSERS:-1}" = "1" ]; then
     --tool-call-parser "$GLM53_TOOL_CALL_PARSER"
   )
 fi
+# --- chat template (GLM-5.3 ships chat_template.jinja as a SEPARATE file, not
+#     in tokenizer_config.json — sglang's auto-load misses it, causing raw-text
+#     input and garbage output. Pass --chat-template explicitly. Set
+#     GLM53_CHAT_TEMPLATE=0 to disable (e.g. for /v1/completions raw-prompt tests).
+if [ "${GLM53_CHAT_TEMPLATE:-1}" = "1" ] && [ -f "$MODEL_PATH/chat_template.jinja" ]; then
+  SGLANG_ARGS+=( --chat-template "$MODEL_PATH/chat_template.jinja" )
+fi
 # --- MI300A workarounds: MTP/nextn crashes cuda-graph capture ---------------
 [ "${DISABLE_CUDA_GRAPH:-1}" = "1" ] && SGLANG_ARGS+=(--disable-cuda-graph)
 [ "${SKIP_SERVER_WARMUP:-1}" = "1" ] && SGLANG_ARGS+=(--skip-server-warmup)
