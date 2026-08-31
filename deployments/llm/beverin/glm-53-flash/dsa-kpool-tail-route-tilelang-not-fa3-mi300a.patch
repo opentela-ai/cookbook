@@ -1,0 +1,32 @@
+# MI300A (gfx942, device_sm_major == 9): the kpool>1 tail route.
+#
+# _resolve_kpool_tail_backend remaps flashmla_sparse -> "fa3" for sm_major==9.
+# fa3 (flash_attn_with_kvcache, sglang.kernels.ops.attention.flash_attention_v3)
+# is NOT importable on this ROCm container (ImportError in sgl_kernel.flash_attn),
+# so the moment kpool>1 materialises topk_indices (e.g. cuda-graph capture),
+# the forward dispatches to _forward_fa3 and crashes at import.
+#
+# Route the tail to "tilelang" instead. sitecustomize.py (PR #52) already
+# rebinds sglang's tilelang_sparse_fwd to the vkernels HIP kernel
+# (vk_hip_dsa_sparse_fwd) which handles tail_dim correctly, so the kpool>1
+# forward completes and cuda-graph capture becomes legal on MI300A.
+diff --git a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa_backend.py b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa_backend.py
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -898,7 +898,13 @@
+             return dsa_impl
+         if self.device_sm_major >= 10:
+             return "trtllm"
+-        if self.device_sm_major == 9:
+-            return "fa3"
++        if self.device_sm_major == 9:
++            # MI300A (gfx942): fa3 (flash_attn_with_kvcache) is not importable
++            # on this ROCm container (ImportError in sgl_kernel.flash_attn), so
++            # route the kpool>1 tail to the tilelang backend. sitecustomize.py
++            # (PR #52) rebinds tilelang_sparse_fwd to the vkernels HIP kernel
++            # (vk_hip_dsa_sparse_fwd) which handles tail_dim correctly, making
++            # cuda-graph capture legal for kpool>1 on MI300A.
++            return "tilelang"
+         return dsa_impl
+ 
+     def _pad_trtllm_sparse_page_table(

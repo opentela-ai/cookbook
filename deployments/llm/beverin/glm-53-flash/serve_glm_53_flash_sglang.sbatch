@@ -294,9 +294,12 @@ export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 
-# MI300A workarounds: disable cuda-graph capture + skip warmup (both crash the
-# MTP/nextn layer on MI300A; glm47/glm52 lesson).
-export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+# MI300A workarounds: --skip-server-warmup stays on (MTP/nextn warmup
+# crash). CUDA graph is now ON (was the kpool>1 gate -> fa3 ImportError
+# during capture; patched _resolve_kpool_tail_backend routes MI300A ->
+# tilelang, whose forward is the PR #52 vkernels HIP shim). Capture is the
+# real cuda-graph perf win (no per-step host launch overhead).
+export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 export SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-1}"
 
 # --- networking + ports -----------------------------------------------------
