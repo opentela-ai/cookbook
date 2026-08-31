@@ -285,7 +285,12 @@ export GLM53_ENABLE_PARSERS="${GLM53_ENABLE_PARSERS:-1}"
 # KV pool is sized by MEM_FRAC (not this). 32768 for a fast cold start + probe
 # (shorter than kimi-k3's 1M; raise toward 1M once the forward is proven).
 export CTX_LEN="${CTX_LEN:-32768}"
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.88}"
+# APU: MI300A shares one ~513 GB HBM pool across CPU + 4 dies. At 0.88 each die
+# reserves 104.7 GB (weights 75.9 + KV/Mamba ~29), leaving only ~14 GB/die for
+# the serving-time inductor/Triton JIT (bf16 F.linear -> triton_mm, triton_poi_fused),
+# and a second JIT round (decode shapes) OOMs with allocator fragmentation.
+# 0.80 frees ~24 GB/die headroom (weights still fit, KV/Mamba ~550K ctx, fine for smoke).
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 
