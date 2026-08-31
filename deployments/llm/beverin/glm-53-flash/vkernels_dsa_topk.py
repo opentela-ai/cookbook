@@ -102,7 +102,7 @@ import torch
 __all__ = ["fast_kpool_topk_transform_fused"]
 
 
-def fast_kpool_topk_transform_fused(
+def _fast_kpool_topk_transform_fused_eager(
     score: torch.Tensor,
     lengths: torch.Tensor,
     pool_size: int,
@@ -209,3 +209,145 @@ def fast_kpool_topk_transform_fused(
                 dst[b, history_len : history_len + tail_count] = raw.to(torch.int32)
 
     return dst
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph-capturable vectorized implementation of the LINEAR branch
+# (length <= group_topk) — the GLM-5.3 DECODE case. NO host syncs: every
+# per-row scalar (length / row_start / ptr / offset / tail_count) stays on
+# the device as a 0-d/1-d tensor, and per-row dynamic slicing is replaced by
+# masked ``torch.where`` over a single constant-bounded ``arange(out_cols)``.
+#
+# Why this exists: the eager implementation above uses ``.item()`` CPU syncs
+# (one per row per scalar) which are ILLEGAL under stream capture
+# (``hipErrorStreamCaptureUnsupported``, beverin job 614033 during
+# ``init_all_cuda_graphs``). During CUDA-graph capture/replay the decode
+# path has short pooled history (``length <= group_topk``), so the LINEAR
+# branch is the only one taken and ``group_id == group_rank`` (identity) —
+# no ``torch.topk`` / ``arange(length)`` host-bounded lookup is needed.
+#
+# The RADIX branch (length > group_topk, long pooled history) is NOT taken
+# on decode and is intentionally NOT implemented here; the public switch
+# routes to the eager path when not capturing, so the radix branch stays
+# available (and correct) for non-decode eager forwards.
+# ---------------------------------------------------------------------------
+def _fast_kpool_topk_transform_fused_graphsafe(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None = None,
+    topk_indices_offset: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,  # noqa: ARG001 (unused on linear branch)
+    seq_lens: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert topk % pool_size == 0, f"topk ({topk}) must be a multiple of pool_size ({pool_size})"
+    group_topk = topk // pool_size  # noqa: F841 (kept for parity / future radix guard)
+    assert score.dim() == 2, f"score must be 2-D (got {score.dim()})"
+    assert page_table is None or topk_indices_offset is None, (
+        "page_table and topk_indices_offset are mutually exclusive"
+    )
+    assert page_table_row_index is None or page_table is not None, (
+        "page_table_row_index requires page_table"
+    )
+
+    B = int(score.shape[0])              # shape access — no host sync
+    device = score.device
+    append_tail = seq_lens is not None
+    out_cols = topk + (pool_size - 1 if append_tail else 0)
+    token_topk = topk
+
+    lengths_i = lengths.to(torch.int64)
+    ptr_i = (page_table_row_index.to(torch.int64) if page_table_row_index is not None
+             else torch.arange(B, dtype=torch.int64, device=device))
+    offsets_i = (topk_indices_offset.to(torch.int32) if topk_indices_offset is not None
+                 else torch.zeros(B, dtype=torch.int32, device=device))
+    seq_lens_i = seq_lens.to(torch.int64) if seq_lens is not None else None
+
+    has_page_table = page_table is not None
+    has_offset = topk_indices_offset is not None
+
+    # full pooled history length (tokens) per row, clamped to token_topk
+    full_pool_token_len_b = lengths_i * pool_size                            # (B,)
+    token_topk_t = torch.full((), token_topk, dtype=torch.int64, device=device)  # graph-safe (kernel fill, not cudaMemcpy)
+    history_len_b = torch.minimum(full_pool_token_len_b, token_topk_t)        # (B,)
+
+    if has_page_table:
+        zero_t = torch.zeros((), dtype=torch.int64, device=device)         # graph-safe
+        pt_cols_m1 = torch.full((), max(int(page_table.size(1)) - 1, 0),
+                                dtype=torch.int64, device=device)           # graph-safe
+
+    dst = torch.full((B, out_cols), -1, dtype=torch.int32, device=device)
+
+    cols = torch.arange(out_cols, dtype=torch.int64, device=device)          # (out_cols,)
+    cols_b = cols.unsqueeze(0)                                               # (1, out_cols)
+    hist_len_2 = history_len_b.unsqueeze(1)                                  # (B, 1)
+
+    def _transform(raw_2d):
+        # raw_2d: (B, out_cols) int64 -> (B, out_cols) int32
+        if has_page_table:
+            # clamp to [0, pt_cols-1] via tensor compares (no scalar_tensor ->
+            # no cudaMemcpy; all graph-safe) before the advanced-index gather,
+            # so out-of-range raw (in cols the masks discard) never OOBs.
+            lo = torch.where(raw_2d > zero_t, raw_2d, zero_t)
+            raw_safe = torch.where(lo < pt_cols_m1, lo, pt_cols_m1)
+            idx = page_table[ptr_i.unsqueeze(1).expand(-1, out_cols), raw_safe]
+            return idx.to(torch.int32)
+        if has_offset:
+            return raw_2d.to(torch.int32) + offsets_i.to(torch.int32).unsqueeze(1)
+        return raw_2d.to(torch.int32)
+
+    # --- HISTORY cols [0, history_len_b): linear branch (group_id == group_rank) ---
+    # raw_token = group_rank * pool_size + slot  (identity; no arange(length) lookup)
+    group_rank = cols // pool_size                                           # (out_cols,)
+    slot = cols % pool_size                                                  # (out_cols,)
+    hist_raw_2 = (group_rank * pool_size + slot).unsqueeze(0).expand(B, -1)  # (B, out_cols)
+    hist_mask = cols_b < hist_len_2                                          # (B, out_cols) bool
+    dst = torch.where(hist_mask, _transform(hist_raw_2), dst)
+
+    # --- TAIL cols [history_len_b, history_len_b + tail_count_b) ---
+    if append_tail:
+        tail_count_b = seq_lens_i % pool_size                                # (B,)
+        tail_col_rel = cols_b - hist_len_2                                   # (B, out_cols); >=0 in valid range
+        tail_raw_2 = (full_pool_token_len_b.unsqueeze(1) + tail_col_rel).to(torch.int64)  # (B, out_cols)
+        tail_mask = (cols_b >= hist_len_2) & (
+            cols_b < (history_len_b + tail_count_b).unsqueeze(1)
+        )
+        dst = torch.where(tail_mask, _transform(tail_raw_2), dst)
+
+    return dst
+
+
+def fast_kpool_topk_transform_fused(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None = None,
+    topk_indices_offset: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """DSA kpool top-k transform, dispatched by CUDA-graph capture state.
+
+    During CUDA-graph capture/replay (the GLM-5.3 decode path under CUDA
+    graphs): use the vectorized LINEAR-branch implementation (NO ``.item()``
+    host syncs). During eager execution (prefill, or the rare radix branch
+    with long pooled history): use the original per-row implementation
+    (correct for ALL branches; ``.item()`` is fine when not capturing).
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return _fast_kpool_topk_transform_fused_graphsafe(
+            score, lengths, pool_size, topk,
+            page_table=page_table, topk_indices_offset=topk_indices_offset,
+            row_starts=row_starts, seq_lens=seq_lens,
+            page_table_row_index=page_table_row_index,
+        )
+    return _fast_kpool_topk_transform_fused_eager(
+        score, lengths, pool_size, topk,
+        page_table=page_table, topk_indices_offset=topk_indices_offset,
+        row_starts=row_starts, seq_lens=seq_lens,
+        page_table_row_index=page_table_row_index,
+    )
