@@ -900,8 +900,14 @@ chmod +x "$RUNDIR/engine.sh"
 # (verified on clariden for kimi-k3: a 2nd container on the head reaches the
 # engine on localhost:$SERVE_PORT, and the host's `ss` sees the container's
 # listening socket), so otela on the head reaches sglang on
-# localhost:$SERVE_PORT. HOME is the EDF's /capstor/.../home (not quota
-# /users), so its libp2p identity + badger DB persist cleanly across jobs.
+# localhost:$SERVE_PORT. HOME is the EDF's $DEPLOY_DIR/home (not quota
+# /users), so its libp2p identity + badger DB are KEPT ON /capstor across
+# jobs. NOTE (observed, run 3219525 + 4 prior): the identity is NOT pinned
+# by the shared HOME — $HOME/.config/opentela/id and a fresh
+# $HOME/.ocfcore/ocfcore.Qm*.db are REGENERATED on every start, so each of
+# the last 5 runs minted a different peer id (QmcrhK7z, QmPnaDQD, QmRAdK3p,
+# QmQLa2Bu, QmdV1...) with seed=$OTELA_SEED unchanged. See the "stale row"
+# note by stop_otela below.
 OTELA_CFG_DIR="$DEPLOY_DIR/otela"
 OTELA_CFG="$OTELA_CFG_DIR/cfg.yaml"
 mkdir -p "$OTELA_CFG_DIR"
@@ -971,9 +977,12 @@ stop_otela() {
     echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
     echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
     echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    echo "[$(date -Is)]       Restart with the SAME seed (default $OTELA_SEED) so the" >&2
-    echo "[$(date -Is)]       new worker re-adopts the peer ID and overwrites the" >&2
-    echo "[$(date -Is)]       stale row in the CRDT." >&2
+    echo "[$(date -Is)]       The next run mints a FRESH peer id (seed=$OTELA_SEED does" >&2
+    echo "[$(date -Is)]       NOT pin the libp2p identity — see the header note), so it" >&2
+    echo "[$(date -Is)]       cannot overwrite this stale row; the head accumulates one" >&2
+    echo "[$(date -Is)]       dead connected=true peer per run. Non-fatal: registration" >&2
+    echo "[$(date -Is)]       and serving still succeed; it shows as ~5.5-min dial-then-" >&2
+    echo "[$(date -Is)]       peer-id-mismatch DEBUG spam sourced from the head's CRDT." >&2
     return 0
   fi
   echo "[$(date -Is)] stopping otela step $step"
@@ -1037,6 +1046,17 @@ trap 'stop_otela' EXIT TERM INT
     fi
   fi
 
+  # --- stale CRDT hygiene (manual; NOT auto-run) -------------------------
+  # Each job mints a fresh peer id, so $HOME/.ocfcore/ocfcore.Qm*.db dirs
+  # pile up (5 observed across Aug 28 -> Sep 1). When no other glm-53 job is
+  # on $HEAD, prune on the head inside the container (single-quoted so $HOME
+  # resolves in the container, not the batch shell):
+  #   srun --jobid=$SLURM_JOB_ID --overlap --gres=none -w "$HEAD" \
+  #        --environment="$OTELA_EDF_NAME" \
+  #        bash -c 'rm -rf "$HOME/.ocfcore/"ocfcore.Qm*.db 2>/dev/null || true'
+  # NB: this clears only THIS worker's local store; it does NOT stop the
+  # dial-mismatch loop, whose stale rows live in the bootstrap head's CRDT
+  # ($OTELA_RELAY_ADDR, which this recipe does not run).
   echo "[$(date -Is)] starting otela worker on $HEAD (inside container, EDF=$OTELA_EDF_NAME)"
   # Redirect INSIDE the container (not via srun's pipe) to avoid srun
   # output buffering that hides otela log lines until the buffer fills.
