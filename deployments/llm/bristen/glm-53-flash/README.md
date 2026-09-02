@@ -32,7 +32,8 @@ GLM-5.3 Python overlay, then register it on OpenTela.
 > read across 4 files, plus the decode `kpool_decode_update_index_cache` path)
 > — a larger effort than the MoE patch, with more untested FP8 paths behind it.
 > **Tracked as [vkernels#60](https://github.com/opentela-ai/vkernels/issues/60)**
-> (native SM80 CUDA kernels, bf16 storage + fp32 accum, mirroring PR #52).
+> (native SM80 CUDA kernels, bf16 storage + fp32 accum, mirroring PR #52);
+> the recipe-side re-validation is [cookbook#1](https://github.com/opentela-ai/cookbook/issues/1).
 > (The "detokenizer health check failed / last_heartbeat" messages around boot
 > are a red herring: the TokenizerManager's health monitor simply stalls during
 > the slow weight load; no detokenizer crash occurs.)

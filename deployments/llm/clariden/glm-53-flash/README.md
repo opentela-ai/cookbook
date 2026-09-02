@@ -24,7 +24,7 @@ the FP8-compile floor (and the A100-80GB HBM floor). See
 FP8 / 4 GPUs = **~76.5 GiB weights/GPU of ≈96 GiB usable** → ~20 GiB free
 for KV pool + activations + JIT — tight but sufficient for single-stream /
 low concurrency. **2 nodes (TP4 × PP2) widens KV headroom to ~58 GiB/GPU
-but is not yet validated end-to-end**; add a node only if you need more
+but is **not yet validated end-to-end** (tracked #2); add a node only if you need more
 concurrency. TP4 keeps tensor-parallel all-reduce **inside one node's 4-GH200
 NVLink domain**; the only cross-Slingshot traffic is pipeline send/recv
 (point-to-point) — bandwidth-tolerant and CUDA-graph-safe. (Flat TP8 across
@@ -131,7 +131,7 @@ Routed serving **registered successfully** in job 3219525 (`model=zai-org/GLM-5.
 (~10h in) returned **HTTP 400 in ~22ms** — fast rejections, almost
 certainly malformed external probes (missing `X-Otela-Model` or wrong model
 name), not a serve failure. Direct localhost serving is gen-probe-validated;
-a clean routed `200` is the one open confirmation to close on the next run.
+a clean routed `200` is the one open confirmation to close on the next run (tracked #3).
 
 ## Files
 
