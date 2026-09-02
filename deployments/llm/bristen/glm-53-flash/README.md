@@ -143,9 +143,11 @@ in `patched_sources/`.
 | `MODEL_PATH` | `/capstor/scratch/cscs/xyao/models/zai-org/GLM-5.3-Flash` | weights |
 | `SERVED_MODEL_NAME` | `zai-org/GLM-5.3-Flash` | sglang + OpenTela model id |
 | `TP_SIZE` / `PP_SIZE` / `EP_SIZE` | `4` / `1` / `4` | one node, TP=4, EP=4 |
-| `CTX_LEN` | `2048` | small context because 77 GB weights/GPU leaves little HBM |
-| `GPU_MEM_UTIL` | `0.94` | high static fraction for the tight 80 GB budget |
+| `CTX_LEN` | `2048` | small context; FP8 weights leave only ~2.4 GB/GPU HBM |
+| `GPU_MEM_UTIL` | `0.98` | raised from 0.94 so the hybrid mamba state cache fits the ~2.4 GB free after weights |
+| `MAX_RUNNING_REQUESTS` | `8` | small so the tiny mamba cache (~9 slots) is not over-subscribed |
 | `LOAD_FORMAT` | `auto` | `dummy` for fast overlay smoke, `auto` for real FP8 weights |
+| `CHUNKED_PREFILL_SIZE` | `2048` | matches `CTX_LEN`; keeps prefill activations within the tight slack |
 | `SMOKE` | `1` | `1` = hold job after health, `0` = OpenTela registration step |
 | `DISABLE_CUDA_GRAPH` / `SKIP_SERVER_WARMUP` | `1` | defaults match Beverin/Clariden stability knobs |
 | `DSA_PREFILL_BACKEND` | *(unset)* | set to `fa3` to experiment; overlay default routes SM80 to TileLang |

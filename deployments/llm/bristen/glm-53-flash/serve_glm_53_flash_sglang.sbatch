@@ -58,11 +58,22 @@ export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-1}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
 
-# A100 80 GB is tight: high static fraction, small context for smoke.
+# A100 80 GB is extremely tight: FP8 weights leave only ~2.4 GB/GPU after
+# load. GLM-5.3 is a hybrid mamba/linear-attention model, so it needs a
+# separate mamba state cache in addition to the KV pool. With the default
+# mem-fraction-static=0.94 the activation reserve (~6% of ~79 GB = 4.7 GB)
+# exceeds the free memory and the mamba cache budget goes negative
+# ("Not enough GPU memory for hybrid ... state cache").
+#
+# Raise mem-fraction-static to 0.98 so the activation reserve (~1.6 GB)
+# fits within the ~2.4 GB free, leaving ~0.7 GB for a small mamba cache
+# (~9 slots). Keep max-running-requests and chunked-prefill-size small so
+# the tiny cache is not over-subscribed and prefill activations stay
+# within the now-tighter slack. (Smoke-test only; see README.)
 export CTX_LEN="${CTX_LEN:-2048}"
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
-export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
-export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.98}"
+export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 
 # Request-length bound + KV pool sizing.
 export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
