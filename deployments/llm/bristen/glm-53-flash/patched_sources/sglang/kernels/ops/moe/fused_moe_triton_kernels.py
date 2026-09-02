@@ -882,6 +882,24 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    if use_fp8_w8a8 and A.dtype == torch.float8_e4m3fn:
+        # SM80 (A100) cannot load fp8e4nv in Triton -- fp8 load/store and
+        # fp8 tl.dot require SM89+/SM90+. Upcast A and B to the compute dtype
+        # (bf16/fp16) here, before launch, so the kernel's tl.load never sees
+        # an FP8 pointer and its in-kernel `a.to(compute_type)` becomes a
+        # no-op. use_fp8_w8a8 stays True, so the per-block (A_scale, B_scale)
+        # dequant multiply runs unchanged and the result matches the FP8
+        # emulation exactly: A_fp8.to(bf16) @ B_fp8.to(bf16) * scales.
+        #
+        # B is this layer's w1/w2 (EP-sharded, ~1-2 GB fp8 -> ~2-4 GB bf16),
+        # not the whole model, so the transient copy fits the HBM headroom.
+        if torch.cuda.get_device_capability(A.device)[0] < 9:
+            compute_dtype = (
+                torch.bfloat16 if compute_type == tl.bfloat16 else torch.float16
+            )
+            A = A.to(compute_dtype)
+            B = B.to(compute_dtype)
+
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
