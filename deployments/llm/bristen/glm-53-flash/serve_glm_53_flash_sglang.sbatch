@@ -2,11 +2,21 @@
 #SBATCH --job-name=glm53-bristen
 #SBATCH --account=infra02
 #SBATCH --partition=normal
-#SBATCH --nodes=1
+# Default 2 nodes x TP4 x PP2 (8 GPUs) for a 12-hour-capable serve: FP8
+# weights ~306 GB / 8 GPUs = ~38 GiB/GPU, leaving ~41 GiB headroom (vs the
+# razor-edge ~2.4 GiB on 1 node). PP2 puts one pipeline stage per node, so
+# only PP send/recv crosses the Slingshot fabric (validated, job 82749).
+# Override with: sbatch --nodes=1 --export=ALL,PP_SIZE=1 ... (1-node smoke)
+# or  NNODES=2 PP_SIZE=2 sbatch serve_glm_53_flash_sglang.sbatch
+#SBATCH --nodes=2
+# 2026-09-02 snapshot of bad-boot nodes (scontrol shows IDLE/gpu:4 but slurmd
+# won't launch: "Something is wrong with the boot of the nodes"). Refresh with
+# find_bad_nodes.sh and override via: sbatch --exclude=... serve_glm_53_flash_sglang.sbatch
+#SBATCH --exclude=nid002284,nid002293,nid002297,nid002312,nid002316,nid002321,nid002324
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/capstor/scratch/cscs/xyao/glm-53-flash-bristen/logs/%x-%j.out
 #
 # =============================================================================
@@ -55,23 +65,31 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export NNODES="${NNODES:-1}"
 export TP_SIZE="${TP_SIZE:-4}"
-export PP_SIZE="${PP_SIZE:-1}"
+# One pipeline stage per node (Clariden pattern). PP2 on 2 nodes halves the
+# per-GPU weight to ~38 GiB (the path to a 12-hour serve on A100-80GB).
+export PP_SIZE="${PP_SIZE:-$NNODES}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
+# Slingshot high-speed NIC (one per GPU NUMA domain). hsn0 carries the
+# routable 172.28/16 IPv4 used for the NCCL/GLOO TCPStore bootstrap; the
+# aws_ofi_nccl plugin (engine.sh) carries the data path over CXI.
+export GLM53_NIC="${GLM53_NIC:-hsn0}"
 
-# A100 80 GB is extremely tight: FP8 weights leave only ~2.4 GB/GPU after
-# load. GLM-5.3 is a hybrid mamba/linear-attention model, so it needs a
-# separate mamba state cache in addition to the KV pool. With the default
-# mem-fraction-static=0.94 the activation reserve (~6% of ~79 GB = 4.7 GB)
-# exceeds the free memory and the mamba cache budget goes negative
-# ("Not enough GPU memory for hybrid ... state cache").
+# A100 80GB is extremely tight at 1 node x TP4: FP8 weights ~306 GB / 4
+# GPUs = ~77 GiB/GPU, leaving ~2.4 GiB free. mem_fraction_static=0.98 makes
+# the activation reserve (slack = total * (1-mem)) ~1.6 GiB, below the ~2.25
+# GiB FP8->bf16 MoE upcast transient (job 82473 OOM). Lowering mem to fit the
+# transient is impossible at 1 node (KV+mamba = total*mem - weights - mamba
+# goes negative: 80*0.95 - 77 - 0.4 < 0).
 #
-# Raise mem-fraction-static to 0.98 so the activation reserve (~1.6 GB)
-# fits within the ~2.4 GB free, leaving ~0.7 GB for a small mamba cache
-# (~9 slots). Keep max-running-requests and chunked-prefill-size small so
-# the tiny cache is not over-subscribed and prefill activations stay
-# within the now-tighter slack. (Smoke-test only; see README.)
+# DEFAULT 2 nodes x TP4 x PP2 (8 GPUs) FIXES THIS: weights ~306 GB / 8 =
+# ~38 GiB/GPU, leaving ~41 GiB free. mem_fraction_static=0.93 gives slack
+# ~5.5 GiB (> the 2.25 GiB upcast transient, ~2.4x margin) while KV+mamba
+# stays ~35 GiB (vs going negative on 1 node). This is the path to a 12-hour
+# serve on A100-80GB. The mamba state cache is no longer binding (no
+# --max-mamba-cache-size needed); max_running_requests stays small as a
+# conservative first-boot choice.
 export CTX_LEN="${CTX_LEN:-2048}"
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.98}"
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.93}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 
@@ -133,10 +151,16 @@ bash "$SCRIPT_DIR/apply_sm80_patch.sh" || { echo "[$(date -Is)] FATAL: SM80 patc
 
 export RUNDIR="$DEPLOY_DIR/run/${SLURM_JOB_ID:-$$}"
 mkdir -p "$RUNDIR"
-export HEAD="${SLURM_JOB_NODELIST:-$(hostname)}"
-export HEAD="$(echo "$HEAD" | sed 's/\[.*//')"   # strip any node-array suffix -> first node
+export HEAD="$(scontrol show hostnames "${SLURM_JOB_NODELIST:-$(hostname)}" 2>/dev/null | head -1)"
+export HEAD="${HEAD:-$(hostname)}"
 export HEAD_IP="$(getent hosts "$HEAD" 2>/dev/null | awk '{print $1; exit}')"
 export HEAD_IP="${HEAD_IP:-127.0.0.1}"
+# HEAD/HEAD_IP must reach engine.sh INSIDE the container, where the
+# --dist-init-addr "$HEAD_IP:$MASTER_PORT" (PP2 TCPStore bootstrap) is built.
+# Without them engine.sh falls back to 127.0.0.1 and node 1 can never reach
+# node 0's store (job 82802 hung for dist_timeout). MASTER_PORT is set above
+# (line ~102); all three are listed explicitly in --container-env below for
+# defense in depth.
 
 # Cache / tmp inside the container (visible because /capstor is mounted)
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$DEPLOY_DIR/cache/triton}"
@@ -160,7 +184,11 @@ CONTAINER_OPTS=(
   --container-image="$IMAGE"
   --container-name=sglang-cu13
   --container-mounts=/capstor:/capstor
-  --container-env=PYTHONPATH
+  # NCCL vars are authored in engine.sh (:= defaults) and overridable from the
+  # host via this list (pyxis inherits them into the container unmodified).
+  # HEAD/HEAD_IP/MASTER_PORT are the PP2 dist-init-addr (engine.sh); without
+  # them node 1's TCPStore bootstrap points at 127.0.0.1 and hangs.
+  --container-env=PYTHONPATH,HEAD,HEAD_IP,MASTER_PORT,NCCL_NET_PLUGIN,NCCL_NET,NCCL_CROSS_NIC,FI_CXI_DISABLE_HOST_REGISTER,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RDZV_THRESHOLD,FI_CXI_RDZV_GET_MIN,FI_MR_CACHE_MONITOR,NCCL_SOCKET_IFNAME,GLOO_SOCKET_IFNAME,NCCL_SOCKET_FAMILY,GLOO_SOCKET_FAMILY,NCCL_DEBUG,GLM53_NIC
 )
 
 echo "[$(date -Is)] started job=$SLURM_JOB_ID node=$HEAD image=$IMAGE load_format=$LOAD_FORMAT smoke=$SMOKE"

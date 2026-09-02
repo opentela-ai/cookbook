@@ -7,6 +7,44 @@ echo "[rank $RANK] $(hostname) node-rank=$RANK dist-init=$HEAD:$MASTER_PORT serv
 # Cache / tmp are already exported by the parent shell.
 mkdir -p "$TRITON_CACHE_DIR" "$HF_HOME" "$TMPDIR" 2>/dev/null || true
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+# The per-layer FP8->bf16 MoE upcast is a single ~2.25 GiB transient that must
+# fit in a tiny activation reserve on A100. expandable_segments lets the
+# caching allocator coalesce that transient against already-freed chunks
+# instead of demanding a contiguous 2.25 GiB block (OOM hint suggested it).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# --- Slingshot NCCL (validated 2-node allreduce, job 82749) -----------------
+# Bristen (x86_64 A100) sits on the same CSCS Slingshot/CXI fabric as Clariden
+# (hsn0..hsn3, /dev/cxi0..3, kfi_cxi kernel modules). NCCL has no IB verbs here
+# and needs the aws_ofi_nccl CUDA13 plugin to drive CXI. The plugin .so was
+# copied to the SHARED /capstor (every node mounts /capstor) so it does NOT
+# depend on the per-node-local /opt/cscs/aws-ofi-ccl-plugin path, which is
+# unpopulated on bad-boot nodes and breaks multi-node container launch. The
+# .so links against the system libfabric.so.1 + the auto-mounted
+# /opt/cscs/netstack/libcxi.so.1 (present on every healthy node). Validated by
+# nccl_smoke.sbatch (job 82749): 2-node allreduce PASS, channels carried via
+# NET/AWS Libfabric/CXI. Without this block SGLang's PP send/recv falls back to
+# the slow built-in socket transport over the management IP. Host overrides
+# (carried via --container-env in the sbatch) win because of `:=`.
+: "${NCCL_NET_PLUGIN:=${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-bristen}/cache/nccl-plugin/libnccl-net.so}"
+: "${NCCL_NET:=AWS Libfabric}"
+: "${NCCL_CROSS_NIC:=1}"
+: "${FI_CXI_DISABLE_HOST_REGISTER:=1}"
+: "${FI_CXI_DEFAULT_CQ_SIZE:=131072}"
+: "${FI_CXI_RDZV_THRESHOLD:=0}"
+: "${FI_CXI_RDZV_GET_MIN:=0}"
+: "${FI_MR_CACHE_MONITOR:=userfaultfd}"
+: "${NCCL_SOCKET_IFNAME:=${GLM53_NIC:-hsn0}}"
+: "${GLOO_SOCKET_IFNAME:=${GLM53_NIC:-hsn0}}"
+: "${NCCL_SOCKET_FAMILY:=IPv4}"
+: "${GLOO_SOCKET_FAMILY:=IPv4}"
+export NCCL_NET_PLUGIN NCCL_NET NCCL_CROSS_NIC FI_CXI_DISABLE_HOST_REGISTER \
+  FI_CXI_DEFAULT_CQ_SIZE FI_CXI_RDZV_THRESHOLD FI_CXI_RDZV_GET_MIN \
+  FI_MR_CACHE_MONITOR NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME \
+  NCCL_SOCKET_FAMILY GLOO_SOCKET_FAMILY
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+[ "${NNODES:-1}" -gt 1 ] && \
+  echo "[rank $RANK] netstack: plugin=$NCCL_NET_PLUGIN net=$NCCL_NET iface=$NCCL_SOCKET_IFNAME head=$HEAD_IP:$MASTER_PORT"
 
 SGLANG_ARGS=(
   --model-path "$MODEL_PATH"
