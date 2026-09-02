@@ -4,21 +4,20 @@ Serve `zai-org/GLM-5.3-Flash` on **Bristen** (CSCS, 4× A100 80 GB / node,
 x86_64, NVIDIA) with the upstream CUDA SGLang image and the Beverin
 GLM-5.3 Python overlay, then register it on OpenTela.
 
-> **Current status — known blocker on A100 (SM80):** the model ships in FP8
-> (`e4m3`, ~306 GB). No bundled FP8 GEMM backend supports SM80 out of the box:
-> Triton maps `torch.float8_e4m3fn` to the Hopper-only `fp8e4nv` dtype,
-> `torch._scaled_mm` requires SM89+/MI300+, and the FlashInfer/DeepGEMM/CUTLASS
-> backends require SM90+/SM100+. The recipe therefore boots and loads weights,
-> but the first forward pass fails to compile. See *SM80 FP8 compute blocker*
-> below for the exact errors and the remaining path to a working serve.
+> **Current status — experimental SM80 fallback:** the model ships in FP8
+> (`e4m3`, ~306 GB). The recipe now applies a local patch that converts
+> FP8 storage to bf16/fp16 compute inside the Triton kernels, so the engine
+> compiles on A100 (SM80). This is **not** native FP8 tensor-core execution;
+> it is slow and memory-heavy, but it can be used to smoke-test GLM-5.3-Flash
+> on Bristen.
 
-## Quick start (for debugging the blocker)
+## Quick start
 
 ```bash
 # from the Bristen login node
 sbatch deployments/llm/bristen/glm-53-flash/serve_glm_53_flash_sglang.sbatch
 
-# with real weights and OpenTela registration (will still hit the SM80 FP8 compile)
+# real weights + OpenTela registration
 SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_53_flash_sglang.sbatch
 ```
 
@@ -28,6 +27,8 @@ SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_5
 |------|---------|
 | `serve_glm_53_flash_sglang.sbatch` | Slurm batch: container setup, preflight, SGLang engine, generation probe |
 | `engine.sh` | Per-rank SGLang launcher (args, MoE/FP8 backend selection, DSA override) |
+| `apply_sm80_patch.sh` | Copy the Beverin overlay and apply the SM80 FP8→bf16 compute patches |
+| `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py` and `fused_moe_triton_kernels.py` |
 | `preflight.py` | In-container import test for the GLM-5.3 overlay |
 | `gen_correctness.py` | Greedy correctness/smoke probe against `/v1/completions` |
 | `README.md` | This file |
@@ -58,7 +59,7 @@ sbatch deployments/llm/bristen/glm-53-flash/serve_glm_53_flash_sglang.sbatch
 # real weights, hold the job for manual inspection
 LOAD_FORMAT=auto SMOKE=1 sbatch deployments/llm/bristen/glm-53-flash/serve_glm_53_flash_sglang.sbatch
 
-# real weights + OpenTela registration (currently still blocked at first forward)
+# real weights + OpenTela registration
 LOAD_FORMAT=auto SMOKE=0 sbatch deployments/llm/bristen/glm-53-flash/serve_glm_53_flash_sglang.sbatch
 ```
 
@@ -103,58 +104,33 @@ srun --jobid=<JOBID> --overlap --gres=none --nodes=1 -n1 -w <HEAD> \
 The same `--served-model-name zai-org/GLM-5.3-Flash` and `--label model=...`
 keep direct calls and routed calls consistent (see `conventions/README.md`).
 
-## Status: SM80 FP8 compute blocker
+## SM80 FP8 compute patch
 
-### What fails
+The sbatch automatically builds a patched copy of the SGLang Python tree in
+`$DEPLOY_DIR/patches_full` and prepends it to `PYTHONPATH`:
 
-With the default Triton backend on A100, the first FP8 GEMM compile dies:
+- `sglang/kernels/ops/quantization/fp8_kernel.py`: the `_w8a8_block_fp8_matmul`
+  kernel loads FP8 tensors and upcasts them to the compute dtype before
+  `tl.dot`; the launcher upcasts the A/B tensors before launching the kernel
+  so the Triton signature never sees an FP8 pointer.
+- `sglang/kernels/ops/moe/fused_moe_triton_kernels.py`: TMA descriptors are
+  disabled on SM80, and both pointer and descriptor loads are upcast to
+  `compute_type` before `tl.dot`; the launcher upcasts A/B to the compute
+  dtype before launching the kernel.
 
-```text
-triton.compiler.errors.CompilationError: at 1:0:
-def _w8a8_block_fp8_matmul(
-^
-ValueError("type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
-```
+The patch is applied by `apply_sm80_patch.sh`, which copies the whole Beverin
+overlay `sglang` tree and then overwrites the two files above with the versions
+in `patched_sources/`.
 
-The same error occurs in the fused MoE Triton kernel. Forcing the
-FlashInfer/CUTLASS/TRT-LLM backends fails earlier at model initialization
-because they gate on SM90+ or SM100+.
+### Caveats
 
-### Why
-
-- `torch.float8_e4m3fn` is Triton's `fp8e4nv`, which is Hopper-only (SM90).
-- A100 (SM80) supports only the storage FP8 types `fp8e4b15` / `fp8e5` in
-  Triton, and has **no native FP8 tensor-core instructions**.
-- The practical path on SM80 is **FP8 storage + bf16 compute**: load the FP8
-  tensor, upcast to `bf16`/`fp16`, then call `tl.dot`. None of the bundled
-  SGLang kernels currently do this.
-
-### What has been tried
-
-| Attempt | Result |
-|---------|--------|
-| Default Triton backend (`--fp8-gemm-backend triton`, `--moe-runner-backend triton`) | Fails at first forward with `fp8e4nv not supported in this architecture`. |
-| FlashInfer CUTLASS (`flashinfer_cutlass`) | Runtime error at init: requires Blackwell (SM100+). |
-| FlashInfer TRT-LLM (`flashinfer_trtllm`) | Runtime error at init: requires Blackwell (SM100+) and weight shuffling. |
-| `torch._scaled_mm` direct test | `only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+`. |
-| `--dsa-prefill-backend fa3` | Not viable: FA3 on SM80 rejects GLM-5.3's different QK/V head dims. The overlay already routes SM80 to the TileLang sparse DSA backend for `index_kpool > 1` tails. |
-
-### Remaining path to a working serve
-
-The kernels in the Beverin overlay would need to be patched to upcast FP8
-inputs to bf16 before the matmul on SM80:
-
-- `sglang/kernels/ops/quantization/fp8_kernel.py`: in `_w8a8_block_fp8_matmul`,
-  convert `a` and `b` to the compute dtype after `tl.load` and before
-  `tl.dot`.
-- `sglang/kernels/ops/moe/fused_moe_triton_kernels.py`: in
-  `fused_moe_kernel`, disable TMA descriptors on SM80 and upcast the
-  pointer-loaded FP8 activations/weights to `compute_type` before `tl.dot`.
-
-This is expected to be **functionally correct but very slow** on A100; it
-would at best be a smoke-test / fallback path, not a production serving
-configuration. The Beverin (MI300A) and Clariden (GH200) recipes are the
-production-grade targets for this model.
+- **Slow**: A100 has no native FP8 tensor cores; the matmuls run in bf16/fp16.
+- **Memory-heavy**: weights are still stored as FP8, but each GEMM/MoE call
+  upcasts the activation and (for MoE) weight slices to bf16 at runtime.
+  This can push the 80 GB budget hard; keep `--context-length` and the
+  running-batch size small.
+- **Smoke-test / fallback only**: Beverin (MI300A) and Clariden (GH200)
+  remain the production-grade targets for this model.
 
 ## Knobs (env, all overridable)
 
@@ -163,6 +139,7 @@ production-grade targets for this model.
 | `DEPLOY_DIR` | `/capstor/scratch/cscs/xyao/glm-53-flash-bristen` | scratch dir for logs, caches, run state |
 | `IMAGE` | `$DEPLOY_DIR/cache/enroot/sglang-dev-cu13.sqsh` | enroot squashfs |
 | `OVL` | `/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay` | GLM-5.3 pure-Python overlay |
+| `SGLANG_PATCH_DIR` | `$DEPLOY_DIR/patches_full` | patched SGLang tree for SM80 |
 | `MODEL_PATH` | `/capstor/scratch/cscs/xyao/models/zai-org/GLM-5.3-Flash` | weights |
 | `SERVED_MODEL_NAME` | `zai-org/GLM-5.3-Flash` | sglang + OpenTela model id |
 | `TP_SIZE` / `PP_SIZE` / `EP_SIZE` | `4` / `1` / `4` | one node, TP=4, EP=4 |

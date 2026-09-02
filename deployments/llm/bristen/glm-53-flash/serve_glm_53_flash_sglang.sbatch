@@ -106,6 +106,16 @@ export LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 mkdir -p "$DEPLOY_DIR" "$DEPLOY_DIR/logs" "$DEPLOY_DIR/cache/triton" \
          "$DEPLOY_DIR/cache/hf" "$DEPLOY_DIR/cache/tmp" \
          "$DEPLOY_DIR/cache/enroot" "$DEPLOY_DIR/home" 2>/dev/null || true
+
+# SM80 FP8 compute patch: FP8 storage with bf16/fp16 compute inside Triton,
+# because A100 has no native FP8 tensor cores and Triton's fp8e4nv dtype is
+# Hopper-only.
+export SGLANG_PATCH_DIR="${SGLANG_PATCH_DIR:-$DEPLOY_DIR/patches_full}"
+if [ ! -f "$SGLANG_PATCH_DIR/sglang/kernels/ops/quantization/fp8_kernel.py" ]; then
+    echo "[$(date -Is)] applying SM80 FP8 compute patches ..."
+    bash "$SCRIPT_DIR/apply_sm80_patch.sh" || { echo "[$(date -Is)] FATAL: SM80 patch failed" >&2; exit 1; }
+fi
+
 export RUNDIR="$DEPLOY_DIR/run/${SLURM_JOB_ID:-$$}"
 mkdir -p "$RUNDIR"
 export HEAD="${SLURM_JOB_NODELIST:-$(hostname)}"
@@ -126,7 +136,7 @@ mkdir -p "$TRITON_CACHE_DIR" "$HF_HOME" "$TMPDIR" "$ENROOT_CACHE_PATH"
 # sidecar (extracted from the overlay's cp310 pkgs310 because tokenizers is
 # abi3).  Do NOT put pkgs310 itself on PYTHONPATH -- it contains cp310-only
 # compiled extensions (e.g. regex) that break on cp312.
-export PYTHONPATH="${OVL}/sgl-workspace/sglang/python:${OVL}/sgl-workspace/transformers/src:${OVL}/site-extra-cp312:${PYTHONPATH:-}"
+export PYTHONPATH="${SGLANG_PATCH_DIR}:${OVL}/sgl-workspace/sglang/python:${OVL}/sgl-workspace/transformers/src:${OVL}/site-extra-cp312:${PYTHONPATH:-}"
 
 # Propagate PYTHONPATH into the container unchanged.  Note: pyxis's
 # --container-env=PYTHONPATH="value" form mangles colon-separated paths, so we
