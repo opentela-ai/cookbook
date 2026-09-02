@@ -77,6 +77,11 @@ export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-7200}"
 export DIST_TIMEOUT="${DIST_TIMEOUT:-1800}"
 # Real FP8 weights (~306 GB from /capstor) can take 60-90 min to load on 4x A100.
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"
+# The first request on SM80 triggers a long TileLang compile; raise the
+# detokenizer heartbeat timeout so the health check does not kill the server.
+export SGLANG_HEALTH_CHECK_TIMEOUT="${SGLANG_HEALTH_CHECK_TIMEOUT:-300}"
+# TileLang's data-race checker prints huge warnings on SM80; disable it.
+export TL_DISABLE_DATA_RACE_CHECK="${TL_DISABLE_DATA_RACE_CHECK:-1}"
 export GEN_PROBE="${GEN_PROBE:-1}"
 export GEN_PROBE_TIMEOUT="${GEN_PROBE_TIMEOUT:-600}"
 export GEN_CORRECTNESS_PER_REQ_TIMEOUT="${GEN_CORRECTNESS_PER_REQ_TIMEOUT:-180}"

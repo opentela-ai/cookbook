@@ -298,6 +298,7 @@ def fused_moe_kernel_gptq_awq(
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        a = a.to(compute_type)
         accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
@@ -563,6 +564,10 @@ def fused_moe_kernel(
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
         # We accumulate along the K dimension.
+        if use_fp8_w8a8 or use_int8_w8a8:
+            a = a.to(compute_type)
+            b = b.to(compute_type)
+
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
@@ -818,20 +823,6 @@ def invoke_fused_moe_kernel(
         assert not (fuse_add_to_output or mask_output or fuse_sum_all_reduce)
         assert not lora_preserve_base
         assert compute_type == tl.bfloat16
-
-    # SM80 fallback: Triton cannot compile FP8 pointer arguments on SM80
-    # (fp8e4nv is Hopper-only). Convert A/B to the compute dtype before the
-    # kernel; the per-token/per-block scales are still applied inside.
-    if compute_type == tl.bfloat16:
-        torch_compute_dtype = torch.bfloat16
-    elif compute_type == tl.float16:
-        torch_compute_dtype = torch.float16
-    else:
-        torch_compute_dtype = torch.float32
-    if A.dtype != torch_compute_dtype:
-        A = A.to(torch_compute_dtype)
-    if B.dtype != torch_compute_dtype:
-        B = B.to(torch_compute_dtype)
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])

@@ -1006,6 +1006,9 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
+        a = a.to(C.dtype.element_ty)
+        b = b.to(C.dtype.element_ty)
+
         scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -1109,6 +1112,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
+        a = a.to(C.dtype.element_ty)
+        b = b.to(C.dtype.element_ty)
+
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -1133,6 +1139,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
 
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
+
+        a = a.to(C.dtype.element_ty)
+        b = b.to(C.dtype.element_ty)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -1159,6 +1168,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
+        a = a.to(C.dtype.element_ty)
+        b = b.to(C.dtype.element_ty)
+
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -1183,6 +1195,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
 
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
+
+        a = a.to(C.dtype.element_ty)
+        b = b.to(C.dtype.element_ty)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -1454,15 +1469,6 @@ def w8a8_block_fp8_matmul_triton(
     """
 
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
-
-    # SM80 fallback: Triton cannot compile FP8 pointer arguments on SM80
-    # (fp8e4nv is Hopper-only). Upcast storage to the compute dtype before
-    # the kernel; per-block scales are still applied inside the kernel.
-    compute_dtype = C.dtype
-    if A.dtype != compute_dtype:
-        A = A.to(compute_dtype)
-    if B.dtype != compute_dtype:
-        B = B.to(compute_dtype)
 
     block_n, block_k = block_size
 
