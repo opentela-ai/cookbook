@@ -2,10 +2,11 @@
 
 Serves `zai-org/GLM-5.3-Flash` — FP8 e4m3 dynamic, ~306 GiB, multimodal
 (vision + text), DSA + linear + KDA hybrid attention, 45 layers / 288 routed
-experts top-8, MTP — on **CSCS Clariden** (4× NVIDIA GH200 120 GB / node,
-aarch64, Slingshot 11 via CXI libfabric, **no InfiniBand**) with the upstream
-multi-arch `lmsysorg/sglang:glm-5.3-flash` image, and registers it on the
-OpenTela mesh — one self-contained sbatch, no sibling scripts.
+experts top-8, MTP — on **CSCS Clariden** (4× NVIDIA GH200 120 GB
+(≈96 GiB usable) / node, aarch64, Slingshot 11 via CXI libfabric,
+**no InfiniBand**) with the upstream multi-arch `lmsysorg/sglang:glm-5.3-flash`
+image, and registers it on the OpenTela mesh — one self-contained sbatch,
+no sibling scripts.
 
 ## Why this site (and not A100)
 
@@ -18,19 +19,27 @@ MoE/GEMM upcast patch only gets it to boot, and the unpatched DSA kpool
 the FP8-compile floor (and the A100-80GB HBM floor). See
 [the Bristen README](../../bristen/glm-53-flash/README.md) for that diagnosis.
 
-306 GiB FP8 / 8 GPUs (2 nodes, TP4 × PP2) = **~38 GiB weights/GPU of 96 GiB**
-→ ~58 GiB free for KV pool + activations + JIT. Comfortable (and scaling to
-TP4 × PP4 on 4 nodes only widens it). TP4 keeps tensor-parallel all-reduce
-**inside one node's 4-GH200 NVLink domain**; the only cross-Slingshot traffic
-is pipeline send/recv (point-to-point) — bandwidth-tolerant and
-CUDA-graph-safe. (Flat TP8 across 2 nodes boots but is ~1–5 tok/s and cannot
-be captured in a CUDA graph on Slingshot/CXI — same finding as kimi-k3.)
+**One node (TP4, the default) is the validated config** (jobs 3213420 /
+3219525, gen-probe `PASS 5/6`, served 12 h until the wall limit): 306 GiB
+FP8 / 4 GPUs = **~76.5 GiB weights/GPU of ≈96 GiB usable** → ~20 GiB free
+for KV pool + activations + JIT — tight but sufficient for single-stream /
+low concurrency. **2 nodes (TP4 × PP2) widens KV headroom to ~58 GiB/GPU
+but is not yet validated end-to-end**; add a node only if you need more
+concurrency. TP4 keeps tensor-parallel all-reduce **inside one node's 4-GH200
+NVLink domain**; the only cross-Slingshot traffic is pipeline send/recv
+(point-to-point) — bandwidth-tolerant and CUDA-graph-safe. (Flat TP8 across
+2 nodes boots but is ~1–5 tok/s and cannot be captured in a CUDA graph on
+Slingshot/CXI — same finding as kimi-k3.)
 
 ## Quick start
 
 ```bash
-# from the clariden login node — defaults: 2 nodes, TP4 x PP2 (one distributed engine)
+# from the clariden login node — default: 1 node, TP4 (validated; one engine, no PP)
 sbatch deployments/llm/clariden/glm-53-flash/serve_glm_5_3_flash_otela_clariden.sbatch
+
+# 2 nodes, TP4 x PP2 (more KV headroom; NOT yet validated end-to-end)
+sbatch --nodes=2 --export=ALL,NNODES=2,PP_SIZE=2 \
+       deployments/llm/clariden/glm-53-flash/serve_glm_5_3_flash_otela_clariden.sbatch
 
 # 4 nodes, TP4 x PP4
 sbatch --nodes=4 --export=ALL,NNODES=4,PP_SIZE=4 \
@@ -118,6 +127,12 @@ curl -s http://<alps-or-public-head>/v1/service/llm/v1/models \
   -H "X-Otela-Model: zai-org/GLM-5.3-Flash"
 ```
 
+Routed serving **registered successfully** in job 3219525 (`model=zai-org/GLM-5.3-Flash`, served ~11h40m), but the only 3 routed requests observed
+(~10h in) returned **HTTP 400 in ~22ms** — fast rejections, almost
+certainly malformed external probes (missing `X-Otela-Model` or wrong model
+name), not a serve failure. Direct localhost serving is gen-probe-validated;
+a clean routed `200` is the one open confirmation to close on the next run.
+
 ## Files
 
 | File | Purpose |
@@ -133,7 +148,7 @@ curl -s http://<alps-or-public-head>/v1/service/llm/v1/models \
 
 | Knob | Default | Notes |
 |------|---------|-------|
-| `NNODES` / `TP_SIZE` / `PP_SIZE` | 2 / 4 / `NNODES` | one distributed engine; PP = nodes, TP4 keeps allreduce in-node |
+| `NNODES` / `TP_SIZE` / `PP_SIZE` | 1 / 4 / `NNODES` | one distributed engine; PP = nodes, TP4 keeps allreduce in-node (2-node PP2 = more KV headroom, unvalidated) |
 | `MEM_FRAC` | 0.88 | 306 GiB/8 = ~38 GiB weights/GPU; ~58 GiB free |
 | `CTX_LEN` | 32768 | |
 | `GLM53_DSA_PREFILL` / `GLM53_DSA_DECODE` | `tilelang` / `tilelang` | native FP8; the `flashmla_sparse` path that blocks Bristen is avoided here |

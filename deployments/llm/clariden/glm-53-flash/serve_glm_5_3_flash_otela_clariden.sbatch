@@ -2,7 +2,7 @@
 #SBATCH --job-name=glm53-otela-clariden
 #SBATCH --account=infra02
 #SBATCH --partition=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 # Full node (288 logical CPUs): the sglang glm-5.3 image pins TP ranks to GPU
@@ -33,7 +33,9 @@
 # sbatch, no sibling scripts.
 #
 # Submit:
-#   sbatch serve_glm_5_3_flash_otela_clariden.sbatch        # defaults: 2 nodes, TP4 x PP2
+#   sbatch serve_glm_5_3_flash_otela_clariden.sbatch        # default: 1 node, TP4 (validated)
+#   sbatch --nodes=2 --export=ALL,NNODES=2,PP_SIZE=2 \
+#          serve_glm_5_3_flash_otela_clariden.sbatch        # 2 nodes, TP4 x PP2 (more KV; unvalidated)
 #   sbatch --nodes=4 --export=ALL,NNODES=4,PP_SIZE=4 \
 #          serve_glm_5_3_flash_otela_clariden.sbatch        # 4 nodes, TP4 x PP4
 #
