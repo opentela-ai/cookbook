@@ -4,7 +4,7 @@ Serve `zai-org/GLM-5.3-Flash` on **Bristen** (CSCS, 4× A100 80 GB / node,
 x86_64, NVIDIA) with the upstream CUDA SGLang image and the Beverin
 GLM-5.3 Python overlay, then register it on OpenTela.
 
-> **Current status — experimental SM80 fallback, A100 HBM floor:** the
+> **Current status — experimental SM80 fallback, A100 FP8 floor (not a serving target):** the
 > model ships in FP8 (`e4m3`, ~306 GB). The recipe applies a local patch
 > that upcasts the FP8 MoE expert weights/activations to the compute dtype
 > *before* the Triton kernel launch, because on SM80 Triton cannot even
@@ -12,16 +12,35 @@ GLM-5.3 Python overlay, then register it on OpenTela.
 > supported ... supported fp8 dtypes are ('fp8e4b15','fp8e5')`). This is
 > **not** native FP8 tensor-core execution; it is slow and memory-heavy.
 >
-> As of job 82473 the engine **boots on Bristen** (the FP8 compile error is
-> gone, the hybrid mamba state cache and KV pool allocate, and the server
-> reports "fired up and ready to roll"), but the **first MoE forward OOMs**:
-> the bf16 expert-weight upcast transient (~2.25 GiB/layer) cannot coexist
-> with the KV cache + mamba state in the ~2.4 GiB/GPU left after the 75.3 GB
-> FP8 weights. This is a genuine **A100-80GB HBM floor**, not a fixable bug
-> — see [A100 HBM floor](#a100-hbm-floor). Bristen stays a compile/boot
-> smoke only; run the generation smoke on **Beverin (MI300A, 128 GB,
-> SM90+)** or **Clariden (GH200, 96 GB, SM90+)**, where native FP8 GEMM makes
-> the upcast patch a no-op.
+> As of job 82473 (1-node TP4) the engine **boots on Bristen** (the MoE FP8
+> compile error is gone via the patch below, the hybrid mamba state cache
+> and KV pool allocate, and the server reports "fired up and ready to roll"),
+> but the **first MoE forward OOMs**: the bf16 expert-weight upcast transient
+> (~2.25 GiB/layer) cannot coexist with the KV cache + mamba state in the
+> ~2.4 GiB/GPU left after the 75.3 GB FP8 weights — a genuine
+> **A100-80GB HBM floor**, not a fixable bug (see [A100 HBM floor](#a100-hbm-floor)).
+>
+> The 2-node PP2 target (job **82822**) hits a **more fundamental** blocker
+> *before* any MoE forward: the model's DSA attention cache is also FP8
+> (hardcoded `torch.float8_e4m3fn` → `tl.float8e4nv` in `kpool_fp8_index.py`,
+> `dsa_indexer_kpool.py`, `dsa_indexer.py`, `deepseek_v2.py`) and is **not**
+> covered by the MoE/GEMM patch. The first forward fails at Triton JIT compile,
+> `_kpool_assemble_softmax_rotate_write_cache_kernel`:
+> `ValueError("type fp8e4nv not supported in this architecture")`. There is no
+> config-only escape (`_compress_write` runs on every forward); patching it is
+> a layout-sensitive re-engineering of the attention cache (allocate/store/
+> read across 4 files, plus the decode `kpool_decode_update_index_cache` path)
+> — a larger effort than the MoE patch, with more untested FP8 paths behind it.
+> (The "detokenizer health check failed / last_heartbeat" messages around boot
+> are a red herring: the TokenizerManager's health monitor simply stalls during
+> the slow weight load; no detokenizer crash occurs.)
+>
+> **Bristen is below the FP8-compile floor for GLM-5.3-Flash, not merely the
+> HBM floor, and stays a compile/boot smoke only.** Serve the model on
+> **Clariden (GH200, native FP8, OpenTela-connected — see
+> [`../clariden/glm-53-flash/`](../clariden/glm-53-flash/))** or Beverin
+> (MI300A, 128 GB, SM90+), where native FP8 makes the entire upcast patch
+> a no-op.
 
 ## Quick start
 
@@ -137,7 +156,7 @@ in `patched_sources/`.
 ### Caveats
 
 - **Slow**: A100 has no native FP8 tensor cores; the matmuls run in bf16/fp16.
-- **A100 HBM floor** (job 82473, measured): after the FP8 weight load each
+- **A100 HBM floor** (job 82473, 1-node TP4, measured): after the FP8 weight load each
   GPU has `avail mem=2.43 GB, mem usage=75.33 GB`. With `--mem-fraction-static
   0.98` the non-static activation slack is `~1.55 GB`, the hybrid mamba state
   cache allocates (`max_mamba_cache_size=8`, conv 0.01 GB + ssm 0.30 GB, which
@@ -179,7 +198,7 @@ in `patched_sources/`.
 | `CHUNKED_PREFILL_SIZE` | `2048` | matches `CTX_LEN`; keeps prefill activations within the tight slack |
 | `SMOKE` | `1` | `1` = hold job after health, `0` = OpenTela registration step |
 | `DISABLE_CUDA_GRAPH` / `SKIP_SERVER_WARMUP` | `1` | defaults match Beverin/Clariden stability knobs |
-| `DSA_PREFILL_BACKEND` | *(unset)* | set to `fa3` to experiment; overlay default routes SM80 to TileLang |
+| `DSA_PREFILL_BACKEND` | *(unset → `flashmla_sparse` on 2-node PP2)* | `flashmla_sparse` hits the unpatched fp8 kpool JIT on the first forward (job 82822); `tilelang` (overlay SM80 default) avoids it but then hits the [A100 HBM floor](#a100-hbm-floor) at MoE; `fa3` rejects the model's QK/V head dims on SM80. None yield a serving path. |
 | `MOE_RUNNER_BACKEND` | `triton` | only backend that compiles on SM80; with the upcast patch it runs to the first MoE forward (then hits the A100 HBM floor, not a compile error) |
 | `FP8_GEMM_RUNNER_BACKEND` | `triton` | same as above |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64 otela binary |
