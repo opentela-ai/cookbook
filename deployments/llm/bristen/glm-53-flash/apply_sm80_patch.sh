@@ -5,9 +5,10 @@
 set -euo pipefail
 
 : "${DEPLOY_DIR:=/capstor/scratch/cscs/xyao/glm-53-flash-bristen}"
-: "${OVL:=/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay/sgl-workspace/sglang/python}"
+# OVL is the top-level GLM-5.3 overlay directory (same as the sbatch).
+: "${OVL:=/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay}"
 PATCH_DIR="$DEPLOY_DIR/patches_full"
-SRC_DIR="$OVL/sglang"
+SRC_DIR="$OVL/sgl-workspace/sglang/python/sglang"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$PATCH_DIR"
