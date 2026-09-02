@@ -116,10 +116,9 @@ mkdir -p "$DEPLOY_DIR" "$DEPLOY_DIR/logs" "$DEPLOY_DIR/cache/triton" \
 # because A100 has no native FP8 tensor cores and Triton's fp8e4nv dtype is
 # Hopper-only.
 export SGLANG_PATCH_DIR="${SGLANG_PATCH_DIR:-$DEPLOY_DIR/patches_full}"
-if [ ! -f "$SGLANG_PATCH_DIR/sglang/kernels/ops/quantization/fp8_kernel.py" ]; then
-    echo "[$(date -Is)] applying SM80 FP8 compute patches ..."
-    bash "$SCRIPT_DIR/apply_sm80_patch.sh" || { echo "[$(date -Is)] FATAL: SM80 patch failed" >&2; exit 1; }
-fi
+# Always re-apply so edits to patched_sources/ are picked up on resubmits.
+echo "[$(date -Is)] applying SM80 FP8 compute patches ..."
+bash "$SCRIPT_DIR/apply_sm80_patch.sh" || { echo "[$(date -Is)] FATAL: SM80 patch failed" >&2; exit 1; }
 
 export RUNDIR="$DEPLOY_DIR/run/${SLURM_JOB_ID:-$$}"
 mkdir -p "$RUNDIR"
