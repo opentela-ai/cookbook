@@ -1,0 +1,22 @@
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py	2026-08-30 15:11:15.390072510 +0200
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py	2026-08-30 15:11:15.390072510 +0200
+@@ -828,6 +828,10 @@
+ 
+     @staticmethod
+     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
++        if is_hip():
++            # gfx942 (MI300A): tilelang is the HIP paged-mqa-logits path;
++            # deep_gemm is CUDA-only (NameError here). GLM53-HIP-KPOOL-PATCH
++            return True
+         if not is_cuda():
+             return False
+         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
+@@ -1697,7 +1701,7 @@
+         if weights is None:
+             weights = self._get_logits_head_gate(x, q_scale)
+ 
+-        if is_cuda():
++        if is_cuda() or is_hip():  # GLM53-HIP-KPOOL-PATCH: route HIP kpool to tilelang
+             if (
+                 forward_batch.forward_mode.is_decode_or_idle()
+                 or forward_batch.forward_mode.is_target_verify()

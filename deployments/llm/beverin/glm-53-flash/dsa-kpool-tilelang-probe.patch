@@ -1,0 +1,49 @@
+--- a/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py	2026-08-30 16:21:58.885506056 +0200
++++ b/sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py	2026-08-30 16:21:58.885506056 +0200
+@@ -9,7 +9,11 @@
+ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+ from sglang.srt.utils import is_gfx95_supported, is_hip
+ 
+-tilelang.set_log_level("WARNING")
++try:
++    import os as _os
++    tilelang.set_log_level(_os.environ.get("GLM53_TL_LOG", "WARNING"))
++except Exception:
++    tilelang.set_log_level("WARNING")
+ 
+ # Workaround a tilelang bug: BaseKernelAdapter._legalize_result_idx mutates the
+ # `out_idx` list in place when normalising negative indices to positive ones.
+@@ -1534,6 +1538,15 @@
+     assert page_table.shape[0] == batch_size
+     assert clean_logits == False
+ 
++    import os as _os, sys as _sys
++    if _os.environ.get("GLM53_TILELANG_PROBE", "0") == "1":
++        import torch as _t; _t.cuda.synchronize()
++        _sys.stderr.write(
++            f"[tl-probe] ENTER tilelang_fp8_paged_mqa_logits "
++            f"bs={batch_size} nh={num_heads} hd={head_dim} "
++            f"bs_kv={block_size} max_seq={max_seq_len}\n"
++        ); _sys.stderr.flush()
++
+     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+ 
+     NUM_CU = 256
+@@ -1545,9 +1558,17 @@
+         clear_accum=clean_logits,
+         split_kv=split_kv,
+     )
++    import os as _os, sys as _sys
++    if _os.environ.get("GLM53_TILELANG_PROBE", "0") == "1":
++        _sys.stderr.write("[tl-probe] JIT BUILD DONE (kernel obj ready)\n"); _sys.stderr.flush()
+     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
+     kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
++    if _os.environ.get("GLM53_TILELANG_PROBE", "0") == "1":
++        _sys.stderr.write("[tl-probe] BEFORE kernel launch\n"); _sys.stderr.flush()
+     kernel(q_fp8, kvcache_u8, weight, seq_lens, page_table, logits)
++    if _os.environ.get("GLM53_TILELANG_PROBE", "0") == "1":
++        import torch as _t; _t.cuda.synchronize()
++        _sys.stderr.write("[tl-probe] AFTER kernel launch + sync\n"); _sys.stderr.flush()
+     return logits
+ 
+ 
