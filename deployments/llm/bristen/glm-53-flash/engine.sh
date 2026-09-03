@@ -98,7 +98,33 @@ if [ -f "$MODEL_PATH/chat_template.jinja" ]; then
   SGLANG_ARGS+=( --chat-template "$MODEL_PATH/chat_template.jinja" )
 fi
 
-[ "${DISABLE_CUDA_GRAPH:-1}" = "1" ] && SGLANG_ARGS+=(--disable-cuda-graph)
+# CUDA-graph capture of decode is currently BLOCKED on the SM80 DSA kpool
+# decode bridge (kpool_fp8_index.py::_vk_dsa_kpool_decode_torch): it calls
+# torch.nonzero() twice (live-tail write + pool-complete compress), which is
+# fundamentally non-capturable -- its output count is data-dependent, so a
+# static graph cannot replay it (job 83168: cudaErrorStreamCaptureUnsupported
+# in _vk_dsa_kpool_decode_torch). The proper fix is a single fused Triton
+# kpool-decode kernel (one program per row, masked internally -> fixed grid,
+# no nonzero, no host sync) which is graph-safe by construction AND cuts the
+# ~12 host-launched torch ops that dominate eager mode. Until that lands,
+# decode runs eager (the validated 83166 path: 5.1 tok/s bs=1, 38.6 tok/s bs=8).
+# Set DISABLE_CUDA_GRAPH=0 to re-attempt capture AFTER the fused kernel.
+export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+if [ "${DISABLE_CUDA_GRAPH:-1}" = "1" ]; then
+  SGLANG_ARGS+=(--disable-cuda-graph)
+else
+  # CUDA graphs ON for decode. Capturing the decode step into a single graph
+  # eliminates the ~157 host-launched copy casts + per-step launch overhead
+  # that dominated job-83152/83166. Capture bs 1,2,4,8 (<=
+  # max_running_requests=8) to bound the static-buffer footprint to the free
+  # ~14 GiB/GPU. Prefill stays eager: the DSA TileLang sparse prefill route
+  # uses host-side .item() indexing (dsa_backend.py 1280-1644) that
+  # stream-capture rejects, and prefill (TTFT) is not the bottleneck.
+  SGLANG_ARGS+=(
+    --disable-prefill-cuda-graph
+    --cuda-graph-bs-decode 1 2 4 8
+  )
+fi
 [ "${SKIP_SERVER_WARMUP:-1}" = "1" ] && SGLANG_ARGS+=(--skip-server-warmup)
 [ -n "${LOAD_FORMAT:-}" ] && [ "$LOAD_FORMAT" != "auto" ] && \
   SGLANG_ARGS+=(--load-format "$LOAD_FORMAT")

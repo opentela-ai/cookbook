@@ -96,6 +96,14 @@ export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 
 # Request-length bound + KV pool sizing.
+# CUDA-graph capture of decode is currently BLOCKED on the SM80 DSA kpool
+# decode bridge (kpool_fp8_index.py::_vk_dsa_kpool_decode_torch calls
+# torch.nonzero() twice -> data-dependent dynamic shape -> non-capturable;
+# job 83168 cudaErrorStreamCaptureUnsupported). The proper fix is a single
+# fused Triton kpool-decode kernel (graph-safe by construction, and also
+# cuts the host-launch overhead that dominates eager mode). Until that
+# lands, decode runs eager = the validated 83166 path (5.1 tok/s bs=1,
+# 38.6 tok/s bs=8). Re-enable AFTER the kernel with DISABLE_CUDA_GRAPH=0.
 export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 export SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-1}"
 

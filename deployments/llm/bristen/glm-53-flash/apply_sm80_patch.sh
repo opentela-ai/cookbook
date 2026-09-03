@@ -53,4 +53,24 @@ cp "$SCRIPT_DIR/patched_sources/sglang/kernels/ops/attention/dsa/triton_kernel.p
 # CPython imports this automatically at interpreter startup.
 cp "$SCRIPT_DIR/patched_sources/sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
 
+# Hardened post-warmup GC freeze: the single POST to /freeze_gc raced
+# uvicorn's accept loop on job 83153 (connection refused), the unfrozen
+# Tokenizer Manager then wedged its event loop under gen2 GC storms and the
+# API never came up. Retry + direct in-process fallback.
+cp "$SCRIPT_DIR/patched_sources/sglang/srt/entrypoints/http_server.py" \
+   "$PATCH_DIR/sglang/srt/entrypoints/http_server.py"
+
+# CUDA-graph capture fix for GLM-5.3 + PP2: the decode capture dummy buffers
+# (DecodeInputBuffers.create + the legacy _allocate_decode_buffers helper)
+# skipped provisioning pp_proxy_tensors["residual"] when is_mhc
+# (hc_hidden_size set), but GLM-5.3 -- though hybrid-channel -- still passes
+# a SEPARATE residual between pipeline stages (its forward reads
+# pp_proxy_tensors["residual"] unconditionally on non-first ranks). The
+# KeyError killed graph capture (job 83167). Always provision residual,
+# matching the eager scheduler path (scheduler_pp_mixin.py).
+cp "$SCRIPT_DIR/patched_sources/sglang/srt/model_executor/runner_utils/buffers.py" \
+   "$PATCH_DIR/sglang/srt/model_executor/runner_utils/buffers.py"
+cp "$SCRIPT_DIR/patched_sources/sglang/srt/model_executor/runner/base_runner.py" \
+   "$PATCH_DIR/sglang/srt/model_executor/runner/base_runner.py"
+
 echo "[$(date -Is)] SM80 patch tree ready at $PATCH_DIR/sglang"
