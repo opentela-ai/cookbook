@@ -107,8 +107,12 @@ try:
         assert _y.dtype == _t.float8_e4m3fn and _y.shape == _x.shape, _fmt
         assert _s.dtype == _t.float32 and _s.shape == (*_x.shape[:-1], 1), _fmt
         _recon = _y.float() * _s  # dequant contract: y * s ~= x
-        _err = (_recon - _x.float()).abs().max().item()
-        assert _err < 0.02, f"act_quant recon err {_err} too large (fmt={_fmt})"
+        # e4m3 error is RELATIVE (~2^-4 half-ulp for normals), so bound it
+        # relatively (same formula as tests_local T9).
+        _rel = ((_recon - _x.float()).abs() / _x.float().abs().clamp(min=0.5))
+        assert _rel.max().item() < 0.08, (
+            f"act_quant recon rel err {_rel.max().item()} too large (fmt={_fmt})"
+        )
     if hasattr(_tk, "act_quant") and hasattr(_tk, "_act_quant_sm80"):
         ok.append("act_quant_sm80")
         print(
