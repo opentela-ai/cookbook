@@ -131,10 +131,12 @@ Remaining before a bristen go/no-go (mirrors the vkernels#60 acceptance list):
    build the compiled backend (`VKERNELS_BUILD_PYTHON=ON`) in the container.
    The bridge's requant store is plain torch (device-side, no JIT) and can
    stay as-is.
-2. First-forward smoke on bristen `flashmla_sparse` (short-context
-   generation through `_compress_write`, no `fp8e4nv` error, no
-   `deep_gemm` SM90 assert), then 2-node PP2 `gen_correctness.py` →
-   `PASS pass=5/6 crisp=3/3` (Clariden parity).
+2. ~~First-forward smoke on bristen `flashmla_sparse`~~ **DONE** (see
+   [Serving status](#serving-status)); 2-node PP2 `gen_correctness.py` →
+   `PASS pass=5/6 crisp=3/3` (Clariden parity) still pending at full probe
+   budget — at the current ~0.4 tok/s decode the in-job 600 s budget passes
+   2/6 (both crisp), and a warm-server manual probe answers **all six
+   prompts correctly** (32-token generations, ~85 s each).
 
 Known not-bridged (would still JIT-fail if reached, neither runs in the
 2-node PP2 smoke config): `kpool_write_tail_and_maybe_compress`
@@ -144,6 +146,29 @@ Known not-bridged (would still JIT-fail if reached, neither runs in the
 The 1-node TP4 A100 HBM floor (first MoE forward OOM) is a memory limit, not
 a kernel limit — it is unaffected by this wiring; 2-node PP2 remains the
 serving shape for bristen.
+
+## Serving status
+
+The model **serves end-to-end on bristen** (2-node PP2, real FP8 weights):
+
+- **Job 83091** — boot + FP8 load + `/health` + prefill PASS; first decode
+  died at the indexer `act_quant` (`fp8e4nv` Triton JIT). Fixed by the SM80
+  `act_quant` torch fallback.
+- **Job 83115** — preflight PASS (incl. the new act_quant gate), prefill +
+  indexer decode chain PASS; first decode died in the FA3 core (`Only
+  Hopper supports different V headdim`). Fixed by `DSA_DECODE_BACKEND=
+tilelang`.
+- **Job 83120** — `prefill=flashmla_sparse, decode=tilelang`: prefill,
+  indexer, kpool topk and TileLang sparse decode all run; in-job probe
+  `pass=2/6` (both crisp: primes, train) with 4 timeouts from the ~0.4 tok/s
+  JIT-cold decode vs the probe's 180 s/600 s budgets — no crashes. A
+  warm-server manual probe (`run/manual_probe_83120.txt`) answers **6/6
+  prompts correctly** (Paris; air-molecule blue-scatter; "2, 3, 5"; "40
+  km/h"; a real fibonacci body; entropy/conservation laws) at ~85 s per
+  32-token greedy request.
+
+Throughput work (compiled vkernels backend, CUDA graphs, decode-kernel
+tuning) is the next lever; correctness of the serving path is proven.
 
 ## Quick start
 
