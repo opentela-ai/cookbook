@@ -46,7 +46,10 @@ f5bed255), NOT from the vkernels code, so agreement is meaningful.
       (amax clamp 1e-4, scale = absmax/448 or pow2-ceiling round_scale, RTNE
       e4m3 store), exact shape/dtype contract, zero-guard and clamp behavior,
       2-D/3-D/multi-block shapes -- the decode-path wall of jobs 82822/83091.
-"""
+  T10 torch-on-GPU bridge (the serving path since the job-83120 profile:
+      the numpy fallback spent ~0.95 s/step in host fills + D2H/H2D) == the
+      numpy fallback bridge: assemble caches byte-equal (incl. write_mask),
+      decode tails bit-equal, written cache within one fp8 ulp."""
 
 import importlib.util
 import math
@@ -475,11 +478,20 @@ def t6_assemble_bridge(mod, c):
     written = torch.zeros(c["num_pages"], c["ssp"], dtype=torch.bool)
     for l in c["loc"].tolist():
         written[l // c["ssp"], l % c["ssp"]] = True
-    # exact store-path check: quantize the vkernels fp32 output rows (public
-    # API, same scratch the bridge reads) and expect IDENTICAL bytes -- the
-    # bridge must be a bit-exact requant+store of its own compute input.
+    # exact store-path check: the bridge must be a bit-exact requant+store
+    # of its own compute output. Capture the fp32 rows the store receives
+    # (path-agnostic: torch-on-GPU by default, numpy via
+    # VKERNELS_DSA_KPOOL_NUMPY=1) and (i) expect IDENTICAL bytes vs
+    # quantize(captured), (ii) expect the captured math to match the vkernels
+    # fallback output within the T1 tight tolerance.
     n = lambda t, dt=np.float32: np.ascontiguousarray(t.to(torch.float32).numpy(), dtype=dt)
     i32 = lambda t: np.ascontiguousarray(t.numpy(), dtype=np.int32)
+    orig_store = mod._vk_bridge_requant_store
+    captured = {}
+    def _capture(buf_, num_pages_, ssp_, pages_, sips_, x_, rs_):
+        captured["x"] = torch.as_tensor(x_, dtype=torch.float32).clone()
+        return orig_store(buf_, num_pages_, ssp_, pages_, sips_, x_, rs_)
+    mod._vk_bridge_requant_store = _capture
     for round_scale in (False, True):
         scratch = np.zeros(c["num_pages"] * c["ssp"] * HEAD, dtype=np.float32)
         mod._VK_DSA_KPOOL_ASSEMBLE(
@@ -490,22 +502,25 @@ def t6_assemble_bridge(mod, c):
         loc_l = c["loc"].to(torch.int64).numpy()
         pages_l, sips_l = loc_l // c["ssp"], loc_l % c["ssp"]
         x_vk = scratch.reshape(c["num_pages"], c["ssp"], HEAD)[pages_l, sips_l]
-        q_exp, s_exp = _quant_bytes(torch.from_numpy(x_vk), round_scale)
         buf = torch.zeros(c["num_pages"], c["ssp"] * (HEAD + 4), dtype=torch.uint8)
         mod.kpool_assemble_softmax_rotate_write_cache(
             pool, buf, c["chunk_k"], c["chunk_score"], c["tail_k"], c["tail_score"],
             c["rpi"], c["nft"], c["css"], c["tlb"], c["ape"], c["loc"],
             write_mask=None, round_scale=round_scale)
         deq, scales = _dequant_legacy_buf(buf, c["ssp"])
-        # (a) bit-exact store: K bytes and scale bytes == the emulation
+        # (a) bit-exact store: K bytes and scale bytes == quantize(captured x)
+        q_exp, s_exp = _quant_bytes(captured["x"], round_scale)
         k_got = (buf[:, : c["ssp"] * HEAD].contiguous().view(torch.float8_e4m3fn)
                  .view(c["num_pages"], c["ssp"], HEAD)
                  [torch.from_numpy(pages_l), torch.from_numpy(sips_l)])
         assert torch.equal(k_got.view(torch.uint8), q_exp.view(torch.uint8)), \
-            "bridge K bytes != emulation of the vkernels fp32 rows"
+            "bridge K bytes != requant of its own compute output"
         s_exp_b = s_exp.numpy().view(np.uint8).reshape(-1, 4)
         s_got = scales[pages_l, sips_l].numpy().view(np.uint8).reshape(-1, 4)
         assert (s_got == s_exp_b).all(), "bridge scale bytes != emulation"
+        # (a2) math parity with the vkernels fallback output (T1 tolerance)
+        torch.testing.assert_close(captured["x"], torch.from_numpy(x_vk),
+                                   rtol=1e-3, atol=1e-4)
         # (b) semantic anchor: dequantized bridge ~ reference fp8. NOT
         # bit-equal: independent fp8 rounding chains over slightly different
         # inputs (vkernels fp32 vs the ref's double-bf16, T1 tol). One e4m3
@@ -525,8 +540,10 @@ def t6_assemble_bridge(mod, c):
         else:
             torch.testing.assert_close(
                 scales[written], absmax / 448.0, rtol=0.07, atol=1e-9)
-    print("  T6 assemble bridge (bit-exact fp8 store of vk output; dequant "
-          "within fp8 ulp of ref; both round_scale): OK")
+    mod._vk_bridge_requant_store = orig_store
+    print("  T6 assemble bridge (bit-exact fp8 store of own compute; math "
+          "parity with vkernels output; dequant within fp8 ulp of ref; both "
+          "round_scale): OK")
 
 
 def t7_decode_bridge(mod, cd):
@@ -551,6 +568,38 @@ def t7_decode_bridge(mod, cd):
     torch.testing.assert_close(ts2, ts, rtol=1e-6, atol=1e-6, msg="tail scores diverged")
     deq, scales = _dequant_legacy_buf(buf_u8, cd["ssp"])
     native = buf_bf16.float().view(cd["num_pages"], cd["ssp"], HEAD)
+    # store-path property on the serving (torch) path: captured fp32 rows
+    # requantize bit-exactly into the stored bytes, and match the native
+    # bf16 cache within bf16 rounding
+    orig_store = mod._vk_bridge_requant_store
+    captured = {}
+    def _capture(buf_, num_pages_, ssp_, pages_, sips_, x_, rs_):
+        captured["x"] = torch.as_tensor(x_, dtype=torch.float32).clone().reshape(-1, HEAD)
+        captured["pg"] = torch.as_tensor(pages_, dtype=torch.int64).clone().reshape(-1)
+        captured["sp"] = torch.as_tensor(sips_, dtype=torch.int64).clone().reshape(-1)
+        return orig_store(buf_, num_pages_, ssp_, pages_, sips_, x_, rs_)
+    mod._vk_bridge_requant_store = _capture
+    buf_u8b = torch.zeros(cd["num_pages"], cd["ssp"] * (HEAD + 4), dtype=torch.uint8)
+    tk3 = cd["tail_k"].clone()
+    ts3 = cd["tail_score"].clone()
+    mod.kpool_decode_update_and_maybe_write_cache(
+        pool, buf_u8b, tk3, ts3, cd["key"], cd["slot_score"], cd["ape"],
+        cd["block_tables"], cd["rpi"], cd["pos"], cd["seq_lens"], cd["ocl"],
+        round_scale=False)
+    mod._vk_bridge_requant_store = orig_store
+    assert torch.equal(buf_u8b, buf_u8), "captured-run cache != first run"
+    q_exp, s_exp = _quant_bytes(captured["x"], False)
+    flat_idx = captured["pg"] * cd["ssp"] + captured["sp"]
+    k_got = (buf_u8b[:, : cd["ssp"] * HEAD].contiguous()
+             .view(torch.float8_e4m3fn).view(-1, HEAD)[flat_idx])
+    assert torch.equal(k_got.view(torch.uint8), q_exp.view(torch.uint8)), \
+        "decode bridge K bytes != requant of its own compute output"
+    s_got = scales.view(-1)[flat_idx]
+    assert torch.equal(s_got.view(torch.uint8).reshape(-1, 4),
+                       s_exp.view(torch.uint8).reshape(-1, 4)), \
+        "decode bridge scale bytes != requant of its own compute output"
+    torch.testing.assert_close(captured["x"], native.view(-1, HEAD)[flat_idx],
+                               rtol=2e-2, atol=2e-3)
     wr = buf_bf16.abs().view(cd["num_pages"], cd["ssp"], -1).sum(-1) > 0
     # the bridge quantizes the fp32 vkernels output; the native path stores it
     # as bf16 first -- so expect fp8-ulp agreement with the bf16 values, not
@@ -699,6 +748,84 @@ def t9_act_quant_sm80():
           "bytes+scale, 3 shapes x 2 scale_fmts, guards): OK")
 
 
+def t10_torch_numpy_parity(mod):
+    """T10 torch-on-GPU bridge == numpy fallback bridge (the pre-T10 serving
+    path), end to end: identical tails; written cache slots dequant to the
+    same values within one fp8 ulp (both sides requant fp32 math that agrees
+    to ~1e-6 rel, but RTNE can flip on e4m3 rounding boundaries); scales
+    agree tightly. The numpy path is selected per-call via
+    VKERNELS_DSA_KPOOL_NUMPY=1."""
+    # -- assemble: unmasked + write_mask cases --
+    ca = make_assemble_case(21)
+    wm = torch.tensor([True, False, True, True, True])
+    pool = Pool(slots_per_page=ca["ssp"])
+    runs = {}
+    for tag, env in (("numpy", "1"), ("torch", None)):
+        if env is not None:
+            os.environ["VKERNELS_DSA_KPOOL_NUMPY"] = env
+        try:
+            for name, mask in (("asm", None), ("asm_wm", wm)):
+                buf = torch.zeros(ca["num_pages"], ca["ssp"] * (HEAD + 4),
+                                  dtype=torch.uint8)
+                mod.kpool_assemble_softmax_rotate_write_cache(
+                    pool, buf, ca["chunk_k"], ca["chunk_score"], ca["tail_k"],
+                    ca["tail_score"], ca["rpi"], ca["nft"], ca["css"],
+                    ca["tlb"], ca["ape"], ca["loc"], write_mask=mask,
+                    round_scale=False)
+                runs[(name, tag)] = buf
+        finally:
+            os.environ.pop("VKERNELS_DSA_KPOOL_NUMPY", None)
+    for name in ("asm", "asm_wm"):
+        b_np, b_t = runs[(name, "numpy")], runs[(name, "torch")]
+        if torch.equal(b_np, b_t):
+            continue  # byte-equal (no RTNE boundary flip on this case)
+        deq_np, sc_np = _dequant_legacy_buf(b_np, ca["ssp"])
+        deq_t, sc_t = _dequant_legacy_buf(b_t, ca["ssp"])
+        touched = b_np.view(ca["num_pages"], ca["ssp"], -1).any(-1) | \
+            b_t.view(ca["num_pages"], ca["ssp"], -1).any(-1)
+        err = (deq_np[touched] - deq_t[touched]).abs()
+        bound = 0.14 * deq_np[touched].abs() + 4e-3
+        assert (err <= bound).all(), \
+            f"assemble bridge ({name}): torch-vs-numpy dequant beyond one " \
+            f"fp8 ulp (max excess {(err - bound).max()})"
+        torch.testing.assert_close(sc_np[touched], sc_t[touched],
+                                   rtol=1e-2, atol=1e-9)
+    # -- decode: tails must be bit-equal, cache within one fp8 ulp --
+    cdd = make_decode_case(22)
+    poold = Pool(slots_per_page=cdd["ssp"])
+    dec = {}
+    for tag, env in (("numpy", "1"), ("torch", None)):
+        if env is not None:
+            os.environ["VKERNELS_DSA_KPOOL_NUMPY"] = env
+        try:
+            buf = torch.zeros(cdd["num_pages"], cdd["ssp"] * (HEAD + 4),
+                              dtype=torch.uint8)
+            tk = cdd["tail_k"].clone()
+            ts = cdd["tail_score"].clone()
+            mod.kpool_decode_update_and_maybe_write_cache(
+                poold, buf, tk, ts, cdd["key"], cdd["slot_score"], cdd["ape"],
+                cdd["block_tables"], cdd["rpi"], cdd["pos"], cdd["seq_lens"],
+                cdd["ocl"], round_scale=False)
+            dec[tag] = (buf, tk, ts)
+        finally:
+            os.environ.pop("VKERNELS_DSA_KPOOL_NUMPY", None)
+    assert torch.equal(dec["torch"][1], dec["numpy"][1]), "decode tails diverge"
+    assert torch.equal(dec["torch"][2], dec["numpy"][2]), "decode tail scores diverge"
+    buf_np, buf_t = dec["numpy"][0], dec["torch"][0]
+    touched = buf_np.view(cdd["num_pages"], cdd["ssp"], -1).any(-1) | \
+        buf_t.view(cdd["num_pages"], cdd["ssp"], -1).any(-1)
+    deq_np, sc_np = _dequant_legacy_buf(buf_np, cdd["ssp"])
+    deq_t, sc_t = _dequant_legacy_buf(buf_t, cdd["ssp"])
+    err = (deq_np[touched] - deq_t[touched]).abs()
+    bound = 0.14 * deq_np[touched].abs() + 4e-3
+    assert (err <= bound).all(), \
+        f"decode bridge torch-vs-numpy dequant beyond one fp8 ulp " \
+        f"(max excess {(err - bound).max()})"
+    torch.testing.assert_close(sc_np[touched], sc_t[touched], rtol=1e-2, atol=1e-9)
+    print("  T10 torch-vs-numpy bridge parity (assemble + decode: same tails "
+          "where applicable, cache within one fp8 ulp): OK")
+
+
 def main():
     os.environ["VKERNELS_DSA_KPOOL_FORCE"] = "1"
     print(f"cookbook root: {COOKBOOK}")
@@ -723,9 +850,10 @@ def main():
     t7_decode_bridge(patched, cd)
     t8_shim_logits()
     t9_act_quant_sm80()
+    t10_torch_numpy_parity(patched)
     print("\nALL TESTS PASSED -- vkernels#60 dsa_kpool wiring (native + legacy-"
-          "layout bridge), the SM80 deep_gemm shim and the SM80 act_quant "
-          "fallback are semantically sound.")
+          "layout bridge + torch-on-GPU serving path), the SM80 deep_gemm shim "
+          "and the SM80 act_quant fallback are semantically sound.")
 
 
 if __name__ == "__main__":

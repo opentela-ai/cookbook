@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Optional, Tuple
 
@@ -25,10 +26,14 @@ KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # roundings (mean, Hadamard) as the Triton kernels (validated in
 # tests_local/test_dsa_kpool_wiring.py, T1-T7).
 #
-# The vkernels calls go through the pure-Python fallback (numpy, host round
-# trip) -- semantically validated but NOT serving-grade; production wants the
-# compiled backend (VKERNELS_BUILD_PYTHON=ON) or the C-ABI adapters
-# (vk_dsa_kpool_*), cf. meta/diag/glm53/patch_dsa_vk.py (PR #52).
+# The vkernels compute runs as a torch-on-GPU port of the fallback math
+# (``_vk_dsa_kpool_{assemble,decode}_torch``: no host round trip, no giant
+# fp32 scratch, no per-call syncs -- the numpy fallback cost ~0.95 s/step
+# in ``numpy .fill`` alone, profiled in bristen job 83120). The numpy
+# fallback remains available as a reference via ``VKERNELS_DSA_KPOOL_NUMPY=1``
+# and is parity-validated in tests_local/test_dsa_kpool_wiring.py (T10).
+# The compiled backend (VKERNELS_BUILD_PYTHON=ON) or the C-ABI adapters
+# (vk_dsa_kpool_*) remain the long-term option (PR #52).
 #
 # NOT bridged (would JIT-fail if reached): ``kpool_write_tail_and_maybe_compress``
 # (target-verify / spec-decode only) and ``kpool_softmax_rotate_write_cache``'s
@@ -77,6 +82,190 @@ def _vk_np(t: torch.Tensor, dtype):
     return np.ascontiguousarray(t.detach().to("cpu", dtype).numpy())
 
 
+# ---------------------------------------------------------------------------
+# Torch-on-GPU port of the vkernels dsa_kpool math (serving-grade bridge;
+# the numpy fallback below is the parity reference).
+# ---------------------------------------------------------------------------
+
+_VK_H128_CACHE: dict = {}
+
+
+def _vk_torch_hadamard128(device: torch.device) -> torch.Tensor:
+    """The vkernels involution-normalized Hadamard matrix as a torch buffer
+    (``H[i, j] = +-1/sqrt(128)``, ``+1`` iff ``popcount(i & j)`` is even --
+    mirrors ``vkernels._fallback._build_hadamard128``)."""
+    key = (device.type, device.index)
+    h = _VK_H128_CACHE.get(key)
+    if h is None:
+        idx = torch.arange(INDEX_HEAD_DIM, dtype=torch.int64)
+        c = idx[:, None] & idx[None, :]
+        pc = torch.zeros_like(c)
+        for bit in range(7):  # c < 128 -> 7 bits
+            pc += (c >> bit) & 1
+        sign = torch.where(pc % 2 == 0, 1.0, -1.0)
+        h = (sign / math.sqrt(INDEX_HEAD_DIM)).to(device)
+        _VK_H128_CACHE[key] = h
+    return h
+
+
+def _vk_torch_pool_rotate(
+    src_k: torch.Tensor, src_s: torch.Tensor, ape: torch.Tensor
+) -> torch.Tensor:
+    """Softmax-weighted pool mean + 128-pt Hadamard rotation.
+
+    ``src_k/src_s``: fp32 ``[N, P, D]``; ``ape``: ``[P, D]`` -> fp32 ``[N, D]``.
+    One vectorized global-max softmax; equal to the fallback's sequential
+    online softmax up to fp32 rounding (H is symmetric, so ``mean @ H`` is
+    ``H @ mean``).
+    """
+    scores = src_s + ape.to(torch.float32).unsqueeze(0)
+    mx = scores.amax(dim=1, keepdim=True)
+    p = torch.exp(scores - mx)
+    denom = p.sum(dim=1)
+    acc = (p * src_k).sum(dim=1)
+    mean = acc / denom
+    return torch.matmul(mean, _vk_torch_hadamard128(src_k.device))
+
+
+def _vk_dsa_kpool_assemble_torch(
+    pool,
+    buf: torch.Tensor,
+    chunk_k: torch.Tensor,
+    chunk_score: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_score: torch.Tensor,
+    req_pool_idx: torch.Tensor,
+    n_from_tail: torch.Tensor,
+    chunk_src_start: torch.Tensor,
+    tail_logical_base: torch.Tensor,
+    ape: torch.Tensor,
+    loc: torch.Tensor,
+    write_mask: torch.Tensor | None,
+    round_scale: bool,
+) -> None:
+    """SM80 assemble, fully on-device. Mirrors the vkernels assemble fallback:
+    for every unmasked pool row, gated softmax-weighted mean over
+    ``pool_size`` slots (the first ``n_from_tail`` from the live tail at
+    ``tail_logical_base``, the rest from ``chunk_*`` at ``chunk_src_start``),
+    Hadamard rotation, requant-store at ``loc``. Untouched slots keep their
+    content (no zero-fill: only addressed slots are written)."""
+    dev = chunk_k.device
+    n_pools = req_pool_idx.shape[0]
+    if n_pools == 0:
+        return
+    ssp = pool.slots_per_page
+    pool_size = pool.index_kpool
+    n_reqs, tail_size, _ = tail_k.shape
+    n_chunks = chunk_k.shape[0]
+    assert buf.dtype == torch.uint8
+    assert buf.shape[1] == ssp * (INDEX_HEAD_DIM + 4)
+    if write_mask is None:
+        sel = torch.arange(n_pools, device=dev)
+    else:
+        sel = write_mask.to(torch.bool).nonzero(as_tuple=True)[0]
+    if sel.numel() == 0:
+        return
+    req = req_pool_idx.detach().to(torch.int64)[sel].clamp(0, max(n_reqs - 1, 0))
+    nft = n_from_tail.detach().to(torch.int64)[sel]
+    css = chunk_src_start.detach().to(torch.int64)[sel]
+    tlb = tail_logical_base.detach().to(torch.int64)[sel]
+    offs = torch.arange(pool_size, device=dev)
+    from_tail = offs.unsqueeze(0) < nft.unsqueeze(1)
+    phys_tail = (tlb.unsqueeze(1) + offs.unsqueeze(0)) % tail_size
+    # chunk offsets for from-tail slots may be negative -> clamp (masked out)
+    chunk_off = (
+        css.unsqueeze(1) + (offs.unsqueeze(0) - nft.unsqueeze(1))
+    ).clamp(0, max(n_chunks - 1, 0))
+    src_k = torch.where(
+        from_tail.unsqueeze(2),
+        tail_k.detach().to(torch.float32)[req.unsqueeze(1), phys_tail],
+        chunk_k.detach().to(torch.float32)[chunk_off],
+    )
+    src_s = torch.where(
+        from_tail.unsqueeze(2),
+        tail_score.detach().to(torch.float32)[req.unsqueeze(1), phys_tail],
+        chunk_score.detach().to(torch.float32)[chunk_off],
+    )
+    x = _vk_torch_pool_rotate(src_k, src_s, ape)
+    loc_l = loc.detach().to(torch.int64)[sel]
+    _vk_bridge_requant_store(
+        buf, buf.shape[0], ssp, loc_l // ssp, loc_l % ssp, x, round_scale
+    )
+
+
+def _vk_dsa_kpool_decode_torch(
+    pool,
+    buf: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_score: torch.Tensor,
+    key: torch.Tensor,
+    slot_score: torch.Tensor,
+    ape: torch.Tensor,
+    block_tables: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    round_scale: bool,
+) -> None:
+    """SM80 decode update, fully on-device (no host round trip, no scratch).
+
+    Mirrors the vkernels ``dsa_kpool_decode_update`` fallback: valid rows
+    write the live tail in place at ``pos % tail_size``; pool-complete valid
+    rows additionally compress (softmax-weighted pool mean with the current
+    token substituted at ``pos % pool_size``), apply the Hadamard rotation
+    and requant-store into the fp8+scale page. Only addressed rows change
+    the cache; the tail write precedes the pool read exactly like the
+    fallback (the substituted current slot makes the order value-neutral)."""
+    dev = key.device
+    batch = key.shape[0]
+    if batch == 0:
+        return
+    ssp = pool.slots_per_page
+    pool_size = pool.index_kpool
+    n_reqs, tail_size, _ = tail_k.shape
+    btc = block_tables.shape[1]
+    assert buf.dtype == torch.uint8
+    assert buf.shape[1] == ssp * (INDEX_HEAD_DIM + 4)
+    rpi = req_pool_indices.detach().to(torch.int64)
+    pos = positions.detach().to(torch.int64)
+    ocl = out_cache_loc.detach().to(torch.int64)
+    req_valid = (rpi >= 0) & (rpi < n_reqs)
+    pos_valid = (
+        req_valid & (ocl != 0) & (pos >= 0) & (pos < seq_lens.detach().to(torch.int64))
+    )
+    safe_pos = pos.clamp(min=0)
+    slot = safe_pos % pool_size
+    req_safe = rpi.clamp(0, max(n_reqs - 1, 0))
+    cur_k = key.detach().to(torch.float32)
+    cur_s = slot_score.detach().to(torch.float32)
+    # (1) live-tail write for valid rows (one row per running request).
+    wsel = pos_valid.nonzero(as_tuple=True)[0]
+    if wsel.numel() > 0:
+        phys = safe_pos[wsel] % tail_size
+        tail_k[req_safe[wsel], phys] = cur_k[wsel].to(tail_k.dtype)
+        tail_score[req_safe[wsel], phys] = cur_s[wsel].to(tail_score.dtype)
+    # (2) pool-complete rows: compress + rotate + requant store.
+    psel = (pos_valid & (slot == pool_size - 1)).nonzero(as_tuple=True)[0]
+    if psel.numel() == 0:
+        return
+    pls = safe_pos[psel] - slot[psel]
+    offs = torch.arange(pool_size, device=dev)
+    physp = (pls.unsqueeze(1) + offs.unsqueeze(0)) % tail_size
+    src_k = tail_k.detach().to(torch.float32)[req_safe[psel].unsqueeze(1), physp]
+    src_s = tail_score.detach().to(torch.float32)[req_safe[psel].unsqueeze(1), physp]
+    ar = torch.arange(psel.numel(), device=dev)
+    src_k[ar, slot[psel]] = cur_k[psel]
+    src_s[ar, slot[psel]] = cur_s[psel]
+    x = _vk_torch_pool_rotate(src_k, src_s, ape)
+    pid = safe_pos[psel] // pool_size
+    tpr = ((pid // ssp) * pool_size).clamp(0, btc - 1)
+    packed_page = block_tables.detach().to(torch.int64)[psel, tpr]
+    _vk_bridge_requant_store(
+        buf, buf.shape[0], ssp, packed_page, pid % ssp, x, round_scale
+    )
+
+
 
 
 def _vk_bridge_requant_store(
@@ -88,33 +277,35 @@ def _vk_bridge_requant_store(
     x_host,
     round_scale: bool,
 ) -> None:
-    """Requantize vkernels bf16 output into the legacy fp8+scale cache slots.
+    """Requantize the Hadamard-rotated means into the legacy fp8+scale slots.
 
-    ``x_host``: numpy fp32 [n, 128] -- the bf16-rounded Hadamard-rotated means
-    for rows (pages[i], sips[i]); exactly what ``_hadamard_quantize_fp8``
-    consumes in the Triton kernels. Store offsets replicate the Triton kernels:
-    K fp8e4m3 at ``page*BUF_NUMEL + sip*128``; scale fp32 at
-    ``page*BUF_NUMEL/4 + ssp*32 + sip`` (i.e. byte ``ssp*128 + sip*4``).
+    ``x_host``: fp32 ``[n, 128]`` (numpy or torch, host or device) -- the
+    Hadamard-rotated means for rows (pages[i], sips[i]); exactly what
+    ``_hadamard_quantize_fp8`` consumes in the Triton kernels. Store offsets
+    replicate the Triton kernels: K fp8e4m3 at ``page*BUF_NUMEL + sip*128``;
+    scale fp32 at ``page*BUF_NUMEL/4 + ssp*32 + sip`` (byte ``ssp*128 + sip*4``).
     """
     import numpy as np
 
     n = len(pages)
     if n == 0:
         return
-    x = torch.from_numpy(np.ascontiguousarray(x_host, dtype=np.float32))
+    x = torch.as_tensor(x_host, dtype=torch.float32).reshape(n, INDEX_HEAD_DIM)
+    dev = buf.device
+    if x.device != dev:
+        x = x.to(dev)
     absmax = x.abs().amax(dim=1).clamp_min_(1e-4)
     if round_scale:
         scale = torch.exp2(torch.ceil(torch.log2(absmax * (1.0 / 448.0))))
     else:
         scale = absmax / 448.0
     q = (x / scale.unsqueeze(1)).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
-    q8 = q.view(torch.uint8).numpy()
-    s4 = np.ascontiguousarray(scale.numpy()).view(np.uint8).reshape(n, 4)
-    dev = buf.device
-    pg = torch.as_tensor(pages, dtype=torch.int64, device=dev)
-    sp = torch.as_tensor(sips, dtype=torch.int64, device=dev)
-    kb = torch.from_numpy(q8).to(dev)
-    sb = torch.from_numpy(s4).to(dev)
+    q8 = q.view(torch.uint8)
+    s4 = scale.view(torch.uint8).reshape(n, 4)
+    pg = torch.as_tensor(pages, dtype=torch.int64, device=dev).reshape(n)
+    sp = torch.as_tensor(sips, dtype=torch.int64, device=dev).reshape(n)
+    kb = q8 if q8.device == dev else q8.to(dev)
+    sb = s4 if s4.device == dev else s4.to(dev)
     # flat byte offsets, exactly the Triton kernels' store math
     #   K:     page * BUF_NUMEL_PER_PAGE + sip*HEAD + [0, HEAD)
     #   scale: page * BUF_NUMEL_PER_PAGE/4 + ssp*32 + sip        (fp32 words)
@@ -144,11 +335,21 @@ def _vk_dsa_kpool_assemble_bridge(
     write_mask: torch.Tensor | None,
     round_scale: bool,
 ) -> None:
-    """SM80 assemble: vkernels compute -> legacy fp8+scale store.
+    """SM80 assemble: torch-on-GPU compute -> legacy fp8+scale store.
 
-    Same row selection as ``_vk_dsa_kpool_assemble_native``; only the store
-    differs (fp8+scale requant instead of a bf16 cache).
+    Torch port of the vkernels ``dsa_kpool_assemble`` math (same gated
+    online-softmax mean + Hadamard; parity-validated against the numpy
+    fallback in tests_local/test_dsa_kpool_wiring.py T10). Set
+    ``VKERNELS_DSA_KPOOL_NUMPY=1`` to run the numpy reference path instead
+    (host round trip, ~1 s per call on big caches -- diagnostics only).
     """
+    if os.environ.get("VKERNELS_DSA_KPOOL_NUMPY") != "1":
+        _vk_dsa_kpool_assemble_torch(
+            pool, buf, chunk_k, chunk_score, tail_k, tail_score,
+            req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base,
+            ape, loc, write_mask, round_scale,
+        )
+        return
     import numpy as np
 
     n_pools = req_pool_idx.shape[0]
@@ -206,12 +407,22 @@ def _vk_dsa_kpool_decode_bridge(
     out_cache_loc: torch.Tensor,
     round_scale: bool,
 ) -> None:
-    """SM80 decode update: vkernels compute -> legacy fp8+scale store.
+    """SM80 decode update: torch-on-GPU compute -> legacy fp8+scale store.
 
-    Same row selection as ``_vk_dsa_kpool_decode_native`` (which mirrors the
-    Triton kernel): pool-complete valid rows compress+rotate+write the pool
-    slot; every valid row updates the live tail in place.
+    Torch port of the vkernels ``dsa_kpool_decode_update`` math (same row
+    selection as ``_vk_dsa_kpool_decode_native``, which mirrors the Triton
+    kernel: pool-complete valid rows compress+rotate+write the pool slot;
+    every valid row updates the live tail in place). Parity-validated
+    against the numpy fallback in tests_local/test_dsa_kpool_wiring.py T10.
+    Set ``VKERNELS_DSA_KPOOL_NUMPY=1`` for the numpy reference path.
     """
+    if os.environ.get("VKERNELS_DSA_KPOOL_NUMPY") != "1":
+        _vk_dsa_kpool_decode_torch(
+            pool, buf, tail_k, tail_score, key, slot_score, ape,
+            block_tables, req_pool_indices, positions, seq_lens,
+            out_cache_loc, round_scale,
+        )
+        return
     import numpy as np
 
     batch = key.shape[0]
