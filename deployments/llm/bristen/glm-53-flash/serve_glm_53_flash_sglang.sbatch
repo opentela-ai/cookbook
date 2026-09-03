@@ -26,9 +26,11 @@
 # The Beverin overlay (built from the Clariden aarch64/CUDA image) supplies the
 # GLM-5.3 Python source code (sglang.srt.models.glm5_next +
 # transformers.models.glm5_next).  Its pure-Python files are prepended to
-# PYTHONPATH over the dev-cu13 image.  The ROCm-specific pieces
-# (overlay/pylib/sitecustomize.py, rocm_libs, vkernels) are intentionally NOT
-# added, because they target MI300A gfx942.
+# PYTHONPATH over the dev-cu13 image.  The overlay's ROCm-specific pieces
+# (overlay/pylib/sitecustomize.py, rocm_libs, overlay vkernels) are
+# intentionally NOT added, because they target MI300A gfx942.  The cookbook's
+# device-agnostic vkernels python package (vkernels#60, pure-Python fallback)
+# IS added instead — the SM80 DSA kpool bridge (patches_full) imports it.
 #
 # Memory note: GLM-5.3-Flash FP8 is ~306 GB.  On 4x A100 80 GB that is ~77 GB
 # weights / GPU, leaving very little headroom.  Keep --context-length small for
@@ -171,11 +173,18 @@ export TMP="$TMPDIR"
 export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH:-$DEPLOY_DIR/cache/enroot}"
 mkdir -p "$TRITON_CACHE_DIR" "$HF_HOME" "$TMPDIR" "$ENROOT_CACHE_PATH"
 
-# PYTHONPATH: overlay source first, then a cp312-compatible tokenizers 0.23.1
-# sidecar (extracted from the overlay's cp310 pkgs310 because tokenizers is
-# abi3).  Do NOT put pkgs310 itself on PYTHONPATH -- it contains cp310-only
-# compiled extensions (e.g. regex) that break on cp312.
-export PYTHONPATH="${SGLANG_PATCH_DIR}:${OVL}/sgl-workspace/sglang/python:${OVL}/sgl-workspace/transformers/src:${OVL}/site-extra-cp312:${PYTHONPATH:-}"
+# PYTHONPATH: patches_full first (the SM80-patched sglang tree + the
+# sitecustomize deep_gemm shim, auto-imported at interpreter startup), then
+# the vkernels #60 python package (the DSA kpool bridge imports it; the
+# pure-Python fallback works without the compiled ext), then the overlay
+# source, then a cp312-compatible tokenizers 0.23.1 sidecar (extracted from
+# the overlay's cp310 pkgs310 because tokenizers is abi3).  Do NOT put
+# pkgs310 itself on PYTHONPATH -- it contains cp310-only compiled extensions
+# (e.g. regex) that break on cp312.
+export VKERNELS_PYTHON="${VKERNELS_PYTHON:-$DEPLOY_DIR/vkernels-python}"
+[ -d "$VKERNELS_PYTHON/vkernels" ] || \
+  { echo "FATAL: vkernels python package not found: $VKERNELS_PYTHON/vkernels" >&2; exit 1; }
+export PYTHONPATH="${SGLANG_PATCH_DIR}:${VKERNELS_PYTHON}:${OVL}/sgl-workspace/sglang/python:${OVL}/sgl-workspace/transformers/src:${OVL}/site-extra-cp312:${PYTHONPATH:-}"
 
 # Propagate PYTHONPATH into the container unchanged.  Note: pyxis's
 # --container-env=PYTHONPATH="value" form mangles colon-separated paths, so we
