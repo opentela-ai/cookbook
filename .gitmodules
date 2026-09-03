@@ -1,0 +1,6 @@
+[submodule "third_party/sglang"]
+	path = third_party/sglang
+	url = https://github.com/sgl-project/sglang.git
+[submodule "third_party/vkernels"]
+	path = third_party/vkernels
+	url = https://github.com/opentela-ai/vkernels.git

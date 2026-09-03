@@ -34,6 +34,16 @@ GLM-5.3 Python overlay, then register it on OpenTela.
 > **Tracked as [vkernels#60](https://github.com/opentela-ai/vkernels/issues/60)**
 > (native SM80 CUDA kernels, bf16 storage + fp32 accum, mirroring PR #52);
 > the recipe-side re-validation is [cookbook#1](https://github.com/opentela-ai/cookbook/issues/1).
+>
+> **Update — the 82822 wall has a validated recipe-side workaround** (see
+> [SM80 DSA kpool wiring](#sm80-dsa-kpool-wiring-vkernels-60--prototype-status)):
+> vkernels `1de4eec` landed the SM80-proven `dsa_kpool` kernels, and the
+> prototype here bridges them into the **legacy fp8+scale cache layout**
+> (allocator/readers untouched, bit-exact store bytes, T0–T8 green locally)
+> plus a `sitecustomize` shim replacing the SM90-only `deep_gemm` DSA-indexer
+> logits on SM80. What remains is on-node proof: the serving-grade device
+> path, a first-forward smoke, and 2-node PP2 correctness. The 1-node HBM
+> floor below stands regardless.
 > (The "detokenizer health check failed / last_heartbeat" messages around boot
 > are a red herring: the TokenizerManager's health monitor simply stalls during
 > the slow weight load; no detokenizer crash occurs.)
@@ -44,6 +54,80 @@ GLM-5.3 Python overlay, then register it on OpenTela.
 > [`../clariden/glm-53-flash/`](../clariden/glm-53-flash/))** or Beverin
 > (MI300A, 128 GB, SM90+), where native FP8 makes the entire upcast patch
 > a no-op.
+
+## SM80 DSA kpool wiring (vkernels #60) — prototype status
+
+The job-82822 blocker (DSA kpool cache hardcoded `fp8e4nv` → SM80 Triton JIT
+`ValueError`) has a kernel-side fix landed in vkernels `1de4eec`
+(`dsa_kpool_assemble` / `dsa_kpool_decode_update`, bf16 storage + fp32
+accum, verified 14/14 vs fp32 oracles on **both** MI300A and A100-SXM4-80GB).
+The recipe side is prototyped here:
+
+- `patched_sources/sglang/srt/layers/attention/dsa/kpool_fp8_index.py` — the
+  upstream sglang file (submodule pin `third_party/sglang` @ `f5bed255`) with
+  a dtype-dispatched vkernels path in the two host wrappers:
+  cache `uint8` → **legacy-layout bridge** (default bristen path): vkernels
+  `dsa_kpool_*` compute + a torch requant store that reproduces the Triton
+  kernels' fp8e4m3 + per-vector-scale bytes EXACTLY (same store offsets, same
+  `absmax/448` scale, optional pow2 `round_scale`) — the cache buffer, its
+  allocator, the deep_gemm/tilelang readers, cpu offload and `move()` all
+  stay untouched; cache `bf16` → native vkernels bf16 layout
+  (`[num_pages, ssp, 128]`, upstream #60 follow-up shape). Gated to SM80
+  (`VKERNELS_DSA_KPOOL_FORCE=1` forces, `VKERNELS_DSA_KPOOL_DISABLE=1`
+  vetoes). Call sites are unchanged — **no cache-allocation flip needed** for
+  the bridge path.
+- `patched_sources/sitecustomize.py` — installed at `patches_full/` root
+  (first on PYTHONPATH, auto-imported at interpreter startup): on SM80 it
+  rebinds `deep_gemm.fp8_paged_mqa_logits` / `fp8_mqa_logits` /
+  `get_paged_mqa_logits_metadata` (SM90+-only JIT, the other half of the
+  job-82822 wall — the DSA indexer's prefill/decode logits) to pure-torch
+  fallbacks replicating the tilelang/DeepGEMM semantics
+  (`relu(q·k)·w` head-sum × `k_scale`, paged `col = table_idx*64 + j`).
+  No-op on non-SM80; `SGLANG_SM80_DG_SHIM_DISABLE=1` vetoes.
+- Local validation (`tests_local/test_dsa_kpool_wiring.py`, CPU-only,
+  torch-cpu + triton, via the vkernels pure-Python fallback) — T0–T8 all
+  green: the native path matches an **independent** torch re-implementation
+  of the Triton kernels' math (assemble incl. write_mask/tail-chunk mix;
+  decode incl. pool-complete gating, current-token substitution,
+  unconditional tail update, block_tables clamp) at fp32 tight tolerance,
+  preserves untouched cache slots, and — with every Triton kernel replaced by
+  a raising sentinel — still completes (Triton path unreachable). Negative
+  control: the unpatched wrapper enters the Triton launch path.
+  Storage-envelope check: native bf16 max|err| 0.006 vs the fp32 reference;
+  the legacy fp8+scale storage is 0.079 — the native path is numerically
+  **tighter** than what it replaces. Bridge checks (T6/T7): the legacy-layout
+  store is **bit-exact** vs a quantize emulation of the vkernels fp32 output
+  (K bytes + scale bytes, both `round_scale` variants), dequantized values
+  land within one e4m3 ulp + input-diff of the reference fp8, decode tails
+  are identical to the native path, and untouched slots stay zero.
+  Shim check (T8): both torch logits fallbacks match a per-element loop
+  reference of the DeepGEMM/tilelang semantics, including the page-table
+  column mapping, the −1e30 fill for unwritten paged columns, and ragged
+  `clean_logits` masking.
+
+Remaining before a bristen go/no-go (mirrors the vkernels#60 acceptance list):
+
+1. Device path: this dispatch currently uses the vkernels public Python API
+   (numpy fp32, host round trip) — fine for validation, not for serving.
+   Plug the C-ABI device adapters (`vk_dsa_kpool_assemble` /
+   `vk_dsa_kpool_decode_update`) into the two `_vk_dsa_kpool_*_native`
+   functions, mirroring `meta/diag/glm53/patch_dsa_vk.py` from PR #52, or
+   build the compiled backend (`VKERNELS_BUILD_PYTHON=ON`) in the container.
+   The bridge's requant store is plain torch (device-side, no JIT) and can
+   stay as-is.
+2. First-forward smoke on bristen `flashmla_sparse` (short-context
+   generation through `_compress_write`, no `fp8e4nv` error, no
+   `deep_gemm` SM90 assert), then 2-node PP2 `gen_correctness.py` →
+   `PASS pass=5/6 crisp=3/3` (Clariden parity).
+
+Known not-bridged (would still JIT-fail if reached, neither runs in the
+2-node PP2 smoke config): `kpool_write_tail_and_maybe_compress`
+(target-verify / spec-decode) and the `return_compressed` path of
+`kpool_softmax_rotate_write_cache` (CP / layer-shard).
+
+The 1-node TP4 A100 HBM floor (first MoE forward OOM) is a memory limit, not
+a kernel limit — it is unaffected by this wiring; 2-node PP2 remains the
+serving shape for bristen.
 
 ## Quick start
 
@@ -62,7 +146,9 @@ SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_5
 | `serve_glm_53_flash_sglang.sbatch` | Slurm batch: container setup, preflight, SGLang engine, generation probe |
 | `engine.sh` | Per-rank SGLang launcher (args, MoE/FP8 backend selection, DSA override) |
 | `apply_sm80_patch.sh` | Copy the Beverin overlay and apply the SM80 FP8→bf16 compute patches |
-| `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py` and `fused_moe_triton_kernels.py` |
+| `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py`, `fused_moe_triton_kernels.py`, and `srt/layers/attention/dsa/kpool_fp8_index.py` (vkernels #60 kpool bridge: legacy fp8+scale store, bf16 native path) |
+| `patched_sources/sitecustomize.py` | SM80 `deep_gemm` logits shim (paged + ragged torch fallbacks), auto-imported from `patches_full` |
+| `tests_local/test_dsa_kpool_wiring.py` | CPU-only validation of the vkernels #60 kpool wiring + deep_gemm shim (see below) |
 | `preflight.py` | In-container import test for the GLM-5.3 overlay |
 | `gen_correctness.py` | Greedy correctness/smoke probe against `/v1/completions` |
 | `README.md` | This file |
@@ -201,7 +287,7 @@ in `patched_sources/`.
 | `CHUNKED_PREFILL_SIZE` | `2048` | matches `CTX_LEN`; keeps prefill activations within the tight slack |
 | `SMOKE` | `1` | `1` = hold job after health, `0` = OpenTela registration step |
 | `DISABLE_CUDA_GRAPH` / `SKIP_SERVER_WARMUP` | `1` | defaults match Beverin/Clariden stability knobs |
-| `DSA_PREFILL_BACKEND` | *(unset → `flashmla_sparse` on 2-node PP2)* | `flashmla_sparse` hits the unpatched fp8 kpool JIT on the first forward (job 82822); `tilelang` (overlay SM80 default) avoids it but then hits the [A100 HBM floor](#a100-hbm-floor) at MoE; `fa3` rejects the model's QK/V head dims on SM80. None yield a serving path. |
+| `DSA_PREFILL_BACKEND` | *(unset → `flashmla_sparse` on 2-node PP2)* | `flashmla_sparse`'s job-82822 blockers (fp8 kpool JIT, deep_gemm SM90 logits) are addressed by the [SM80 DSA kpool wiring](#sm80-dsa-kpool-wiring-vkernels-60--prototype-status) (vkernels bridge + `sitecustomize` shim) — still to be proven on-node; `tilelang` (overlay SM80 default) avoids them but then hits the [A100 HBM floor](#a100-hbm-floor) at MoE; `fa3` rejects the model's QK/V head dims on SM80. |
 | `MOE_RUNNER_BACKEND` | `triton` | only backend that compiles on SM80; with the upcast patch it runs to the first MoE forward (then hits the A100 HBM floor, not a compile error) |
 | `FP8_GEMM_RUNNER_BACKEND` | `triton` | same as above |
 | `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64 otela binary |

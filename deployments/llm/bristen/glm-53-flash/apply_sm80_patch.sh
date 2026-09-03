@@ -28,4 +28,21 @@ cp "$SCRIPT_DIR/patched_sources/sglang/kernels/ops/quantization/fp8_kernel.py" \
 cp "$SCRIPT_DIR/patched_sources/sglang/kernels/ops/moe/fused_moe_triton_kernels.py" \
    "$PATCH_DIR/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
 
+# vkernels #60: kpool-cache path for the DSA indexer (SM80 has no fp8e4nv
+# Triton). Dispatches on the cache dtype: uint8 -> legacy fp8+scale LAYOUT
+# but vkernels dsa_kpool compute + torch requant store (the bristen serving
+# shape -- allocator/readers/offload untouched); bf16 -> native vkernels
+# bf16-cache layout. Requires the vkernels python package importable
+# (pure-Python fallback works, compiled/CUDA backend for serving).
+mkdir -p "$PATCH_DIR/sglang/srt/layers/attention/dsa"
+cp "$SCRIPT_DIR/patched_sources/sglang/srt/layers/attention/dsa/kpool_fp8_index.py" \
+   "$PATCH_DIR/sglang/srt/layers/attention/dsa/kpool_fp8_index.py"
+
+# sitecustomize: on SM80, rebind deep_gemm's fp8_paged_mqa_logits /
+# fp8_mqa_logits / get_paged_mqa_logits_metadata (SM90+-only JIT) to pure-
+# torch fallbacks for the DSA-indexer prefill/decode logits. No-op elsewhere
+# (non-SM80 capability check inside). patches_full is first on PYTHONPATH, so
+# CPython imports this automatically at interpreter startup.
+cp "$SCRIPT_DIR/patched_sources/sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
+
 echo "[$(date -Is)] SM80 patch tree ready at $PATCH_DIR/sglang"
