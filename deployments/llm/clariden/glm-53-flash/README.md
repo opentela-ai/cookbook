@@ -127,11 +127,48 @@ curl -s http://<alps-or-public-head>/v1/service/llm/v1/models \
   -H "X-Otela-Model: zai-org/GLM-5.3-Flash"
 ```
 
-Routed serving **registered successfully** in job 3219525 (`model=zai-org/GLM-5.3-Flash`, served ~11h40m), but the only 3 routed requests observed
-(~10h in) returned **HTTP 400 in ~22ms** — fast rejections, almost
-certainly malformed external probes (missing `X-Otela-Model` or wrong model
-name), not a serve failure. Direct localhost serving is gen-probe-validated;
-a clean routed `200` is the one open confirmation to close on the next run (tracked #3).
+Routed serving **registered successfully** in job 3219525 (`model=zai-org/GLM-5.3-Flash`, served ~11h40m). The routed `200` confirmation has since closed: in job 3270164 the gateway routed end-to-end repeatedly with `max_completion_tokens: 131072` + `reasoning_effort: high` (8/8 HTTP 200s via `api.ada.ai`) and the full `pi` agent path (`--provider ada --model zai-org/GLM-5.3-Flash`) returned clean `stopReason:"stop"` turns.
+
+## Measured serving performance (job 3270164, nid006990, 2026-09-03)
+
+Measured with [`bench_serving.py`](bench_serving.py) from the Clariden login node against the engine head directly (`http://172.28.37.184:30000`), streaming `/v1/chat/completions`, `temperature=0`, `ignore_eos` (fixed output length), `stream_options.include_usage` for exact token counts. Each level is a closed batch (all requests launched at once) after a warmup request; engine-side numbers are parsed from the sglang serve log's `Decode batch ... gen throughput` lines inside each level's wall-clock window. Raw results: [`bench_sweep_1k.json`](bench_sweep_1k.json), [`bench_longinput_8k.json`](bench_longinput_8k.json).
+
+**Decode sweep** — ~1K-token input (actual mean 985), 256 output tokens, 224/224 requests OK:
+
+| c | TTFT p50/p95 (s) | e2e p50 (s) | TPOT p50 (ms) | agg out tok/s | agg total tok/s | engine decode mean/max (tok/s) | running max |
+|---|------------------|-------------|---------------|---------------|-----------------|-------------------------------|-------------|
+| 1 | 0.20 / 0.81 | 2.76 | 9.6 | 67 | 324 | 180 / 209 | 1 |
+| 2 | 0.37 / 0.55 | 3.27 | 11.3 | 158 | 765 | 232 / 284 | 2 |
+| 4 | 0.46 / 0.63 | 3.18 | 10.6 | 319 | 1,548 | 384 / 443 | 4 |
+| 8 | 0.39 / 0.57 | 2.90 | 9.8 | 697 | 3,378 | 744 / 818 | 8 |
+| 16 | 0.63 / 0.68 | 6.61 | 17.7 | 617 | 2,991 | 934 / 1,552 | 16 |
+| 32 | 3.56 / 6.70 | 6.82 | 12.7 | 909 | 4,406 | 1,051 / 1,469 | 17 |
+| 64 | 3.85 / 11.45 | 7.34 | 13.6 | 1,095 | 5,307 | 1,146 / 1,596 | 17 |
+
+**Long-input spot check** — 7.6K-token input (actual mean 7,564), 128 output tokens:
+
+| c | TTFT p50/p95 (s) | e2e p50 (s) | TPOT p50 (ms) | agg out tok/s | agg total tok/s |
+|---|------------------|-------------|---------------|---------------|-----------------|
+| 1 | 0.22 / 0.22 | 1.35 | 8.9 | 95 | 5,677 |
+| 8 | 0.59 / 0.59 | 2.09 | 12.1 | 490 | 29,434 |
+
+Interpretation:
+
+- **Scaling is linear up to c=8**: 67 → 697 agg out tok/s (~87 tok/s per stream at c=8), TPOT stays ~10 ms/token. This is the regime pi/agentic traffic lives in — sub-second TTFT even with 7.5K-token prompts (DSA/tilelang prefill ≈ 30K tok/s).
+- **Decode step time grows ~1.8× from bs=1 to bs=16** (9.6 → 17.7 ms/token), so per-stream speed halves but instantaneous aggregate still rises (~905 tok/s at bs=16).
+- **Hard cap: `max_running_requests=17`** (Mamba state cache: `max_mamba_cache_size=88`, 5 state slots/request). Above 17, requests queue instead of batching: agg throughput plateaus at **~1.0–1.1K out tok/s (~5.3K total tok/s)** — engine steady decode ≈ 1.15K tok/s, transient max ≈ 1.6K tok/s — while TTFT p95 grows with queue depth (6.7 s @ c=32, 11.5 s @ c=64).
+- **Guidance**: for interactive/agentic use (c ≤ 4) expect ~0.2–0.5 s TTFT and ~10 ms/token. For batch workloads, cap client concurrency at 17 to avoid queue TTFT, or raise the cap on the next deployment via `--max-mamba-cache-size` / `--mamba-full-memory-ratio`, or halve state size with `--mamba-ssm-dtype bfloat16` (unvalidated here).
+
+Reproduce (login node, engine head IP from `last_service.env`):
+
+```bash
+python3 bench_serving.py \
+  --url http://<HEAD_IP>:30000/v1/chat/completions \
+  --model zai-org/GLM-5.3-Flash \
+  --levels 1,2,4,8,16,32,64 --out-tokens 256 --input-tokens 1450 \
+  --serve-log /capstor/scratch/cscs/$USER/glm-53-flash/logs/serve-<JOBID>.out \
+  --save bench_sweep_1k.json
+```
 
 ## Files
 
@@ -142,6 +179,8 @@ a clean routed `200` is the one open confirmation to close on the next run (trac
 | `build_glm_5_3_flash_image.sbatch` | One-time enroot import of `docker://lmsysorg/sglang:glm-5.3-flash` (arm64, sm_90 cubins for GH200) to a local `.sqsh` |
 | `download_glm_5_3_flash.sbatch` | One-time HF weights download to `/capstor` (~306 GiB, 62 shards) |
 | `gen_correctness.py` | Mandatory pre-registration greedy generation probe (reused from kimi-k3 / glm-5.2) |
+| `bench_serving.py` | stdlib-only concurrency-sweep benchmark: streaming TTFT/TPOT/e2e + aggregate throughput per level, cross-checked against the engine's own decode-log throughput |
+| `bench_sweep_1k.json` / `bench_longinput_8k.json` | Raw results of the 2026-09-03 measured-performance run above (job 3270164) |
 | `verify_parsers.py` / `inspect_fa3_paths.py` / `verify_kpool_patch.py` | reasoning/tool-call parser + DSA/FA3/kpool path verification helpers |
 
 ## Knobs (env, all overridable)
@@ -150,7 +189,7 @@ a clean routed `200` is the one open confirmation to close on the next run (trac
 |------|---------|-------|
 | `NNODES` / `TP_SIZE` / `PP_SIZE` | 1 / 4 / `NNODES` | one distributed engine; PP = nodes, TP4 keeps allreduce in-node (2-node PP2 = more KV headroom, unvalidated) |
 | `MEM_FRAC` | 0.88 | 306 GiB/8 = ~38 GiB weights/GPU; ~58 GiB free |
-| `CTX_LEN` | 32768 | |
+| `CTX_LEN` | 262144 | catalog advertises max-out 131072 (pi sends `max_completion_tokens=131072`); gateway rejects any > advertised `max_model_len`. Live-KV budget 287104 at MEM_FRAC=0.88 (probe job 3269479), so a single 256K request fits at 91%. Raise toward 1M only with `HICACHE_ENABLE=1` |
 | `GLM53_DSA_PREFILL` / `GLM53_DSA_DECODE` | `tilelang` / `tilelang` | native FP8; the `flashmla_sparse` path that blocks Bristen is avoided here |
 | `GLM53_MM_ATTENTION` | `triton_attn` | multimodal attention backend |
 | `GLM53_REASONING_PARSER` / `GLM53_TOOL_CALL_PARSER` | `glm45` / `glm47` | gated by `GLM53_ENABLE_PARSERS=1` |

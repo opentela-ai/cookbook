@@ -1,0 +1,50 @@
+{
+ "meta": {
+  "model": "zai-org/GLM-5.3-Flash",
+  "url": "http://172.28.37.184:30000/v1/chat/completions",
+  "input_tokens_target": 11350,
+  "output_tokens": 128,
+  "started": "2026-09-03T01:52:48+0200",
+  "host_note": "client on cluster login node; engine on compute node"
+ },
+ "levels": [
+  {
+   "concurrency": 1,
+   "requests": 6,
+   "ok": 6,
+   "fail": 0,
+   "in_tok_mean": 7564.0,
+   "out_tok_mean": 128.0,
+   "ttft_p50_s": 0.221,
+   "ttft_p95_s": 0.224,
+   "lat_p50_s": 1.347,
+   "lat_p95_s": 1.381,
+   "tpot_p50_ms": 8.9,
+   "agg_out_tok_s": 94.5,
+   "agg_total_tok_s": 5677.0,
+   "eng_decode_tps_mean": 107.4,
+   "eng_decode_tps_max": 203.5,
+   "eng_running_max": 2,
+   "wall_s": 8.13
+  },
+  {
+   "concurrency": 8,
+   "requests": 16,
+   "ok": 16,
+   "fail": 0,
+   "in_tok_mean": 7564.0,
+   "out_tok_mean": 128.0,
+   "ttft_p50_s": 0.585,
+   "ttft_p95_s": 0.589,
+   "lat_p50_s": 2.088,
+   "lat_p95_s": 2.126,
+   "tpot_p50_ms": 12.1,
+   "agg_out_tok_s": 489.8,
+   "agg_total_tok_s": 29433.9,
+   "eng_decode_tps_mean": 549.8,
+   "eng_decode_tps_max": 765.9,
+   "eng_running_max": 8,
+   "wall_s": 4.18
+  }
+ ]
+}

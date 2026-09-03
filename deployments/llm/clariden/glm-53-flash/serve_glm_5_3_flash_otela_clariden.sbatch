@@ -270,11 +270,20 @@ export GLM53_TOOL_CALL_PARSER="${GLM53_TOOL_CALL_PARSER:-glm47}"
 export GLM53_ENABLE_PARSERS="${GLM53_ENABLE_PARSERS:-1}"
 
 # Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
-# 1048576 (1M). The KV pool is sized by MEM_FRAC, not this value. Default
-# 32768 for a fast cold start + probe (shorter than the kimi-k3 1M default
-# because GLM-5.3 is brand-new on clariden — confirm a short-context forward
-# first, then raise toward 1M).
-export CTX_LEN="${CTX_LEN:-32768}"
+# 1048576 (1M); the KV pool is sized by MEM_FRAC, not this value. Default
+# 262144 (256K): the 32768 cold-start PROBE (job 3269479) served correctly,
+# but pi's catalog advertises max-out=131072 for GLM-5.3-Flash and sends
+# max_completion_tokens=131072 by default — the OpenTela gateway rejects any
+# max_completion_tokens > advertised max_model_len with a 400, so 32768 broke
+# every default pi request. 262144 gives full input+output headroom above
+# 131072 while staying inside the live-KV budget (verified at CTX_LEN=32768:
+# max_total_num_tokens=287104 at MEM_FRAC=0.88 with 10.68 GiB still free),
+# i.e. a single 256K request fits the ~287K pool at 91%. max_running_requests
+# stays 17 (Mamba ssm_state 2.96 GiB is the real cap, not KV), so raising
+# CTX_LEN costs nothing in concurrency. Raise toward 1M only after widening
+# the live-KV pool (HICACHE_ENABLE=1 to spill evicted prefixes to Grace
+# LPDDR) — a 1M single request does NOT fit the ~287K pool today.
+export CTX_LEN="${CTX_LEN:-262144}"
 export MEM_FRAC="${MEM_FRAC:-0.88}"
 
 # Slingshot high-speed NIC. Every clariden GH200 node exposes hsn0..hsn3 (one
