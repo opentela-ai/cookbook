@@ -166,9 +166,33 @@ tilelang`.
   prompts correctly** (Paris; air-molecule blue-scatter; "2, 3, 5"; "40
   km/h"; a real fibonacci body; entropy/conservation laws) at ~85 s per
   32-token greedy request.
+- **Job 83152** — profiling + the torch-on-GPU kpool bridge. The job-83120
+  torch-profiler trace pinned the decode wall: the SM80 vkernels **numpy
+  fallback** spent ~950 ms/step (76% of the 1.25 s/step wall, per stage)
+  in `numpy .fill` over a whole-cache fp32 host scratch + full D2H/H2D
+  round trips; GPU was busy only 228 ms/step. Fix: `_vk_dsa_kpool_
+  {assemble,decode}_torch` in `patched_sources/.../kpool_fp8_index.py`
+  (commit d9df65d) — same math entirely on-GPU, no host scratch, no syncs;
+  numpy fallback kept as reference via `VKERNELS_DSA_KPOOL_NUMPY=1`;
+  parity gated by tests T0–T10 (T10 = torch-vs-numpy bridge parity).
+  Measured (same bench, input 64):
 
-Throughput work (compiled vkernels backend, CUDA graphs, decode-kernel
-tuning) is the next lever; correctness of the serving path is proven.
+  | metric | job 83120 (numpy bridge) | job 83152 (torch bridge) |
+  |---|---|---|
+  | TPOT / decode tok/s (bs=1) | 2672 ms / 0.37 | **510 ms / 1.96** |
+  | TTFT (input 64) | 3012 ms | **742 ms** |
+  | TTFT (input 1024) | 2965 ms | — (same fixed-overhead regime gone) |
+  | bs=8 aggregate output | n/a (didn't finish) | **8.14 tok/s** (TPOT 565 ms) |
+  | per-step wall / GPU busy | 1250 / 228 ms | **240 / 195 ms** |
+
+  Post-fix re-profile: numpy fill 0 ms; the remaining ~185 ms/step is
+  ~157 host-launched `direct_copy` kernels + eager-mode launch overhead
+  (CUDA graphs are disabled in this config) vs ~12 ms of real math —
+  CUDA graphs / cast-fusion is the next lever.
+
+Further throughput work (compiled vkernels backend, CUDA graphs,
+decode-kernel tuning) is the next lever; correctness of the serving path
+is proven (probe answers crisp, T0–T10 green).
 
 ## Quick start
 
