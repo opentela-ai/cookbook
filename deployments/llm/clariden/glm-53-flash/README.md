@@ -170,6 +170,36 @@ python3 bench_serving.py \
   --save bench_sweep_1k.json
 ```
 
+## Stopping a job cleanly (verified 2026-09-03)
+
+The trap path (`B:TERM@120` at wall-time end) fires `stop_otela` correctly, but a
+**manual step-level signal may not**: `scancel -s TERM <jobid>.<otela-step>` on
+job 3273975 killed the worker with **no LEFT published** (no drain logged,
+`otela.log` ends abruptly). The head de-facto stopped routing to that peer
+immediately (zero routed traffic after worker death), but the row-level risk is
+real. The reliably graceful manual procedure is to TERM the otela **process**
+inside the running container, confirm LEFT, then cancel the job:
+
+```bash
+IMG=/capstor/scratch/cscs/$USER/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh
+# find the worker pid
+srun --jobid=<JOBID> --overlap --gres=none --nodes=1 -w <HEAD_NODE> \
+  --container-image=$IMG --container-name=glm-5.3-flash-clariden \
+  bash -c 'ps -eo pid,args | grep -a otela-arm64 | grep -v grep'
+# graceful leave (~10 s: AnnounceLeave -> 5 s CRDT drain -> shutdown)
+srun --jobid=<JOBID> --overlap --gres=none --nodes=1 -w <HEAD_NODE> \
+  --container-image=$IMG --container-name=glm-5.3-flash-clariden \
+  bash -c 'kill -TERM <OTELA_PID>'
+sleep 15
+grep -acE "Announcing myself as LEFT|Leaving network" \
+  /capstor/scratch/cscs/$USER/glm-53-flash/run-<JOBID>/otela.log   # must be >= 1
+scancel <JOBID>
+```
+
+With the worker dead but the engine still up, the head stops routing to that
+peer at once (observed on 3273975) — so even the ungraceful case is mitigated
+by keeping the job alive a few minutes before `scancel`.
+
 ## Files
 
 | File | Purpose |
