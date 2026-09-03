@@ -1,5 +1,9 @@
 # meta/tools/debugger — agent toolkit for correctness bugs
 
+> This toolkit answers *why is the output wrong*. For *why is it slow*
+> (utilization, kernel bottlenecks), use [`meta/tools/profiler/`](../profiler/) instead —
+> same bench-file discipline, opposite failure class.
+
 Reusable, model-agnostic tooling for the failure class this cookbook hits most
 often in a serving campaign: **the service boots, `/health` is green, the
 engine log is clean — and the output is wrong** (garbage tokens, weakly-peaked

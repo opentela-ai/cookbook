@@ -14,6 +14,7 @@ deployments/<service-kind>/local/<site>/<model>/    # no scheduler: single-box, 
 conventions/                                       # cross-recipe rules (LLM served-model naming, …)
 meta/bench/                                        # benchmark harness shared by all recipes
 meta/tools/debugger/                               # agent toolkit for correctness bugs (probes, capture/diff bisect, journal)
+meta/tools/profiler/                               # agent toolkit for kernel perf (forward breakdown, roofline microbench, compare)
 .rcc/config.toml                                   # project-local rcc profiles for remote submit
 ```
 
@@ -83,6 +84,7 @@ substrates (DGX Spark) everything runs without a scheduler.
 | [`conventions/`](conventions/) | Cross-recipe rules, starting with LLM served-model names use the `org/model-name` form. |
 | [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared harness (**servekit bench** via `cbench.sh` / `cbench_report.py`, stdlib-only so it runs zero-install on no-egress compute nodes; `servekit profile` for cold-start timelines), and the reporting checklist every throughput claim must carry. |
 | [`meta/tools/debugger/`](meta/tools/debugger/) | How we debug **correctness** bugs (garbage output, numerical drift): the five-phase method distilled from the GLM-5.3-Flash MI300A bisect — live-server failure-signature probes, no-reference per-layer residual bisect, identity-gated capture→diff, isolated kernel primitive tests, and the investigation journal. Operator tools are stdlib-only; in-engine hook modules are env-gated and self-installing. |
+| [`meta/tools/profiler/`](meta/tools/profiler/) | How we find **where the milliseconds go** (utilization, slow kernels, bottlenecks): torch.profiler-based forward breakdown ranked into kernel families with GPU busy% and gap analysis, an event-timed microbench that roofline-classifies kernels (memory-/compute-/launch-bound vs nominal device peaks), and a before/after compare — portable across CUDA/ROCm, bench-file contract + JSON outputs. Comm bottlenecks → `meta/bench/nccl_sharp_probe.py`. |
 
 ## Conventions
 
