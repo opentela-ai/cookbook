@@ -13,6 +13,7 @@ deployments/<service-kind>/<site>/<model>/          # one self-contained recipe 
 deployments/<service-kind>/local/<site>/<model>/    # no scheduler: single-box, hand-run scripts
 conventions/                                       # cross-recipe rules (LLM served-model naming, …)
 meta/bench/                                        # benchmark harness shared by all recipes
+meta/tools/debugger/                               # agent toolkit for correctness bugs (probes, capture/diff bisect, journal)
 .rcc/config.toml                                   # project-local rcc profiles for remote submit
 ```
 
@@ -81,6 +82,7 @@ substrates (DGX Spark) everything runs without a scheduler.
 | `deployments/llm/local/dgx-spark/qwen3-1.7b-ollama/` | `ollama/qwen3:1.7b` serving on a DGX Spark (NVIDIA GB10, sm_121, aarch64) via **Ollama** (bundled CUDA v13 libs, no golden image, no container). Start with its [`README.md`](deployments/llm/local/dgx-spark/qwen3-1.7b-ollama/README.md) for the Ollama-has-no-`/health` and Modelfile-alias-for-`org/model-name` stories. |
 | [`conventions/`](conventions/) | Cross-recipe rules, starting with LLM served-model names use the `org/model-name` form. |
 | [`meta/bench/`](meta/bench/) | How we benchmark an LLM service: strategy, the C=1 trap, the shared harness (**servekit bench** via `cbench.sh` / `cbench_report.py`, stdlib-only so it runs zero-install on no-egress compute nodes; `servekit profile` for cold-start timelines), and the reporting checklist every throughput claim must carry. |
+| [`meta/tools/debugger/`](meta/tools/debugger/) | How we debug **correctness** bugs (garbage output, numerical drift): the five-phase method distilled from the GLM-5.3-Flash MI300A bisect — live-server failure-signature probes, no-reference per-layer residual bisect, identity-gated capture→diff, isolated kernel primitive tests, and the investigation journal. Operator tools are stdlib-only; in-engine hook modules are env-gated and self-installing. |
 
 ## Conventions
 
