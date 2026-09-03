@@ -322,6 +322,39 @@ def fused_moe_kernel_gptq_awq(
 
 
 @triton.jit
+def _decode_e4m3_u8(u, compute_type):
+    """Exact e4m3fn decode from raw uint8 bytes, in-register.
+
+    SM80 Triton cannot load fp8e4nv pointers, so the fp8 weight tensor is
+    passed as a uint8 view and decoded here. The bf16 bit pattern is
+    assembled with pure integer ops (no fp arithmetic at all -- triton
+    fast-math would fold -0.0 to +0.0), so every byte maps bit-identically
+    to torch's fp8->bf16 upcast:
+      normals   e4m3  s eeee mmm -> bf16 s (e+120) mmm0000
+      denormals m*2^-9 -> re-normalized (E=118+p, 3-p-bit mantissa)
+      0x7F/0xFF -> bf16 NaN (0x7FC0 | sign)
+    """
+    em16 = u.to(tl.uint16)
+    em = em16 & 0x7F
+    e = (em >> 3) & 0xF
+    m = em & 0x7
+    sign = (em16 & 0x80) << 8
+    norm_bits = ((e + 120) << 7) | (m << 4)
+    # denormal m*2^-9: m=1 -> E118/m0; m=2,3 -> E119/m0,4; m=4..7 -> E120/m(m-4)*32
+    den_bits = tl.where(
+        m == 0,
+        0,
+        tl.where(
+            m < 4,
+            ((118 + (m >> 1)) << 7) + tl.where(m == 3, 64, 0),
+            (120 << 7) + ((m - 4) << 5),
+        ),
+    )
+    bits = sign | tl.where(em == 0x7F, 0x7FC0, tl.where(e == 0, den_bits, norm_bits))
+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(compute_type)
+
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -372,6 +405,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
+    B_IS_E4M3_U8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
@@ -566,7 +600,14 @@ def fused_moe_kernel(
         # We accumulate along the K dimension.
         if use_fp8_w8a8 or use_int8_w8a8:
             a = a.to(compute_type)
-            b = b.to(compute_type)
+            if B_IS_E4M3_U8:
+                # fp8 bytes decoded in-register (SM80): identical math to a
+                # host-side B.to(compute_dtype) but with no per-call
+                # full-tensor upcast copy (that copy used to be ~88% of
+                # per-step GPU time in the job-83152 decode profile).
+                b = _decode_e4m3_u8(b, compute_type)
+            else:
+                b = b.to(compute_type)
 
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -882,23 +923,31 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    b_is_e4m3_u8 = False
     if use_fp8_w8a8 and A.dtype == torch.float8_e4m3fn:
         # SM80 (A100) cannot load fp8e4nv in Triton -- fp8 load/store and
-        # fp8 tl.dot require SM89+/SM90+. Upcast A and B to the compute dtype
-        # (bf16/fp16) here, before launch, so the kernel's tl.load never sees
-        # an FP8 pointer and its in-kernel `a.to(compute_type)` becomes a
-        # no-op. use_fp8_w8a8 stays True, so the per-block (A_scale, B_scale)
-        # dequant multiply runs unchanged and the result matches the FP8
-        # emulation exactly: A_fp8.to(bf16) @ B_fp8.to(bf16) * scales.
-        #
-        # B is this layer's w1/w2 (EP-sharded, ~1-2 GB fp8 -> ~2-4 GB bf16),
-        # not the whole model, so the transient copy fits the HBM headroom.
+        # fp8 tl.dot require SM89+/SM90+. On SM90+ the kernel loads fp8
+        # natively. On SM80, upcast A (activations, tiny) on the host and
+        # pass B as a raw uint8 view; the kernel decodes e4m3 in-register
+        # (_decode_e4m3_u8). use_fp8_w8a8 stays True, so the per-block
+        # (A_scale, B_scale) dequant multiply runs unchanged and the result
+        # matches the FP8 emulation exactly: A_fp8.to(bf16) @ B_fp8.to(bf16)
+        # * scales. The in-register decode replaces the old host-side
+        # B.to(compute_dtype), which copied the ENTIRE expert-weight tensor
+        # (~1-2 GB fp8 -> ~2-4 GB bf16, a 2.25 GiB transient) on every MoE
+        # invocation -- twice per layer, every decode step (measured at
+        # ~88% of per-step GPU time, job-83152 profile).
         if torch.cuda.get_device_capability(A.device)[0] < 9:
             compute_dtype = (
                 torch.bfloat16 if compute_type == tl.bfloat16 else torch.float16
             )
             A = A.to(compute_dtype)
-            B = B.to(compute_dtype)
+            if B.dtype == torch.float8_e4m3fn:
+                # Same-itemsize reinterpret: works for any strided view.
+                # (Callers that already pass B in the compute dtype keep the
+                # old host-upcast behavior.)
+                B = B.view(torch.uint8)
+                b_is_e4m3_u8 = True
 
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -1041,6 +1090,7 @@ def invoke_fused_moe_kernel(
             top_k=top_k,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            B_IS_E4M3_U8=b_is_e4m3_u8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
