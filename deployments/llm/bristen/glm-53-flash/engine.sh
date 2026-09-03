@@ -74,6 +74,18 @@ export DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-}"
 [ -n "${DSA_PREFILL_BACKEND:-}" ] && \
   SGLANG_ARGS+=(--dsa-prefill-backend "$DSA_PREFILL_BACKEND")
 
+# Decode backend: the auto-detect picks FA3 for bf16 KV, but FA3's fused
+# kernel rejects GLM-5.3's different QK/V head dims on SM80 ("Only Hopper
+# supports different V headdim" -- job 83115 died there on the first decode,
+# after prefill had already succeeded through the SM80 TileLang route).
+# TileLang's sparse_attention kernel supports arbitrary tail_dim and is the
+# only kpool>1-capable decode backend on A100 (dsa_backend.py
+# _resolve_kpool_tail_backend SM80 comment). Override with
+# DSA_DECODE_BACKEND=fa3 to experiment.
+export DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-tilelang}"
+[ -n "${DSA_DECODE_BACKEND:-}" ] && \
+  SGLANG_ARGS+=(--dsa-decode-backend "$DSA_DECODE_BACKEND")
+
 if [ "${NNODES:-1}" -gt 1 ]; then
   SGLANG_ARGS+=(
     --nnodes "$NNODES" --node-rank "$RANK"
