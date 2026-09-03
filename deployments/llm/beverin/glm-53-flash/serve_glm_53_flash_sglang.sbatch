@@ -11,6 +11,10 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
+# nid002922 excluded: repeatedly failed mid-run with an unrecoverable RCCL/
+# HSA fault during the glm53-otela jobs (see comp-capture campaign logs on
+# /capstor); re-try after the next maintenance window.
+#SBATCH --exclude=nid002922
 # B:TERM@120 signals the BATCH shell (B:) 120 s before wall-time, giving the
 # stop_otela trap (SMOKE=0 only) a window to scancel the otela step with TERM.
 #SBATCH --signal=B:TERM@120
@@ -242,6 +246,22 @@ export GLM53_MAMBA_BACKEND="${GLM53_MAMBA_BACKEND:-triton}"
 # Default ON while we diagnose the job-612826 first-forward stall; set
 # GLM53_FWD_PROBE=0 for production serving (zero-cost when off).
 export GLM53_FWD_PROBE="${GLM53_FWD_PROBE:-1}"
+# Shared GLM-5.3 diagnostic harness (comp_capture/capture_probe/comp_diff,
+# import_hook, the engine patch modules). Lives in the cookbook checkout so
+# beverin and clariden run the IDENTICAL copies (one source of truth).
+export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/meta/diag/glm53}"
+# Component/layer I/O capture (comp_capture.py, gated by GLM53_COMP_CAPTURE).
+# First-forward-only; zero-cost when GLM53_COMP_CAPTURE is unset. Layer 0's
+# input is the embedding (deterministic, identical on any arch for the same
+# prompt) so the component bisect vs a pure-torch reference is immediately
+# meaningful with no dependency on prior layers.
+# DIAGNOSTIC DEFAULTS (like the FWD_PROBE/TILELANG_PROBE blocks): remove the
+# =1 defaults once the beverin-vs-clariden bisect closes.
+export GLM53_COMP_CAPTURE="${GLM53_COMP_CAPTURE:-1}"
+export GLM53_COMP_MODE="${GLM53_COMP_MODE:-components}"
+export GLM53_COMP_LAYER="${GLM53_COMP_LAYER:-0}"
+export GLM53_COMP_TAG="${GLM53_COMP_TAG:-beverin_l0}"
+export GLM53_COMP_DIR="${GLM53_COMP_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-beverin/comp_capture}"
 # tilelang DSA-topk JIT probe (GLM53_TILELANG_PROBE=1) + DEBUG log
 # (GLM53_TL_LOG=DEBUG) to localize the fp8_paged_mqa_logits JIT hang on
 # gfx942. Default ON for this diagnostic run; remove after diagnosis.
@@ -396,6 +416,9 @@ _sib() { # name, why
 _sib gen_correctness.py "The recipe is a 4-file bundle (sbatch + sglang-rocm.toml + sglang_launcher_mi300a.py + gen_correctness.py) + build_overlay.sh."
 _sib sglang-rocm.toml "The EDF (v0.5.18 image + overlay PYTHONPATH + MI300A env). Found via EDF_PATH=$SCRIPT_DIR."
 _sib sglang_launcher_mi300a.py "The is_integrated MI300A memory-accounting fix launcher."
+[ -f "$GLM53_DIAG_DIR/capture_probe.py" ] || {
+  echo "FATAL: capture_probe.py not found in $GLM53_DIAG_DIR" >&2
+  echo "       (the shared diag harness lives in <cookbook>/meta/diag/glm53; submit from a full cookbook checkout)" >&2; exit 1; }
 
 # Quick in-container preflight: the image + overlay actually import the GLM-5.3
 # model (catches a stale/wrong overlay BEFORE the ~5 min srun cold start). ~20 s
@@ -640,6 +663,20 @@ trap 'stop_otela' EXIT TERM INT
     sleep 20
   done
   echo "[$(date -Is)] engine healthy after ~$((HEALTH_TIMEOUT - (deadline - SECONDS)))s"
+
+  # --- capture probe (GLM53_CAPTURE_PROBE=1): fire ONE deterministic ~2k-token
+  # request BEFORE the gen probe so comp_capture (GLM53_COMP_MIN_TOKENS=1200)
+  # lands on THIS forward identically on beverin and clariden (init profile
+  # forwards are machine-dependent: 1-token dummy vs bs=9).
+  if [ "${GLM53_CAPTURE_PROBE:-0}" = "1" ]; then
+    echo "[$(date -Is)] capture probe (deterministic long-prompt prefill) ..."
+    timeout 900 \
+      srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
+           -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+           python3 "$GLM53_DIAG_DIR/capture_probe.py" \
+               "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
+      || echo "[$(date -Is)] capture probe FAILED (rc=$?); continuing" >&2
+  fi
 
   if [ "$GEN_PROBE" = "1" ]; then
     echo "[$(date -Is)] generation ${GEN_CORRECTNESS_SMOKE:+smoke }probe (model=$SERVED_MODEL_NAME, max_tokens=$GEN_CORRECTNESS_MAX_TOKENS, min_pass=$GEN_CORRECTNESS_MIN_PASS, budget=${GEN_PROBE_TIMEOUT}s) ..."

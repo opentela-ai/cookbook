@@ -6,6 +6,12 @@ sparse-MLA forward through the gfx942 HIP kernel ``vk_hip_dsa_sparse_fwd``
 added to the ``vkernels`` library by PR #52 (closes the tilelang/TVM
 ``FloorMod(_, 0)`` JIT abort documented in vkernels issue #51).
 
+Layout note: this file is an ENGINE DROP-IN (installed into $OVL/pylib by
+build_overlay.sh; the meta/diag/glm53 dispatcher's patch_dsa_vk rebinds
+sglang's dsa_backend to it lazily at the first DSA forward). It stays in
+the recipe dir next to build_overlay.sh; everything reusable or
+diagnostic lives in meta/diag/glm53.
+
 WHY THIS EXISTS
 ---------------
 GLM-5.3-Flash runs DeepseekSparseAttn (DSA) with ``qk_rope_head_dim = 0`` ->
@@ -142,13 +148,13 @@ def _bind_dsa_fn(lib):
     # void vk_hip_dsa_sparse_fwd(int S_q, int S_kv, int H, int dim, int tail_dim,
     #   int topk, int kv_group, int block_I, int inner_iter, float sm_scale,
     #   int return_lse, const void* q, const void* kv, const void* indices,
-    #   void* out, void* lse)
+    #   void* out, void* lse, void* stream)
     fn.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
         ctypes.c_int,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # stream
     ]
     fn.restype = None
     return fn
@@ -196,7 +202,8 @@ def tilelang_sparse_fwd(
 
     See the module docstring for the full contract. Mirrors the public
     signature of ``sglang.kernels.ops.attention.dsa.tilelang_sparse_fwd``
-    so ``sitecustomize.py`` can rebind that name to this function.
+    so the meta/diag/glm53 dispatcher (patch_dsa_vk) can rebind that name
+    to this function.
     """
     # --- shape/dtype contract (match the tilelang wrapper's asserts) ---
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3, (
@@ -225,7 +232,7 @@ def tilelang_sparse_fwd(
         raise RuntimeError(
             "vkernels_dsa.tilelang_sparse_fwd requires gfx942 (MI300A); "
             f"current device is not gfx942 (gcn={getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '?')}). "
-            "sitecustomize.py should only patch on gfx942."
+            "patch_dsa_vk (meta/diag/glm53) should only patch on gfx942."
         )
 
     # --- pick the kernel's group-tiling (mirrors vk_dsa_config / dsa_config_for) ---
@@ -266,10 +273,9 @@ def tilelang_sparse_fwd(
     # buffer avoids any NULL-deref risk regardless of the guard.
     lse = torch.empty((1, S_q, num_heads), dtype=torch.float32, device=q.device)
 
-    # --- stream-correct launch (see module docstring): synchronize before
-    #     (input q/kv from sglang's compute stream are done) and after
-    #     (stream-0 kernel output is done before sglang reads it) ---
-    torch.cuda.synchronize()
+    # Launch on the current HIP stream (the capture stream during
+    # cuda-graph capture) so no host sync is needed — same-stream kernels
+    # are ordered, and the graph replays the launch in-stream.
     fn = _bind_dsa_fn(lib)
     fn(
         ctypes.c_int(S_q), ctypes.c_int(S_kv), ctypes.c_int(num_heads),
@@ -279,8 +285,8 @@ def tilelang_sparse_fwd(
         ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(kv.data_ptr()),
         ctypes.c_void_p(indices.data_ptr()),
         ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(lse.data_ptr()),
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
     )
-    torch.cuda.synchronize()
 
     if return_lse:
         return out, lse
@@ -308,12 +314,13 @@ def _bind_dsa_topk_fn(lib):
     # void vk_hip_dsa_topk_logits(int batch_size, int num_heads, int head_dim,
     #   int block, int max_table_len, int max_seq_len, int split_kv,
     #   const void* q_fp8, const void* kvcache_u8, const void* weight,
-    #   const void* seq_lens, const void* page_table, void* out)
+    #   const void* seq_lens, const void* page_table, void* out, void* stream)
     fn.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,  # stream
     ]
     fn.restype = None
     return fn
@@ -367,7 +374,7 @@ def tilelang_fp8_paged_mqa_logits(
         "clean_logits=False (the tilelang wrapper asserts the same)."
     )
 
-    # Device guard (only on gfx942; sitecustomize.py only patches there).
+    # Device guard (only on gfx942; patch_dsa_vk only patches there).
     if not _supports_current_device():
         raise RuntimeError(
             "vkernels_dsa.tilelang_fp8_paged_mqa_logits requires gfx942 (MI300A); "
@@ -411,10 +418,9 @@ def tilelang_fp8_paged_mqa_logits(
     if not page_table.is_contiguous():
         page_table = page_table.contiguous()
 
-    # stream-correct launch (see module docstring): the C kernel launches on
-    # HIP stream 0; synchronize before (inputs from sglang's compute stream
-    # are done) and after (stream-0 output is done before sglang reads it).
-    torch.cuda.synchronize()
+    # Launch on the current HIP stream (the capture stream during
+    # cuda-graph capture) so no host sync is needed — same-stream kernels
+    # are ordered, and the graph replays the launch in-stream.
     lib = _get_lib()
     fn = _bind_dsa_topk_fn(lib)
     fn(
@@ -425,7 +431,7 @@ def tilelang_fp8_paged_mqa_logits(
         ctypes.c_void_p(q_fp8.data_ptr()), ctypes.c_void_p(kvcache_u8.data_ptr()),
         ctypes.c_void_p(weight.data_ptr()), ctypes.c_void_p(seq_lens.data_ptr()),
         ctypes.c_void_p(page_table.data_ptr()), ctypes.c_void_p(logits.data_ptr()),
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
     )
-    torch.cuda.synchronize()
 
     return logits

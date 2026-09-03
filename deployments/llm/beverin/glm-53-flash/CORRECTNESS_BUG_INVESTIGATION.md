@@ -122,3 +122,78 @@ v_head_dim==256, qk_rope_head_dim==0 -> no GQA), so a per-request PyTorch SDPA
 ragged loop is a **correct drop-in** for the full-MHA path. On beverin, if DSA
 or MHC kernels are the bug, a torch/SDPA reference gives the correct answer
 (slower, no sparse savings) — the same fix shape as clariden.
+
+## In-progress: per-layer residual bisect (LSTAT) — Aug 31 ~18:00
+
+Goal: find the FIRST layer whose residual goes bad (abs_mean explodes/collapses/
+NaN) on a real beverin forward — names the broken kernel family (KDA-layer-0 vs
+DSA-layer-3 vs MoE-layer-4) with NO reference needed.
+
+- PATCH: `/tmp/glm53_layer_stats_patch.py` added `[LSTAT]` IN/OUT prints (rank 0,
+  first forward only, try/except-wrapped so it can never break the forward) to
+  `Glm5NextModel.forward` layer loop (glm5_next.py:1135). Applied to beverin at
+  `.../overlay/sgl-workspace/sglang/python/sglang/srt/models/glm5_next.py`
+  (bak: `.bak_lstats`).
+- KEY GOTCHA: the engine is launched `srun --environment=sglang-rocm bash
+  engine.sh`. `--environment=sglang-rocm` REPLACES PYTHONPATH with the
+  CONTAINER's `/sgl-workspace/sglang/python` (sglang 0.5.16, NO Glm5Next class,
+  rejects `--bf16-gemm-backend torch`). The OVERLAY (`0.0.0.dev1`, HAS
+  Glm5NextForConditionalGeneration -> glm5_next.py + accepts `torch`) must be
+  forced INLINE: `srun --environment=sglang-rocm env PYTHONPATH=<overlay> bash
+  engine.sh` (an `export PYTHONPATH` in the sbatch does NOT survive). Verified
+  by precheck: `sglang.__file__` = overlay, `glm5_next.py` LSTAT_count=2.
+- JOB 616115 on beverin (nid002964), 1h, TP4/EP4, identical backends to the
+  broken engine (dsa-prefill/decode=tilelang, dsa-topk=torch, moe=triton,
+  mamba=triton, bf16-gemm=torch, kv=bf16, cuda-graph OFF, skip-warmup) +
+  GLM53_LAYER_STATS=1, port 30001 (no otela head). Sbatch auto-probes
+  "The capital of France is" max_tokens=8 on /v1/models ready, greps [LSTAT].
+- Next: read `[LSTAT]` lines from `lstat_engine.log` / `lstat_job_*.out`;
+  the first layer where abs_mean/NaN jumps is the culprit family. Then a
+  targeted isolated/SDPA test confirms the exact kernel.
+
+### KEY GATE: SGLANG_USE_AITER -> page_size -> reproduces ' 1 ' (Aug 31 ~18:47)
+
+LSTAT job 616115 CRASHED before the layer loop — NOT the garbage bug. Root cause:
+- `dsa_backend.py:~1344` asserts `use_kpool = get_dsa_index_kpool(cfg) > 1` requires
+  `real_page_size == 64`. GLM-5.3-Flash HF config has `index_kpool=4` (no env
+  override; `get_dsa_index_kpool = getattr(config,'index_kpool',1)`).
+- `aiter_can_use_preshuffle_paged_mqa()` (dsa/utils.py) sets page_size: True -> 64
+  (preshuffle), False -> 1 (legacy). Gated by `SGLANG_USE_AITER` FIRST, then
+  `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` OR Triton>=3.5 (beverin has 3.6.0).
+- The REGISTERED `sglang-rocm` EDF hardcodes `SGLANG_USE_AITER=0` (live check
+  confirmed). EDF values OVERRIDE sbatch `export` (GLM53_* survive because the
+  EDF doesn't list them; SGLANG_USE_AITER=1 from `export` was clobbered to 0).
+  => page_size=1 => kpool>1 + page_size=1 => `AssertionError: kpool path
+  requires page_size == 64` at `init_forward_metadata`, BEFORE the layer loop
+  (no forward, no [LSTAT], empty probe body).
+- FIX (inline, post-EDF, same pattern as PYTHONPATH):
+  `srun --environment=sglang-rocm env PYTHONPATH="$PP" SGLANG_USE_AITER=1
+  AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1 bash engine.sh` -> log shows
+  `Setting page size to 64 for DeepSeek DSA.` (job 616424). This is the SAME
+  config the broken ' 1 ' engine used, so the forward will now RUN and [LSTAT]
+  will fire per-layer. (AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1 is belt-and-
+  suspenders; Triton 3.6 alone would suffice once SGLANG_USE_AITER=1.)
+- NOTE glm52 contrast: GLM-5.2 page_size=64 DEADLOCKS (100% GPU); GLM-5.3
+  page_size=64 RUNS but gives garbage ' 1 ' -> points at the aiter preshuffle
+  paged-MQA / kpool gather (or tilelang DSA prefill) producing WRONG output on
+  gfx942, not a hang.
+
+## Harness reorg (Sep 1) — bisect tooling moved to meta/diag/glm53
+
+The LSTAT inline patch above was superseded by the first-forward component
+capture, and the whole bisect harness now lives ONE level up in the cookbook:
+`<cookbook>/meta/diag/glm53/` (see its README.md). One copy serves both
+beverin and clariden; recipes point at it via `GLM53_DIAG_DIR`.
+
+- `sitecustomize.py` here is now a thin DISPATCHER (~40 lines): it imports the
+  individual patch modules (`patch_dsa_vk`, `patch_topk_torch`, `fwd_probe`,
+  `patch_dsa_sdpa`) and, on `GLM53_COMP_CAPTURE=1`, `comp_capture` — all from
+  `$GLM53_DIAG_DIR`. Engine drop-ins stay here: `vkernels_dsa.py`,
+  `vkernels_dsa_topk.py` (installed into $OVL/pylib by build_overlay.sh).
+- `comp_capture.py` / `capture_probe.py` / `comp_diff.py` (canonical, with the
+  input_ids identity check) are in `meta/diag/glm53/`; the ad-hoc
+  `analyze_bisect.py` / `diff_layers.py` / `probe_live*.py` / `_run_probe.sh`
+  were folded into `comp_diff.py summary` and `live_probe.py` respectively
+  (pre-deletion copies: ~/glm53-cleanup-backup-20260901).
+- Clariden's sbatch heredoc now imports `comp_capture` from `$GLM53_DIAG_DIR`
+  (no more hardcoded beverin path, no more GLM53_COMP_PYLIB).

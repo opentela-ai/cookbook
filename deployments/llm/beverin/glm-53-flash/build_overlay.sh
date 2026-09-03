@@ -56,15 +56,16 @@ for p in "$PATCH_DIR"/tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch
   # failure (FAILED / can't find file) would have printed above.
 done
 
-# 1c. Install the PR #52 DSA-vkernels shim (sitecustomize.py + vkernels_dsa.py)
-#     onto $OVL/pylib, which the sglang-rocm EDF prepends FIRST on PYTHONPATH
-#     (sglang-rocm.toml [env]). sitecustomize.py is auto-imported by CPython at
-#     startup (before any sglang import) and, on gfx942, rebinds sglang's DSA
-#     tilelang_sparse_fwd -> vkernels_dsa.tilelang_sparse_fwd (a ctypes adapter
-#     for vk_hip_dsa_sparse_fwd in libvkernels_hip.so), bypassing the
-#     tilelang/TVM FloorMod(_, 0) JIT abort (vkernels issue #51, the job-612262
-#     blocker). VKERNELS_DIR (exported by the sbatch) points the adapter at the
-#     rebuilt .so. Mirrors the Kimi-K3 recipe's $K3/home/pylib/sitecustomize.py.
+# 1c. Install the PR #52 DSA-vkernels shim onto $OVL/pylib, which the
+#     sglang-rocm EDF prepends FIRST on PYTHONPATH (sglang-rocm.toml [env]).
+#     sitecustomize.py is the thin DISPATCHER: the actual patch modules live
+#     in <cookbook>/meta/diag/glm53 (exported to the engine as GLM53_DIAG_DIR
+#     by the sbatch) so beverin and clariden share ONE copy. vkernels_dsa.py
+#     is auto-imported by the dispatcher's patch_dsa_vk at the first DSA
+#     forward; vkernels_dsa_topk.py backs the GLM53_TOPK_TRANSFORM_BACKEND=
+#     torch bridge (vkernels #56). VKERNELS_DIR (exported by the sbatch)
+#     points the adapter at the rebuilt .so. Mirrors the Kimi-K3 recipe's
+#     $K3/home/pylib/sitecustomize.py.
 mkdir -p "$OVL/pylib"
 cp -f "$PATCH_DIR/sitecustomize.py" "$PATCH_DIR/vkernels_dsa.py" "$PATCH_DIR/vkernels_dsa_topk.py" "$OVL/pylib/"
 # The self-contained CPU test for the torch top-k bridge (run manually inside

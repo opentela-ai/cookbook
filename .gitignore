@@ -25,5 +25,11 @@ __pycache__/
 *.pyc
 test_llm.py
 
+# Slurm/killer job logs dropped next to recipes by captured-output runs
+# (e.g. glm53-otela-*.txt, *.out): they are per-job noise; job logs live in
+# Slurm's spool, campaign artifacts in /capstor scratch.
+*.out
+glm53-*.txt
+
 # Core dumps from crashed jobs on HPC nodes (nid*)
 core_*

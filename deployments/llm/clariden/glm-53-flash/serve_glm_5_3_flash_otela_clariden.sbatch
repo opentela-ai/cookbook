@@ -147,6 +147,10 @@ unset _edf_dir _cand
 # imported image, EDF cache dirs, and a warm Triton cache live here, so a
 # fresh submit does not re-pull or re-JIT from cold.
 export DEPLOY_DIR="${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash}"
+# Shared GLM-5.3 diagnostic harness (comp_capture/capture_probe/comp_diff).
+# Lives in the cookbook checkout so beverin and clariden run the IDENTICAL
+# copies (one source of truth — no cross-site path hardcoding).
+export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "$SCRIPT_DIR/../../../.." && pwd)/meta/diag/glm53}"
 export IMAGE="${IMAGE:-$DEPLOY_DIR/images/sglang-glm-5.3-flash.aarch64.sqsh}"
 # Weights on /capstor/scratch (verified fast metadata; the /capstor/store MDT
 # was overloaded during download, so the canonical HF cache move was deferred
@@ -644,6 +648,24 @@ except Exception as _e2:
     import sys
     sys.stderr.write(
         f"[sitecustomize] _forward_standard_mha FA3-safe patch skipped: {_e2!r}\n")
+
+# --- comp_capture (GLM53_COMP_CAPTURE=1): beverin-vs-clariden bisect --------
+# Shared harness in $GLM53_DIAG_DIR (<cookbook>/meta/diag/glm53, exported by
+# this sbatch): the SAME copy of comp_capture.py runs on beverin (via its
+# sitecustomize dispatcher) and here — the identical-capture guarantee.
+try:
+    import os as _os_cc
+    if _os_cc.environ.get("GLM53_COMP_CAPTURE", "0") == "1":
+        import sys as _sys_cc
+        _cc = _os_cc.environ.get("GLM53_DIAG_DIR", "")
+        if not _cc:
+            raise RuntimeError("GLM53_DIAG_DIR not set (this sbatch exports it)")
+        if _cc not in _sys_cc.path:
+            _sys_cc.path.insert(0, _cc)
+        import comp_capture  # noqa: F401  (self-installing)
+except Exception as _exc_cc:
+    import sys as _sys_cc2
+    _sys_cc2.stderr.write(f"[sitecustomize] comp_capture import failed: {_exc_cc!r}\n")
 PYEOF
 export PATCH_DIR
 
@@ -848,6 +870,21 @@ ENGINE_CMD=(python -m sglang.launch_server
   --enable-metrics --uvicorn-access-log-exclude-prefixes /metrics /health
   --host 0.0.0.0 --port "$SERVE_PORT")
 
+# --- capture/diagnostic knobs (capture runs ONLY; see header TODO note) -----
+# DISABLE_CUDA_GRAPH=1: forward hooks must see REAL kernel output — during
+#   decode-graph capture the module outputs are placeholder tensors never
+#   written (the bisect_layers_v1/beverin lesson; jobs 617522/619846).
+# SKIP_SERVER_WARMUP=1: sglang's warmup generation would otherwise be the
+#   first >=MIN_TOKENS forward on clariden while beverin (which always skips
+#   warmup) never sees it — the cross-machine capture must land on the SAME
+#   gen_correctness request on BOTH machines.
+if [ "${DISABLE_CUDA_GRAPH:-0}" = "1" ]; then
+  ENGINE_CMD+=(--disable-cuda-graph)
+fi
+if [ "${SKIP_SERVER_WARMUP:-0}" = "1" ]; then
+  ENGINE_CMD+=(--skip-server-warmup)
+fi
+
 # GLM-5.3 reasoning + tool-call parsers (cookbook: glm45 / glm47).
 # NOTE: this sglang build has NO --enable-auto-tool-choice (that's a vLLM
 # flag); tool_choice is handled per-request. Just the two parser flags.
@@ -1023,6 +1060,20 @@ trap 'stop_otela' EXIT TERM INT
     sleep 20
   done
   echo "[$(date -Is)] engine healthy (head=$HEAD_IP:$SERVE_PORT) after ~$((HEALTH_TIMEOUT - (deadline - SECONDS)))s"
+
+  # --- capture probe (GLM53_CAPTURE_PROBE=1): fire ONE deterministic ~2k-token
+  # request BEFORE the gen probe so comp_capture (GLM53_COMP_MIN_TOKENS=1200)
+  # lands on THIS forward identically on beverin and clariden (init profile
+  # forwards are machine-dependent: 1-token dummy vs bs=9).
+  if [ "${GLM53_CAPTURE_PROBE:-0}" = "1" ]; then
+    echo "[$(date -Is)] capture probe (deterministic long-prompt prefill) ..."
+    timeout 900 \
+      srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
+           -w "$HEAD" --environment="$OTELA_EDF_NAME" \
+           python3 "$GLM53_DIAG_DIR/capture_probe.py" \
+               "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
+      || echo "[$(date -Is)] capture probe FAILED (rc=$?); continuing" >&2
+  fi
 
   if [ "$GEN_PROBE" = "1" ]; then
     echo "[$(date -Is)] generation ${GEN_CORRECTNESS_SMOKE:+smoke }probe (model=$SERVED_MODEL_NAME, max_tokens=$GEN_CORRECTNESS_MAX_TOKENS, min_pass=$GEN_CORRECTNESS_MIN_PASS, budget=${GEN_PROBE_TIMEOUT}s) ..."
