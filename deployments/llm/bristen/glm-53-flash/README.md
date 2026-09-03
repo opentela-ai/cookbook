@@ -84,6 +84,19 @@ The recipe side is prototyped here:
   fallbacks replicating the tilelang/DeepGEMM semantics
   (`relu(q·k)·w` head-sum × `k_scale`, paged `col = table_idx*64 + j`).
   No-op on non-SM80; `SGLANG_SM80_DG_SHIM_DISABLE=1` vetoes.
+- `patched_sources/sglang/kernels/ops/attention/dsa/triton_kernel.py` —
+  **job-83091 wall**: the 2-node PP2 server booted, loaded FP8 weights and
+  served `/health` + prefill, but the first decode died in
+  `forward_absorb_prepare → indexer → act_quant` — `_act_quant_kernel`
+  stores through `*fp8e4nv` pointers, which Triton cannot JIT on SM80
+  (`type fp8e4nv not supported in this architecture`; same crash had killed
+  82822 after its prefill). The patched `act_quant` dispatches SM80 to a
+  pure-torch equivalent (`_act_quant_sm80`) with the kernel's exact semantics
+  (fp32 math, `amax` clamp `1e-4`, `scale = amax/448` or pow2-ceiling
+  `round_scale`, RTNE e4m3 store — torch's software fp8 casts have no arch
+  requirement, probed on-node) and the same shapes/dtypes; consumers
+  dequantize via `y*s`, so it is drop-in. `SGLANG_SM80_ACT_QUANT_DISABLE=1`
+  vetoes.
 - Local validation (`tests_local/test_dsa_kpool_wiring.py`, CPU-only,
   torch-cpu + triton, via the vkernels pure-Python fallback) — T0–T8 all
   green: the native path matches an **independent** torch re-implementation
@@ -103,7 +116,10 @@ The recipe side is prototyped here:
   Shim check (T8): both torch logits fallbacks match a per-element loop
   reference of the DeepGEMM/tilelang semantics, including the page-table
   column mapping, the −1e30 fill for unwritten paged columns, and ragged
-  `clean_logits` masking.
+  `clean_logits` masking. act_quant check (T9): the SM80 torch fallback is
+  **byte-equal** (fp8 payload + scale) to an op-for-op emulation of the
+  Triton `_act_quant_kernel` for 3 shapes × both `scale_fmt` variants, with
+  the zero-guard/clamp/contiguity contract verified.
 
 Remaining before a bristen go/no-go (mirrors the vkernels#60 acceptance list):
 
@@ -146,7 +162,7 @@ SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_5
 | `serve_glm_53_flash_sglang.sbatch` | Slurm batch: container setup, preflight, SGLang engine, generation probe |
 | `engine.sh` | Per-rank SGLang launcher (args, MoE/FP8 backend selection, DSA override) |
 | `apply_sm80_patch.sh` | Copy the Beverin overlay and apply the SM80 FP8→bf16 compute patches |
-| `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py`, `fused_moe_triton_kernels.py`, and `srt/layers/attention/dsa/kpool_fp8_index.py` (vkernels #60 kpool bridge: legacy fp8+scale store, bf16 native path) |
+| `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py`, `fused_moe_triton_kernels.py`, `srt/layers/attention/dsa/kpool_fp8_index.py` (vkernels #60 kpool bridge: legacy fp8+scale store, bf16 native path), and `kernels/ops/attention/dsa/triton_kernel.py` (SM80 `act_quant` torch fallback — job-83091 decode wall) |
 | `patched_sources/sitecustomize.py` | SM80 `deep_gemm` logits shim (paged + ragged torch fallbacks), auto-imported from `patches_full` |
 | `tests_local/test_dsa_kpool_wiring.py` | CPU-only validation of the vkernels #60 kpool wiring + deep_gemm shim (see below) |
 | `preflight.py` | In-container import test for the GLM-5.3 overlay |

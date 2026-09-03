@@ -41,6 +41,11 @@ f5bed255), NOT from the vkernels code, so agreement is meaningful.
       semantics (relu(q.k)*w summed over heads, x k_scale), including the
       page-table column mapping (col = table_idx*64 + j), the -1e30 fill for
       unwritten paged columns, and the ragged clean_logits masking.
+  T9  act_quant SM80 fallback (patched triton_kernel.py): torch fp8+scale
+      quantize byte-equal to an independent emulation of _act_quant_kernel
+      (amax clamp 1e-4, scale = absmax/448 or pow2-ceiling round_scale, RTNE
+      e4m3 store), exact shape/dtype contract, zero-guard and clamp behavior,
+      2-D/3-D/multi-block shapes -- the decode-path wall of jobs 82822/83091.
 """
 
 import importlib.util
@@ -58,6 +63,7 @@ sys.path.insert(0, str(COOKBOOK / "third_party" / "vkernels" / "src" / "python")
 
 PATCHED = RECIPE / "patched_sources" / "sglang" / "srt" / "layers" / "attention" / "dsa" / "kpool_fp8_index.py"
 ORIGINAL = COOKBOOK / "third_party" / "sglang" / "python" / "sglang" / "srt" / "layers" / "attention" / "dsa" / "kpool_fp8_index.py"
+TRITON_KERNEL_PATCHED = RECIPE / "patched_sources" / "sglang" / "kernels" / "ops" / "attention" / "dsa" / "triton_kernel.py"
 
 HEAD = 128
 SENTINEL = 999.0
@@ -628,6 +634,71 @@ def t8_shim_logits():
     print("  T8 deep_gemm shim (paged + ragged torch fallbacks vs loop ref): OK")
 
 
+def t9_act_quant_sm80():
+    """The patched triton_kernel.act_quant SM80 fallback vs an independent
+    emulation of _act_quant_kernel (the decode wall of jobs 82822/83091:
+    forward_absorb_prepare -> act_quant -> fp8e4nv ValueError). Byte-equal
+    fp8 payloads and scales for both round_scale variants, exact shape/dtype
+    contract, zero-guard, clamp and contiguity behavior."""
+
+    def _act_quant_ref(x_r, round_scale=False):
+        # op-for-op from the Triton kernel source: fp8_max_inv = 1/448, the
+        # kernel MULTIPLIES by the reciprocal (never divides), amax clamp
+        # 1e-4, round_scale = pow2 ceiling of (amax * fp8_max_inv).
+        fp8_max_inv = 1.0 / 448.0
+        amax = torch.clamp(x_r.abs().amax(dim=-1, keepdim=True), min=1e-4)
+        if round_scale:
+            scale = torch.exp2(torch.ceil(torch.log2(amax * fp8_max_inv)))
+        else:
+            scale = amax * fp8_max_inv
+        q = torch.clamp(x_r / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
+        return q, scale
+
+    mod = load_module("triton_kernel_sm80_patched", TRITON_KERNEL_PATCHED)
+    src = TRITON_KERNEL_PATCHED.read_text()
+    assert "SGLANG_SM80_ACT_QUANT_DISABLE" in src, "SM80 veto env missing"
+    assert "get_device_capability" in src, "arch gate missing"
+    assert "_act_quant_sm80(x, block_size, scale_fmt)" in src, "dispatch missing"
+
+    g = torch.Generator().manual_seed(11)
+    for shape in [(5, 3, 128), (7, 128), (1, 4, 256)]:  # decode 3-D, 2-D, 2 blocks
+        x = (torch.randn(*shape, generator=g) * 3.0).contiguous()
+        x_r = x.view(*shape[:-1], -1, 128)
+        for fmt in (None, "ue8m0"):
+            y, s = mod._act_quant_sm80(x, 128, fmt)
+            assert y.dtype == torch.float8_e4m3fn and y.shape == x.shape, (shape, fmt)
+            assert s.dtype == torch.float32, (shape, fmt)
+            assert s.shape == (*shape[:-1], shape[-1] // 128), (shape, fmt)
+            q_ref, s_ref = _act_quant_ref(x_r.float(), round_scale=fmt is not None)
+            assert torch.equal(y.view_as(x_r).view(torch.uint8),
+                               q_ref.view(torch.uint8)), (shape, fmt)
+            assert torch.equal(s, s_ref.reshape(s.shape)), (shape, fmt)
+            deq = (y.view_as(x_r).float() * s.unsqueeze(-1)).view(x.shape)
+            rel = ((deq - x).abs() / x.abs().clamp(min=1e-3)).max().item()
+            assert rel < 0.08, (shape, fmt, rel)  # half-ulp e4m3 ~ 2^-4 for normals
+
+    # zero guard: all-zero rows keep a positive scale (kernel clamps 1e-4)
+    x0 = torch.zeros(2, 128)
+    x0[0, 0] = 1.0
+    y0, s0 = mod._act_quant_sm80(x0, 128, None)
+    assert (s0 > 0).all() and float(y0[1].float().abs().max()) == 0.0
+
+    # clamp: |y| <= 448 by construction (amax/scale == 448 for scale_fmt=None)
+    big = torch.randn(3, 2, 128, generator=g) * 100.0
+    yb, _ = mod._act_quant_sm80(big, 128, None)
+    assert yb.float().abs().max().item() <= 448.0
+
+    # contiguity contract matches the original kernel
+    try:
+        mod._act_quant_sm80(torch.randn(4, 256, generator=g).t(), 128, None)
+        raise SystemExit("non-contiguous input must raise")
+    except AssertionError:
+        pass
+
+    print("  T9 act_quant SM80 (torch fallback == Triton-kernel emulation, "
+          "bytes+scale, 3 shapes x 2 scale_fmts, guards): OK")
+
+
 def main():
     os.environ["VKERNELS_DSA_KPOOL_FORCE"] = "1"
     print(f"cookbook root: {COOKBOOK}")
@@ -651,8 +722,10 @@ def main():
     t6_assemble_bridge(patched, c)
     t7_decode_bridge(patched, cd)
     t8_shim_logits()
+    t9_act_quant_sm80()
     print("\nALL TESTS PASSED -- vkernels#60 dsa_kpool wiring (native + legacy-"
-          "layout bridge) and the SM80 deep_gemm shim are semantically sound.")
+          "layout bridge), the SM80 deep_gemm shim and the SM80 act_quant "
+          "fallback are semantically sound.")
 
 
 if __name__ == "__main__":

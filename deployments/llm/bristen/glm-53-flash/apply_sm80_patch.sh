@@ -38,6 +38,14 @@ mkdir -p "$PATCH_DIR/sglang/srt/layers/attention/dsa"
 cp "$SCRIPT_DIR/patched_sources/sglang/srt/layers/attention/dsa/kpool_fp8_index.py" \
    "$PATCH_DIR/sglang/srt/layers/attention/dsa/kpool_fp8_index.py"
 
+# SM80 act_quant for the DSA indexer decode path: _act_quant_kernel stores
+# through *fp8e4nv pointers (Hopper+ only in Triton) and killed jobs 82822/
+# 83091 at forward_absorb_prepare -> act_quant on the first decode. The
+# patched act_quant dispatches SM80 to a torch equivalent (software fp8
+# casts, same fp8+scale bytes/shapes).
+cp "$SCRIPT_DIR/patched_sources/sglang/kernels/ops/attention/dsa/triton_kernel.py" \
+   "$PATCH_DIR/sglang/kernels/ops/attention/dsa/triton_kernel.py"
+
 # sitecustomize: on SM80, rebind deep_gemm's fp8_paged_mqa_logits /
 # fp8_mqa_logits / get_paged_mqa_logits_metadata (SM90+-only JIT) to pure-
 # torch fallbacks for the DSA-indexer prefill/decode logits. No-op elsewhere
