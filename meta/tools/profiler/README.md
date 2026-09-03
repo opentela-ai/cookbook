@@ -1,5 +1,9 @@
 # meta/tools/profiler — kernel-level performance toolkit
 
+> Agent skill: **`.agents/skills/profile-kernel-bottleneck/SKILL.md`** — the
+> orchestration layer over this toolkit (when to profile, what each verdict
+> prescribes). This README stays the canonical deep-dive.
+
 The perf-side sibling of [`meta/tools/debugger/`](../debugger/): the debugger
 answers *why is the output wrong*, this toolkit answers *where do the
 milliseconds go* — utilization, per-kernel cost, and the bottleneck class of
