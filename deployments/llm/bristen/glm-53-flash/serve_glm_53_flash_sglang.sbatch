@@ -131,7 +131,11 @@ export SMOKE="${SMOKE:-1}"
 
 # --- OpenTela ---------------------------------------------------------------
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela}"   # x86_64 build
+# Official release v0.2.4 (commit 6c8574d, built 2026-08-25) — has --role,
+# service-policy-v2, TLS, and a default --bootstrap.source that already
+# includes http://140.238.223.116:8092/v1/dnt/bootstraps (this head).
+# The pre-existing $OTELA_DIR/otela is a custom sai-v0.0.6 build kept as fallback.
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-v0.2.4}"
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 export OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
@@ -274,19 +278,22 @@ chmod +x "$RUNDIR/engine.sh"
     echo "[$(date -Is)] starting otela worker on $HEAD for $SERVED_MODEL_NAME bootstrap=$OTELA_RELAY_ADDR"
     srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --export=ALL "${CONTAINER_OPTS[@]}" \
-      # otela v0.0.6 (commit f8088e1) has NO --service.type / --service.llm.
-      # endpoint / --api-port flags, and --subprocess STARTS an LLM (not
-      # register existing). sglang is already up on :SERVE_PORT (engine.sh),
-      # so register the running endpoint: --service.name llm triggers auto
+      # Official otela v0.2.4: --service.type / --service.llm.endpoint /
+      # --api-port do NOT exist (never did — original script was never
+      # runnable), and --subprocess STARTS an LLM instead of registering an
+      # existing one. sglang is already up on :SERVE_PORT (engine.sh), so
+      # register the running endpoint: --service.name llm triggers auto
       # model=<id> identity groups from /v1/models; --label pins the routing
-      # identity pre-/v1/models; --tcpport/--udpport are one word. In-container
-      # only /capstor is mounted (NOT /users), so the worker wallet at
-      # ~/.config/opentela is unreachable -> run anonymous (--account.wallet
-      # ""); the head (QmTtn) accepts anonymous providers. otela_cfg.yaml
-      # (in $DEPLOY_DIR, /capstor-mounted) pins the worker HTTP API port
-      # (18092) + loglevel debug + solana.skip_verification.
+      # identity pre-/v1/models; --role worker designates this node
+      # (v0.2.4 splits mode=cluster-topology from role=this-node);
+      # --tcpport/--udpport are one word. In-container only /capstor is
+      # mounted (NOT /users), so the worker wallet at ~/.config/opentela is
+      # unreachable -> run anonymous (--account.wallet ""); the head (QmTtn)
+      # accepts anonymous providers (solana.skip_verification in cfg).
+      # otela_cfg.yaml (in $DEPLOY_DIR, /capstor-mounted) pins the worker
+      # HTTP API port (18092) + loglevel debug + solana.skip_verification.
       "$OTELA_BIN" start --config "$DEPLOY_DIR/otela_cfg.yaml" \
-        --mode node --service.name "$OTELA_SERVICE_NAME" --service.port "$SERVE_PORT" \
+        --role worker --service.name "$OTELA_SERVICE_NAME" --service.port "$SERVE_PORT" \
         --label "model=$SERVED_MODEL_NAME" \
         --bootstrap.static "$OTELA_RELAY_ADDR" \
         --tcpport "$OTELA_TCP_PORT" --udpport "$OTELA_UDP_PORT" \
