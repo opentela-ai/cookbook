@@ -61,6 +61,8 @@ SGLANG_ARGS=(
   --watchdog-timeout "$WATCHDOG_TIMEOUT"
   --dist-timeout "$DIST_TIMEOUT"
   --enable-metrics
+  --reasoning-parser glm45
+  --tool-call-parser glm47
   --quantization fp8
 )
 
