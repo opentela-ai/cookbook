@@ -274,13 +274,23 @@ chmod +x "$RUNDIR/engine.sh"
     echo "[$(date -Is)] starting otela worker on $HEAD for $SERVED_MODEL_NAME bootstrap=$OTELA_RELAY_ADDR"
     srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --export=ALL "${CONTAINER_OPTS[@]}" \
-      "$OTELA_BIN" start --mode node --subprocess \
-        --service.type llm --service.name "$OTELA_SERVICE_NAME" \
-        --service.llm.endpoint "http://127.0.0.1:$SERVE_PORT" \
+      # otela v0.0.6 (commit f8088e1) has NO --service.type / --service.llm.
+      # endpoint / --api-port flags, and --subprocess STARTS an LLM (not
+      # register existing). sglang is already up on :SERVE_PORT (engine.sh),
+      # so register the running endpoint: --service.name llm triggers auto
+      # model=<id> identity groups from /v1/models; --label pins the routing
+      # identity pre-/v1/models; --tcpport/--udpport are one word. In-container
+      # only /capstor is mounted (NOT /users), so the worker wallet at
+      # ~/.config/opentela is unreachable -> run anonymous (--account.wallet
+      # ""); the head (QmTtn) accepts anonymous providers. otela_cfg.yaml
+      # (in $DEPLOY_DIR, /capstor-mounted) pins the worker HTTP API port
+      # (18092) + loglevel debug + solana.skip_verification.
+      "$OTELA_BIN" start --config "$DEPLOY_DIR/otela_cfg.yaml" \
+        --mode node --service.name "$OTELA_SERVICE_NAME" --service.port "$SERVE_PORT" \
         --label "model=$SERVED_MODEL_NAME" \
         --bootstrap.static "$OTELA_RELAY_ADDR" \
-        --tcp-port "$OTELA_TCP_PORT" --udp-port "$OTELA_UDP_PORT" \
-        --api-port "$OTELA_API_PORT" --seed "$OTELA_SEED" \
+        --tcpport "$OTELA_TCP_PORT" --udpport "$OTELA_UDP_PORT" \
+        --seed "$OTELA_SEED" --account.wallet "" \
         >"$RUNDIR/otela_${SLURM_JOB_ID:-$$}.log" 2>&1 &
     OTELA_PID=$!
     echo "[$(date -Is)] otela pid=$OTELA_PID log=$RUNDIR/otela_${SLURM_JOB_ID:-$$}.log"

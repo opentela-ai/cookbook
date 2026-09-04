@@ -1,0 +1,32 @@
+# Bristen (A100) OpenTela worker config for GLM-5.3-Flash. Used by the
+# SMOKE=0 path in serve_glm_53_flash_sglang.sbatch.
+#
+# In-container only /capstor is mounted (NOT /users), so the worker wallet at
+# ~/.config/opentela is unreachable -> the worker runs ANONYMOUSLY via
+# --account.wallet "" on the CLI. The head (QmTtn @ 140.238.223.116:43905,
+# set via --bootstrap.static) accepts anonymous providers
+# (solana.skip_verification below mirrors the head; validated job test4:
+# "Registering LLM service: ... service:[{llm ... identity_group:
+# [model=zai-org/GLM-5.3-Flash]}]").
+#
+# CLI flags in serve_glm_53_flash_sglang.sbatch OVERRIDE the matching fields
+# below (--service.name, --service.port, --label, --bootstrap.static,
+# --tcpport, --udpport, --seed). This file pins the worker HTTP API port
+# (18092, distinct from the head's 8092) and the debug log level so the
+# registration flow (peer connect -> health -> /v1/models -> register) is
+# visible in run/otela_<job>.log.
+name: bristen-glm53
+port: "18092"
+mode: node
+loglevel: debug
+cleanslate: true
+service:
+  name: llm
+  port: "30000"
+security:
+  require_signed_binary: false
+solana:
+  skip_verification: true
+bootstrap:
+  sources:
+    - "/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7"
