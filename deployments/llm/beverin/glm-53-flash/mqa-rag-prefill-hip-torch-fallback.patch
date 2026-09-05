@@ -1,0 +1,92 @@
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -1005,7 +1005,11 @@
+                 scale_out=k_scale,
+             )
+             k_fp8 = k_u8.view(torch.float8_e4m3fn)
+-            logits = deep_gemm.fp8_mqa_logits(
++            if is_hip():
++                from sglang.srt.layers.attention.dsa.kpool_hip_mqa_fallback import (
++                    hip_fp8_mqa_logits,
++                )
++                logits = hip_fp8_mqa_logits(
+                 q_fp8[:n_real].contiguous(),
+                 (k_fp8.contiguous(), k_scale.contiguous()),
+                 weights[:n_real].contiguous(),
+@@ -1013,6 +1017,16 @@
+                 ke_per_q,
+                 clean_logits=True,
+             )
++            else:
++                logits = deep_gemm.fp8_mqa_logits(
++                q_fp8[:n_real].contiguous(),
++                (k_fp8.contiguous(), k_scale.contiguous()),
++                weights[:n_real].contiguous(),
++                ks_per_q,
++                ke_per_q,
++                clean_logits=True,
++            )
++
+         else:
+             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+ 
+@@ -1119,7 +1133,20 @@
+             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
+                 torch.int32
+             )
+-            logits = deep_gemm.fp8_mqa_logits(
++            if is_hip():
++                from sglang.srt.layers.attention.dsa.kpool_hip_mqa_fallback import (
++                    hip_fp8_mqa_logits,
++                )
++                logits = hip_fp8_mqa_logits(
++                q_work,
++                (k_fp8.contiguous(), k_scale.contiguous()),
++                weights_work,
++                ks,
++                ke,
++                clean_logits=True,
++            )
++            else:
++                logits = deep_gemm.fp8_mqa_logits(
+                 q_work,
+                 (k_fp8.contiguous(), k_scale.contiguous()),
+                 weights_work,
+@@ -1127,6 +1154,7 @@
+                 ke,
+                 clean_logits=True,
+             )
++
+             pool_lens = ke
+         else:
+             logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
+@@ -1353,7 +1381,11 @@
+                     and zero_starts_by_batch[i] is not None
+                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
+                 )
+-                local_logits = deep_gemm.fp8_mqa_logits(
++                if is_hip():
++                    from sglang.srt.layers.attention.dsa.kpool_hip_mqa_fallback import (
++                        hip_fp8_mqa_logits,
++                    )
++                    local_logits = hip_fp8_mqa_logits(
+                     q_fp8[q_slice].contiguous(),
+                     (k_fp8.contiguous(), k_scale.contiguous()),
+                     weights[q_slice].contiguous(),
+@@ -1361,6 +1393,16 @@
+                     local_pool_lens,
+                     clean_logits=True,
+                 )
++                else:
++                    local_logits = deep_gemm.fp8_mqa_logits(
++                    q_fp8[q_slice].contiguous(),
++                    (k_fp8.contiguous(), k_scale.contiguous()),
++                    weights[q_slice].contiguous(),
++                    row_starts,
++                    local_pool_lens,
++                    clean_logits=True,
++                )
++
+             else:
+                 local_logits = torch.empty(
+                     (q_len, 0), dtype=torch.float32, device=q_fp8.device

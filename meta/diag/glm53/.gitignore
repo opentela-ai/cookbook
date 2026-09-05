@@ -1,0 +1,5 @@
+# Per-tensor capture artifacts written by comp_capture.py during the
+# beverin-vs-clariden layer bisect. These .pt files are large (hundreds of
+# MB) and live on /capstor scratch; the pairwise diffs (comp_diff.py /
+# diff_l0_ops.py) and CORRECTNESS_BUG_INVESTIGATION.md are the durable record.
+caps/

@@ -1,0 +1,85 @@
+diff --git a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -29,6 +29,15 @@
+ 
+ from sglang.srt.environ import envs
+ from sglang.srt.layers import deep_gemm_wrapper
++from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
++
++# ROCm (gfx942/MI300A) uses the unsigned-zero e4m3fnuz FP8 layout while
++# CUDA uses e4m3fn. The raw ``k_u8`` buffer written by the (tilelang/
++# triton) FP8 quantizer is in the platform-native layout, so it must be
++# reinterpreted with the matching dtype -- otherwise the downstream
++# index_buf_accessor Triton kernel (which asserts
++# ``index_k.dtype == float8_e4m3fnuz`` on ROCm) rejects it.
++_DSA_FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+ from sglang.srt.layers.attention.dsa.utils import (
+     cp_zigzag_full_plan_rows,
+     dsa_use_prefill_cp,
+@@ -218,7 +227,7 @@
+                 return (
+                     torch.empty(
+                         (0, self.head_dim),
+-                        dtype=torch.float8_e4m3fn,
++                        dtype=_DSA_FP8_DTYPE,
+                         device=slot_k.device,
+                     ),
+                     torch.empty((0,), dtype=torch.float32, device=slot_k.device),
+@@ -1004,7 +1013,7 @@
+                 k_out=k_u8,
+                 scale_out=k_scale,
+             )
+-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
++            k_fp8 = k_u8.view(_DSA_FP8_DTYPE)
+             if is_hip():
+                 from sglang.srt.layers.attention.dsa.kpool_hip_mqa_fallback import (
+                     hip_fp8_mqa_logits,
+@@ -1128,7 +1137,7 @@
+                 k_out=k_u8,
+                 scale_out=k_scale,
+             )
+-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
++            k_fp8 = k_u8.view(_DSA_FP8_DTYPE)
+             ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
+             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
+                 torch.int32
+@@ -1344,7 +1353,7 @@
+                             curr_k_fp8.view(torch.uint8)
+                         )
+                         k_scale[curr_pool_start:pool_seq_len].copy_(curr_k_scale)
+-                        k_fp8 = k_u8.view(torch.float8_e4m3fn)
++                        k_fp8 = k_u8.view(_DSA_FP8_DTYPE)
+                     else:
+                         k_fp8 = curr_k_fp8
+                         k_scale = curr_k_scale
+@@ -1373,7 +1382,7 @@
+                         pool_seq_len,
+                         pool_seq_len,
+                     )
+-                    k_fp8 = k_fp8.view(torch.float8_e4m3fn)
++                    k_fp8 = k_fp8.view(_DSA_FP8_DTYPE)
+                     k_scale = k_scale.view(torch.float32).squeeze(-1)
+                 row_starts = (
+                     zero_starts_by_batch[i]
+diff --git a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_hip_mqa_fallback.py b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_hip_mqa_fallback.py
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_hip_mqa_fallback.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_hip_mqa_fallback.py
+@@ -113,10 +113,15 @@
+     global _probe_fired
+ 
+     k_fp8, k_scale = k_and_scale
+-    q = q_fp8.view(torch.float8_e4m3fn)
++    # Use q_fp8 / k_fp8 with their NATIVE fp8 dtype (e4m3fnuz on ROCm,
++    # e4m3fn on CUDA) -- .to(bf16)/.to(fp32) below convert correctly
++    # from either dtype. Forcing .view(e4m3fn) here would reinterpret
++    # ROCm e4m3fnuz bytes as e4m3fn, mis-converting e4m3fnuz zeros
++    # (0x00) to subnormals and silently corrupting the fp32 oracle.
++    q = q_fp8
+     if q.dim() == 4:
+         q = q.squeeze(1)  # [Nq, H, D]
+-    k = k_fp8.view(torch.float8_e4m3fn)  # [Nk, D]
++    k = k_fp8  # [Nk, D]
+     ks = k_scale.view(torch.float32).squeeze(-1)  # [Nk]
+     w = weights.to(torch.float32)  # [Nq, H]
+     Nq, H, D = q.shape

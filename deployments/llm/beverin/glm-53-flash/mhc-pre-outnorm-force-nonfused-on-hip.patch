@@ -1,0 +1,39 @@
+--- a/sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1756,6 +1756,23 @@
+ 
+     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+     residual_3d = x.view(s, hc_mult, hidden_size)
++    # FIX (Beverin MI300A / tilelang-on-HIP, gfx942): the FUSED out-norm kernel
++    # mhc_pre_big_fuse_with_norm_tilelang produces a ~1.32x magnitude error in
++    # layer_input on MI300A (std 0.119 vs correct 0.090, max_abs 0.195, cos
++    # 0.998 -- same direction, wrong scale: the fused RMSNorm denominator is
++    # too small, so outputs are ~1.32x too large). The NON-fused kernel
++    # mhc_pre_big_fuse_tilelang is correct (matches the pure-torch reference to
++    # 1e-4), and out_norm(non-fused layer_input) matches clariden's CUDA fused
++    # output to 2e-3 / cos 1.000000 (probe_hc_pre_serverfaithful.py, jobs
++    # 621421/621438). So on ROCm, force the non-fused path (norm_weight=None)
++    # and return norm_fused=False so the MHC communicator applies
++    # out_norm(hidden_states) externally (communicator_mhc.py:104). The CUDA
++    # fused path (clariden, correct + faster) is kept. Upstream TODO: repair the
++    # mhc_pre_big_fuse_with_norm_tilelang RMSNorm epilogue on gfx942, then drop
++    # this guard. See CORRECTNESS_BUG_INVESTIGATION.md.
++    _force_nonfused = bool(torch.version.hip) and out_norm_weight is not None
++    _norm_weight = None if _force_nonfused else out_norm_weight
++    _norm_eps = None if _force_nonfused else out_norm_eps
+     post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+         residual=residual_3d,
+         fn=fn,
+@@ -1766,12 +1783,6 @@
+         hc_sinkhorn_eps=hc_eps,
+         hc_post_mult_value=post_mult_value,
+         sinkhorn_repeat=sinkhorn_iters,
+-        norm_weight=out_norm_weight,
+-        norm_eps=out_norm_eps,
+-    )
+-   hc_sinkhorn_eps=hc_eps,
+-        hc_post_mult_value=post_mult_value,
+-        sinkhorn_repeat=sinkhorn_iters,
+         norm_weight=_norm_weight,
+         norm_eps=_norm_eps,
+     )

@@ -309,8 +309,17 @@ export CTX_LEN="${CTX_LEN:-32768}"
 # reserves 104.7 GB (weights 75.9 + KV/Mamba ~29), leaving only ~14 GB/die for
 # the serving-time inductor/Triton JIT (bf16 F.linear -> triton_mm, triton_poi_fused),
 # and a second JIT round (decode shapes) OOMs with allocator fragmentation.
-# 0.80 frees ~24 GB/die headroom (weights still fit, KV/Mamba ~550K ctx, fine for smoke).
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
+# 0.80 frees ~24 GB/die GPU headroom BUT — because it is unified memory — also
+# leaves only ~20% of the pool for the 4 ranks' HOST-side structures
+# (scheduler procs, mamba state cache, detokenizer workers, KV-bookkeeping).
+# On slow cold starts (>=24 min torch-dist init + >=36 min weights at
+# ~22 s/shard) this OOMs the scheduler at init: Rank N scheduler died
+# (exit code -9 = OS OOM killer) right after `max_running_requests` is capped by
+# the mamba cache (job 621559). 0.70 restores headroom (weights still fit,
+# KV/Mamba ~550K ctx, and the mamba-cache cap drops max_running_requests to
+# ~54 anyway, so the extra GPU reservation buys nothing for a correctness
+# re-serve). Override per-deploy (e.g. GPU_MEM_UTIL=0.75 for prod).
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.70}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 

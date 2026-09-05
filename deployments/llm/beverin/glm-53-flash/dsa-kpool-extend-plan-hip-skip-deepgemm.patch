@@ -1,0 +1,14 @@
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_plan.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/attention/dsa/kpool_plan.py
+@@ -504,5 +504,11 @@
+         or not is_extend_like
+         or forward_batch.extend_seq_lens_cpu is None
+         or forward_batch.seq_lens_cpu is None
++        # GLM53-HIP-KPOOL-PATCH: the ragged kpool-extend plan path
++        # (_get_topk_ragged_kpool_plan -> deep_gemm.fp8_mqa_logits in
++        # dsa_indexer_kpool.py) is CUDA-only; on HIP skip the plan so the
++        # prefill takes the tested _get_topk_ragged_kpool path
++        # (defer_kpool_cache_write), mirroring the paged-path HIP guard.
++        or not is_cuda()
+     ):
+         return metadata

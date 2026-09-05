@@ -13,6 +13,7 @@ forward that can arm the capture -- identically on beverin and clariden.
 Usage: capture_probe.py <base_url> <model>
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -21,9 +22,14 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:30000"
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "zai-org/GLM-5.3-Flash"
 
 # Deterministic prompt: same tokenizer on both machines -> identical ids.
-# ~2250 tokens (> MIN_TOKENS=1200, << chunked_prefill 8192).
+# Token count must be in (MIN_TOKENS=1200, index_topk=2048] so the cold
+# prefill takes sglang's _forward_cuda_skip_logits path (dummy topk, no
+# deep_gemm) IDENTICALLY on both beverin (HIP) and clariden (CUDA) -- the
+# long-prefill real-topk path is CUDA-only (deep_gemm.fp8_mqa_logits) on
+# the current overlay.  ~10 tokens/repeat -> reps=180 ~= 1800 tokens.
+_SENT_REPS = int(os.environ.get("GLM53_PROBE_REPEATS", "180"))
 SENT = "The quick brown fox jumps over the lazy dog. "
-PROMPT = SENT * 250 + "The capital of France is"
+PROMPT = SENT * _SENT_REPS + "The capital of France is"
 
 
 def _wait_health(timeout=7200):
