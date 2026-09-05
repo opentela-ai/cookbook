@@ -1,0 +1,23 @@
+# Bristen GLM-5.3 OpenTela worker config for the OFFICIAL v0.2.4 build
+# (commit 6c8574d). Runs ALONGSIDE the v0.0.6 worker that 83202's
+# subshell auto-launched (pre-6213408 script) on a separate worker HTTP
+# API port (18093) + separate libp2p ports (--tcpport 43921 --udpport
+# 59831 via CLI) so both can coexist pointing at the same sglang :30000.
+# Once validated against the REAL sglang, this becomes the canonical
+# worker; v0.0.6 is retired and the next job (6213408 script) uses this
+# on 18092/43905/59820.
+name: bristen-glm53-v024
+port: "18093"
+mode: node
+loglevel: debug
+cleanslate: true
+service:
+  name: llm
+  port: "30000"
+security:
+  require_signed_binary: false
+solana:
+  skip_verification: true
+bootstrap:
+  sources:
+    - "/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7"
