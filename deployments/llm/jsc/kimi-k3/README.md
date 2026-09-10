@@ -217,9 +217,83 @@ default `~/.deep_ep`) — the recipe makes that rank-local too for the same reas
 | File | Purpose |
 |------|---------|
 | `serve_llm_otela_jsc.sbatch` | One self-contained sbatch: sglang engine (apptainer `--nv`) + otela worker + optional vmagent. Defaults: Kimi-K3, 8 nodes, TP4×PP8. |
+| `start_relay_jsc.sh` | Login-node relay (tmux, writes `relay.multiaddr`). Run once before submitting; outlives every job. Per-user ports by default + `attach`/`stop` guards, so multiple operators coexist on one login node. See §6. |
 | `build_kimi_k3_image.sh` | Build the sglang `.sif` on a login node. CUDA-13 (default) and CUDA-12 (`-cu12`, required for SHARP) variants. |
 | `stage_sharp_plugin.sh` | One-command: stage a self-contained SHARP plugin dir on `/e/scratch` (closes all 5 gaps in §2). Run once on a login node. |
 | `build_flashkda_prefix.sh` | Optional: build the FlashKDA Python prefix to bind-mount into the container. |
+
+## §6. The login-node relay (start it too)
+
+Compute nodes have no outbound internet, so the serving sbatch's `otela`
+worker (which sits next to sglang on the compute head, `reachability:
+private`) cannot dial the public head directly — it hops through a relay on a
+login node. The sbatch has always **dialed** that relay via
+`$OTELA_RELAY_ADDR` / `$RELAY_ADDR_FILE`, falling back to a baked-in
+`OTELA_RELAY_DEFAULT`. Until now there was **no in-repo script to start it**;
+`start_relay_jsc.sh` adds that.
+
+```bash
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh           # start (idempotent: reuses if up; per-user ports by default)
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh attach    # print a RUNNING relay's multiaddr (no new start)
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh status    # is it running?
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh multiaddr # print the saved relay.multiaddr
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh stop      # clean AnnounceLeave (refuses if another uid owns the port)
+```
+
+The relay is **us-managed and long-lived** (tmux session `jsc-otela-relay-<user>`):
+it outlives every Slurm job and is shared by all of them. Start it **once**
+before submitting; the sbatch reads `$DEPLOY_DIR/relay.multiaddr`
+(`/e/scratch/$PROJECT/$USER/otela-relay/relay.multiaddr` by default)
+automatically, so no `OTELA_RELAY_ADDR` export is needed for the run that
+follows.
+
+Two JSC-specific points the script handles (both are documented failures
+in the serving sbatch header, ported here so the relay doesn't trip them):
+
+- **BadgerDB off NFS.** otela resolves the home directory via `os/user.Current()`
+  (`/etc/passwd`), **not** the `$HOME` env var — so unlike the Euler relay,
+  `env HOME=...` on the command line does nothing here. The store lands at
+  `$HOME/jupiter/.ocfcore` on NFS-backed `/e/home`, goes `ESTALE` after a few
+  days, the CRDT DAG freezes, and `api.opentela.ai` returns `503 No provider
+  found`. `start_relay_jsc.sh` **symlinks** `$HOME/jupiter/.ocfcore` →
+  `$DEPLOY_DIR/ocfcore` on `/e/scratch` before starting otela. The relay's
+  peer identity comes from `--config-dir` (also on `/e/scratch`), so the
+  symlink does not affect it.
+- **Native binary, not the SIF.** The promoted image is an aarch64
+  **sglang-only** image; the relay is a long-lived cluster-wide process and
+  must not carry the engine's multi-GB working set. Stage a native
+  `otela-arm64` once (the script fetches it to `$DEPLOY_DIR/bin/otela` if
+  missing — login nodes have egress).
+
+### Concurrency on one login node
+
+Two operators on the **same** login node used to both try to bind the fixed
+relay ports; the second `otela start` died with `EADDRINUSE`, never
+published a peer ID, and its sbatch silently latched onto the first user's
+relay — a correctness hazard, since `api.opentela.ai` would then see two
+providers for one model under two operator peer IDs. `start_relay_jsc.sh`
+now handles that:
+
+- **Ports are per-user by default** — `RELAY_TCP_PORT=45000+$(id -u)%1000`,
+  `RELAY_UDP_PORT=59000+$(id -u)%1000` (matching the GLM-5.3 campaign guide;
+  `id -u`, not `$USER`, which can repeat across sites). Two users get two
+  relays on two ports, each with its own peer — no collision.
+- **`start` refuses a busy port** it can't attribute to itself (without
+  root, `ss -p` hides other users' pids but still shows the LISTEN line), so
+  you get a clear message instead of a 60 s capture timeout.
+- **`start` is idempotent** — if your tmux session is already up and
+  `relay.multiaddr` exists, it re-prints and exits 0 instead of clobbering
+  the file.
+- **`stop` refuses** to kill a relay whose libp2p port is owned by another
+  uid (that relay may be serving other workers).
+- **`attach`** is the sharing path: if a relay is already running (yours or
+  another's), print its multiaddr without starting a new one, then point your
+  sbatch at it with `RELAY_ADDR_FILE` / `OTELA_RELAY_ADDR`.
+
+For a fully independent relay (own peer ID, own store), set `DEPLOY_DIR` and
+`RELAY_SEED`/`RELAY_TCP_PORT`/`RELAY_UDP_PORT` before running
+`start_relay_jsc.sh`, then point the sbatch at the new `relay.multiaddr`
+with `RELAY_ADDR_FILE`.
 
 ## Submit
 
@@ -230,10 +304,13 @@ default `~/.deep_ep`) — the recipe makes that rank-local too for the same reas
 bash deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh
 bash deployments/llm/jsc/kimi-k3/stage_sharp_plugin.sh
 
-# 1. production default: Kimi-K3, 8 nodes, TP4×PP8 (~542 tok/s @ C=32)
+# 1. start the login-node relay (tmux; writes relay.multiaddr; see §6)
+bash deployments/llm/jsc/kimi-k3/start_relay_jsc.sh
+
+# 2. production default: Kimi-K3, 8 nodes, TP4×PP8 (~542 tok/s @ C=32)
 sbatch deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch
 
-# 2. experiment: TP32/EP32/PP1 with SHARP (boots stable; see §3 for the
+# 3. experiment: TP32/EP32/PP1 with SHARP (boots stable; see §3 for the
 #    throughput caveat — a2a=none is ~38× slower, deepep/megamoe crash on sm90)
 sbatch --export=ALL,\
 IMAGE=/e/scratch/reformo/$USER/kimi-k3/images/sglang-kimi-k3-cu12.sif,\
@@ -257,6 +334,9 @@ rcc --profile jsc push
 rcc --profile jsc run -- bash -lc \
   'bash /e/scratch/reformo/yao4/opentela-cookbook/deployments/llm/jsc/kimi-k3/build_kimi_k3_image.sh && \
    bash /e/scratch/reformo/yao4/opentela-cookbook/deployments/llm/jsc/kimi-k3/stage_sharp_plugin.sh'
+
+# start the login-node relay (tmux; writes relay.multiaddr; see §6)
+rcc --profile jsc run -- bash /e/scratch/reformo/yao4/opentela-cookbook/deployments/llm/jsc/kimi-k3/start_relay_jsc.sh
 
 # production default: Kimi-K3, 8 nodes, TP4×PP8
 rcc --profile jsc job submit deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch

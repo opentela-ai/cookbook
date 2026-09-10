@@ -239,7 +239,9 @@ OTELA_REQUIRE_SIGNED="${OTELA_REQUIRE_SIGNED:-false}"
 # The shared login-node relay (us-managed; see header). An explicit
 # $OTELA_RELAY_ADDR or a non-empty $RELAY_ADDR_FILE overrides this default.
 OTELA_RELAY_DEFAULT="/ip4/10.128.1.1/tcp/43917/p2p/QmXbXAnu9XVvfyXPaS57rzvKHbTjC4xMpxSdTpFQDaZ1An"
-# Where the login-node relay may publish its dial address (optional override).
+# Where the login-node relay may publish its dial address. Written by
+# start_relay_jsc.sh (run once on a login node); an explicit
+# $OTELA_RELAY_ADDR or a non-empty $RELAY_ADDR_FILE overrides the default.
 RELAY_ADDR_FILE="${RELAY_ADDR_FILE:-/e/scratch/$PROJECT/$USER/otela-relay/relay.multiaddr}"
 
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5400}"   # weights can be ~1.5 TB; be patient

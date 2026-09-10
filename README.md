@@ -59,7 +59,7 @@ updates the files visible from Clariden.
 |---|---|---|---|---|---|
 | **CSCS Alps — Clariden** | 4× NVIDIA GH200 120 GB per node (aarch64, 288 cores) | HPE Slingshot 11 via CXI libfabric (`aws-ofi-ccl-plugin`); **no InfiniBand** | Slurm + Pyxis + enroot (EDF) | direct p2p mesh to the Alps bootstrap, no relay | [`clariden/kimi-k3`](deployments/llm/clariden/kimi-k3/) |
 | **CSCS Alps — Beverin** | 4× AMD MI300A APU per node (gfx942, unified memory) | same Alps fabric | Slurm + Pyxis + enroot (EDF) | direct — compute nodes have full outbound | [`beverin/glm47-flash`](deployments/llm/beverin/glm47-flash/), [`beverin/deepseek-v4`](deployments/llm/beverin/deepseek-v4/) |
-| **JSC — Jupiter Booster** | 4× NVIDIA GH200 per node (aarch64) | InfiniBand (SHARP) | Slurm + Apptainer (`.sqsh`) | direct | [`jsc/kimi-k3`](deployments/llm/jsc/kimi-k3/) |
+| **JSC — Jupiter Booster** | 4× NVIDIA GH200 per node (aarch64) | InfiniBand (SHARP) | Slurm + Apptainer (`.sqsh`) | worker on serving node → **login-node relay** (`start_relay_jsc.sh`, per-user ports); compute has no egress | [`jsc/kimi-k3`](deployments/llm/jsc/kimi-k3/) |
 | **ETH Zürich — Euler** | NVIDIA RTX PRO 6000 Blackwell (one GPU per service) | compute nodes: outbound HTTP(S) only, via the `eth_proxy` module | Slurm + Apptainer | **login-node relay required** | [`euler/qwen36-35b-a3b`](deployments/llm/euler/qwen36-35b-a3b/) |
 | **Local — NVIDIA DGX Spark** | 1× NVIDIA GB10 (aarch64, sm_121, 122 GB unified memory) | single box | no scheduler — Docker overlay or bare-metal Ollama | direct | [`dgx-spark/qwen36-35b-a3b`](deployments/llm/local/dgx-spark/qwen36-35b-a3b/), [`dgx-spark/qwen3-1.7b-ollama`](deployments/llm/local/dgx-spark/qwen3-1.7b-ollama/) |
 
@@ -74,7 +74,7 @@ substrates (DGX Spark) everything runs without a scheduler.
 
 | Path | What it covers |
 |------|----------------|
-| `deployments/llm/jsc/kimi-k3/` | `moonshotai/Kimi-K3` serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated). |
+| `deployments/llm/jsc/kimi-k3/` | `moonshotai/Kimi-K3` serving on JSC Jupiter Booster (GH200, Slurm, Apptainer). **Login-node relay for egress** (compute has none) — `start_relay_jsc.sh` uses per-user ports, so multiple operators coexist on one login node. Start with its [`README.md`](deployments/llm/jsc/kimi-k3/README.md) for the verified findings (why TP4×PP8, the SHARP story, why TP32/EP32 is Blackwell-gated) and the relay/concurrency story (§6). |
 | `deployments/llm/clariden/kimi-k3/` | `moonshotai/Kimi-K3` serving on CSCS Clariden (GH200, aarch64, Slurm + enroot/EDF, Slingshot fabric — no InfiniBand). TP4×PP8, verified 561 tok/s aggregate @ C=32 (1024-in/256-out), 1M context window. Start with its [`README.md`](deployments/llm/clariden/kimi-k3/README.md) for the 10 site-specific fixes (Slingshot NCCL env, the 480 s loading-barrier monkey-patch, the otela cfg.yaml requirements). |
 | `deployments/llm/beverin/glm47-flash/` | `zai-org/GLM-4.7-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
 | `deployments/llm/beverin/deepseek-v4/` | `deepseek-ai/DeepSeek-V4-Flash` serving on Beverin (AMD MI300A, ROCm, EDF). |
