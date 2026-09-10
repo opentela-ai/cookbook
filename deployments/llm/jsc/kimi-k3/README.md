@@ -252,18 +252,28 @@ in the serving sbatch header, ported here so the relay doesn't trip them):
 
 - **BadgerDB off NFS.** otela resolves the home directory via `os/user.Current()`
   (`/etc/passwd`), **not** the `$HOME` env var — so unlike the Euler relay,
-  `env HOME=...` on the command line does nothing here. The store lands at
-  `$HOME/jupiter/.ocfcore` on NFS-backed `/e/home`, goes `ESTALE` after a few
-  days, the CRDT DAG freezes, and `api.opentela.ai` returns `503 No provider
-  found`. `start_relay_jsc.sh` **symlinks** `$HOME/jupiter/.ocfcore` →
-  `$DEPLOY_DIR/ocfcore` on `/e/scratch` before starting otela. The relay's
-  peer identity comes from `--config-dir` (also on `/e/scratch`), so the
-  symlink does not affect it.
+  `env HOME=...` on the command line does nothing here. On JSC the `/etc/passwd`
+  home already ends in `/jupiter` (e.g. `/e/home/jusers/<user>/jupiter`), so
+  the store lands at `$PASSWD_HOME/.ocfcore` on NFS-backed `/e/home`, goes
+  `ESTALE` after a few days, the CRDT DAG freezes, and `api.opentela.ai`
+  returns `503 No provider found`. Verified live with v0.2.4: `--config-dir`
+  does NOT relocate the BadgerDB either (it still lands at
+  `$PASSWD_HOME/.ocfcore`), so the symlink is still required.
+  `start_relay_jsc.sh` **symlinks** `$PASSWD_HOME/.ocfcore` →
+  `$DEPLOY_DIR/ocfcore` on `/e/scratch` before starting otela (and leaves an
+  existing off-NFS symlink alone). The relay's peer identity comes from
+  `--config-dir` (also on `/e/scratch`), so the symlink does not affect it.
 - **Native binary, not the SIF.** The promoted image is an aarch64
   **sglang-only** image; the relay is a long-lived cluster-wide process and
-  must not carry the engine's multi-GB working set. Stage a native
-  `otela-arm64` once (the script fetches it to `$DEPLOY_DIR/bin/otela` if
-  missing — login nodes have egress).
+  must not carry the engine's multi-GB working set. Stage the official
+  `opentela-arm64` **v0.2.4** release asset once (the script fetches it to
+  `$DEPLOY_DIR/bin/opentela` if missing — login nodes have egress). v0.2.4 is
+  pinned because it is the first **official** build with both AutoRelay and
+  the libp2p self-dial fix (`7f421838c5`, "dial the target peer, not the
+  incoming Host header" — merged before v0.2.3); the older two-hop recipe
+  here pinned v0.2.2 + a local `relayfix` patch because the fix wasn't
+  released yet. NB the v0.2.x asset is named `opentela-arm64`, not
+  `otela-arm64` (≤ v0.1.12) or `ocf-arm64` (≤ v0.1.11).
 
 ### Concurrency on one login node
 

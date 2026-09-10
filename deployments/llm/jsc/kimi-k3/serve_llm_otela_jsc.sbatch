@@ -65,15 +65,19 @@
 # $RELAY_ADDR_FILE); it never starts a relay.
 #
 # CRITICAL — relay data must live on /e/scratch, NOT /e/home. The binary puts
-# its go-ds-crdt / badger store at $HOME/jupiter/.ocfcore/ (resolved via
+# its go-ds-crdt / badger store at $PASSWD_HOME/.ocfcore/ (resolved via
 # os/user.Current(), which reads /etc/passwd — NOT the $HOME env var, so no
-# --data-dir flag exists). /e/home is NFS-backed: after a few days the file
-# handle goes stale (ESTALE), badger can no longer write to its value log, the
-# CRDT DAG freezes, and the LLM service never propagates to the public relay
-# -> api.opentela.ai returns 503 "No provider found". Fix: symlink
-# $HOME/jupiter/.ocfcore -> <some dir on /e/scratch> before starting the
-# relay. The relay's identity (PeerID) comes from --config-dir, which is
-# already on /e/scratch, so the symlink does not affect it.
+# --data-dir flag exists; verified live with v0.2.4 that --config-dir does NOT
+# relocate the BadgerDB either). On JSC the /etc/passwd home already ends in
+# /jupiter (e.g. /e/home/jusers/<user>/jupiter), so the store is
+# $PASSWD_HOME/.ocfcore (single) — NOT $PASSWD_HOME/jupiter/.ocfcore. /e/home
+# is NFS-backed: after a few days the file handle goes stale (ESTALE), badger
+# can no longer write to its value log, the CRDT DAG freezes, and the LLM
+# service never propagates to the public relay -> api.opentela.ai returns 503
+# "No provider found". Fix: symlink $PASSWD_HOME/.ocfcore -> <some dir on
+# /e/scratch> before starting the relay. The relay's identity (PeerID) comes
+# from --config-dir, which is already on /e/scratch, so the symlink does not
+# affect it.
 #
 # The relay's second hop depends on the P2PForwardHandler fix ("dial the target
 # peer, not the incoming Host header"; without it every hop self-dials — "failed
@@ -218,10 +222,11 @@ export SERVE_PORT="${SERVE_PORT:-30000}"
 export K3_NIC="${K3_NIC:-ib0}"             # confirmed present on booster nodes
 
 # ------------------------------------------------------------------- otela ----
-# Stock release is fine for the WORKER (it only receives hops). v0.2.3 also
-# carries the relay's P2PForwardHandler fix, so the SAME release runs the
-# us-managed login-node relay (see header) — no special build anymore.
-OTELA_VERSION="${OTELA_VERSION:-v0.2.3}"
+# Stock release is fine for the WORKER (it only receives hops). v0.2.4 is the
+# latest official release and carries the P2PForwardHandler fix (merged before
+# v0.2.3, commit 7f421838c5), so the SAME release runs the us-managed
+# login-node relay (start_relay_jsc.sh also pins v0.2.4) — no special build.
+OTELA_VERSION="${OTELA_VERSION:-v0.2.4}"
 OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/opentela-arm64}"
 OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/$OTELA_VERSION/opentela-arm64}"
 OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"

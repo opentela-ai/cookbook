@@ -22,10 +22,11 @@
 # Euler, setting `HOME=...` on the otela command line does NOTHING here:
 # otela resolves the home directory via os/user.Current(), which reads
 # /etc/passwd (your real /e/home/<user>, NFS-backed) and ignores the $HOME
-# env var. Its go-ds-crdt/badger store then lands at
-# $HOME/jupiter/.ocfcore — which goes ESTALE after a few days on NFS, the
+# env var. On JSC the /etc/passwd home already ends in /jupiter (e.g.
+# /e/home/jusers/<user>/jupiter), so otela's go-ds-crdt/badger store lands at
+# $PASSWD_HOME/.ocfcore — which goes ESTALE after a few days on NFS, the
 # CRDT DAG freezes, and `api.opentela.ai` starts returning 503 "No provider
-# found". So this script SYMLINKS $HOME/jupiter/.ocfcore -> a dir on
+# found". So this script SYMLINKS $PASSWD_HOME/.ocfcore -> a dir on
 # /e/scratch BEFORE starting otela. The relay's peer identity (PeerID) comes
 # from --config-dir, already on /e/scratch, so the symlink does not affect it.
 #
@@ -43,11 +44,16 @@ set -euo pipefail
 # independent relay with its own peer ID).
 PROJECT="${PROJECT:-reformo}"
 DEPLOY_DIR="${DEPLOY_DIR:-/e/scratch/$PROJECT/$USER/otela-relay}"
-BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/otela}"
-# JSC stage default. Check `df -h /e/scratch` and the module system if you
-# change this; the binary only needs to be staged once (login nodes have
-# outbound internet; compute nodes do not).
-OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/latest/download/otela-arm64}"
+BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/opentela}"
+# v0.2.4 (latest release, 2026-08-25) contains the libp2p self-dial fix
+# (commit 7f421838c5, merged before v0.2.3), so the official arm64 binary
+# works as a relay out of the box — no locally-patched build needed (the
+# older two-hop recipe here predated the fix and pinned v0.2.2 + relayfix).
+# NB the v0.2.x asset is named `opentela-arm64`, NOT `otela-arm64` (which
+# 404s) or `ocf-arm64` (<= v0.1.11); `releases/latest` drifts, so this pins
+# an explicit tag. Stage once on /e/scratch (login nodes have egress;
+# compute nodes do not).
+OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/v0.2.4/opentela-arm64}"
 # The tmux session is per-UID by name too. tmux sockets are already
 # per-uid (one user cannot see or kill another's session), but a distinct
 # name keeps `tmux ls` and the stop logic unambiguous when several relays
@@ -59,6 +65,11 @@ SESSION="${RELAY_SESSION:-jsc-otela-relay-$(id -un)}"
 # every start). Keep SEED stable across restarts so workers'
 # relay.multiaddr does not need re-writing.
 SEED="${RELAY_SEED:-0}"
+# The relay bootstraps onto the OpenTela DHT through this peer so it can
+# register as a relay candidate. The public head (p2p.opentela.ai /
+# QmTtnXKHvovC...) is the proven default; override RELAY_BOOTSTRAP with any
+# multiaddr / HTTP dnt source `otela start --bootstrap.static` accepts.
+BOOTSTRAP="${RELAY_BOOTSTRAP:-/dns4/p2p.opentela.ai/tcp/443/wss/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 #
 # PORTS ARE PER-USER BY DEFAULT. Two operators on the same login node would
 # otherwise both try to bind the fixed libp2p tcp/udp ports and the HTTP API
@@ -78,7 +89,8 @@ mkdir -p "$DEPLOY_DIR" "$DEPLOY_DIR/logs" "$DEPLOY_DIR/cfg"
 
 LOGFILE="$DEPLOY_DIR/logs/relay-$(date +%s).log"
 LATEST_LOG="$DEPLOY_DIR/logs/relay-latest.log"
-CFG="$DEPLOY_DIR/cfg/relay.cfg.yaml"
+CFG_DIR="$DEPLOY_DIR/cfg"
+CFG="$CFG_DIR/cfg.yaml"
 MULTIADDR_FILE="$DEPLOY_DIR/relay.multiaddr"
 
 # ----------------------------------------------------------------- helpers ----
@@ -117,38 +129,49 @@ echo_ts "login node: $(hostname)  ib0: $NODE_IP"
 
 write_cfg() {
   # cfg.yaml lives on /e/scratch (NOT /e/home), so the peer identity (from
-  # --config-dir) is stable and never hits an NFS stale handle.
+  # --config-dir) is stable and never hits an NFS stale handle. otela start
+  # --config-dir loads the file NAMED cfg.yaml (verified live); older
+  # versions of this script wrote relay.cfg.yaml, which otela ignored unless
+  # cfg.yaml was ALSO present (fragile merge). Remove the legacy name so
+  # exactly one config -- ours -- is authoritative.
+  rm -f "$CFG_DIR/relay.cfg.yaml"
   cat > "$CFG" <<YAML
 name: jsc-relay
 seed: "$SEED"
 port: "$RELAY_API_PORT"
 tcpport: "$RELAY_TCP_PORT"
 udpport: "$RELAY_UDP_PORT"
-mode: full
+# 'mode: node' + 'role: relay' + 'reachability: public' is the proven relay
+# config (validated live on JSC with v0.2.4); 'mode: full' was wrong here.
+# The relay does NOT advertise public-addr (the "won't be discoverable as a
+# bootstrap" log line is benign -- workers dial the explicit multiaddr this
+# script writes to relay.multiaddr via --bootstrap.static), and the
+# bootstrap source is passed on the CLI, not as a cfg field.
+mode: node
 role: relay
+reachability: public
 loglevel: debug
 cleanslate: false
-public-addr: "$NODE_IP"
 security:
   require_signed_binary: false
 solana:
   skip_verification: true
-bootstrap:
-  sources:
-    - "https://bootstraps.opentela.ai/v1/dnt/bootstraps"
 YAML
 }
 
-# Move otela's BadgerDB (resolved via /etc/passwd -> $HOME/jupiter/.ocfcore,
-# NFS-backed) onto /e/scratch via symlink. os/user.Current() ignores $HOME, so
-# an env override does NOT work on JSC (verified in the serving sbatch header).
+# Move otela's BadgerDB (resolved via /etc/passwd -> $PASSWD_HOME/.ocfcore,
+# NFS-backed) onto /e/scratch via symlink. os/user.Current() ignores $HOME,
+# so an env override does NOT work on JSC (verified live: `otela start
+# --config-dir <scratch>` still writes BadgerDB at $PASSWD_HOME/.ocfcore,
+# not under the config dir). On JSC the passwd home already ends in /jupiter,
+# so the store is $PASSWD_HOME/.ocfcore (single) — NOT $PASSWD_HOME/jupiter/.
 relocate_ocfcore() {
-  local real_home passwd_home ocfcore
-  # otela writes to "$HOME/jupiter/.ocfcore" where $HOME is the /etc/passwd
-  # home, not the env var. Resolve it the same way to find the right place.
+  local passwd_home ocfcore
+  # otela writes to "$PASSWD_HOME/.ocfcore" where $PASSWD_HOME is the
+  # /etc/passwd home, not the $HOME env var. Resolve it the same way.
   passwd_home=$(getent passwd "$USER" | cut -d: -f6)
   [ -n "$passwd_home" ] || { echo "FATAL: no /etc/passwd home for $USER" >&2; exit 1; }
-  ocfcore="$passwd_home/jupiter/.ocfcore"
+  ocfcore="$passwd_home/.ocfcore"
   local scratch_store="$DEPLOY_DIR/ocfcore"
   mkdir -p "$scratch_store" "$(dirname "$ocfcore")"
   if [ -e "$ocfcore" ] && [ ! -L "$ocfcore" ]; then
@@ -316,6 +339,19 @@ case "${1:-start}" in
 
     resolve_binary
     relocate_ocfcore
+    # otela init seeds the peer keypair in $CFG_DIR/keys/ (on /e/scratch, so
+    # the peer ID is stable across restarts) plus a Solana wallet in
+    # $HOME/.config/opentela (tiny; NFS is fine), and idempotently writes a
+    # default cfg.yaml if none exists. Verified live: `otela start
+    # --config-dir` loads the file NAMED `cfg.yaml` (not relay.cfg.yaml), so
+    # init MUST run BEFORE write_cfg and write_cfg MUST target cfg.yaml --
+    # then exactly one authoritative config (ours) is present, with no
+    # dependence on a fragile multi-file merge.
+    if [ ! -s "$CFG_DIR/keys/id" ]; then
+      echo_ts "creating relay peer keypair via 'otela init --config-dir $CFG_DIR'"
+      "$BINARY" init --config-dir "$CFG_DIR" >/dev/null 2>&1 \
+        || { echo_ts "FATAL: otela init failed (see $CFG_DIR)" >&2; exit 1; }
+    fi
     write_cfg
 
     # Port-busy guard. If something is already listening on RELAY_TCP_PORT
@@ -346,18 +382,21 @@ case "${1:-start}" in
       echo_ts "WARN: port $RELAY_TCP_PORT held by your own stray process; killing it first"
     fi
 
-    # Kill any stale relay by config path, then a fresh tmux session.
-    pkill -f "otela.*start.*$(basename "$CFG")" 2>/dev/null || true
+    # Kill any stale relay by config-dir, then a fresh tmux session.
+    pkill -f "otela start --config-dir.*$CFG_DIR" 2>/dev/null || true
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     sleep 1
 
-    echo_ts "starting relay in tmux session '$SESSION' (config $CFG)"
+    echo_ts "starting relay in tmux session '$SESSION' (config-dir $CFG_DIR)"
     echo_ts "  libp2p tcp=$RELAY_TCP_PORT udp=$RELAY_UDP_PORT  api=$RELAY_API_PORT on $NODE_IP"
+    echo_ts "  bootstrap: $BOOTSTRAP"
     # NOTE: we do NOT set HOME= here. On JSC otela resolves the home directory
     # via /etc/passwd (os/user.Current), ignoring $HOME. The BadgerDB path
-    # is relocated to /e/scratch by relocate_ocfcore instead.
+    # is relocated to /e/scratch by relocate_ocfcore instead. --config-dir
+    # puts the peer keypair + cfg on /e/scratch; the bootstrap source and
+    # solana skip are passed on the CLI (matches the proven two-hop recipe).
     tmux new-session -d -s "$SESSION" \
-      "'$BINARY' start --config '$CFG' 2>&1 | tee '$LOGFILE'"
+      "'$BINARY' start --config-dir '$CFG_DIR' --bootstrap.static '$BOOTSTRAP' --solana.skip_verification 2>&1 | tee '$LOGFILE'"
 
     capture_multiaddr "$LOGFILE" || exit 1
     ;;
