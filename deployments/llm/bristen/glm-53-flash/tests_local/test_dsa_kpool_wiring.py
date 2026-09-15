@@ -49,7 +49,14 @@ f5bed255), NOT from the vkernels code, so agreement is meaningful.
   T10 torch-on-GPU bridge (the serving path since the job-83120 profile:
       the numpy fallback spent ~0.95 s/step in host fills + D2H/H2D) == the
       numpy fallback bridge: assemble caches byte-equal (incl. write_mask),
-      decode tails bit-equal, written cache within one fp8 ulp."""
+      decode tails bit-equal, written cache within one fp8 ulp.
+  T11 tier-1 device dispatch (the serving path once libvkernels_c.so is
+      deployed): env precedence (NUMPY/TORCH veto tier 1), the bridge's arg
+      wiring byte-matches the torch tier (fake device module emulating the
+      in-kernel fp8 store), TypeError -> torch-tier fallback, and the real
+      vkernels.dsa_kpool_device wrapper marshals dims/pointers/round_scale/
+      stream correctly against a fake lib (incl. the in-place bf16 tail ABI
+      and the bool write_mask / int index casts)."""
 
 import importlib.util
 import math
@@ -826,6 +833,278 @@ def t10_torch_numpy_parity(mod):
           "where applicable, cache within one fp8 ulp): OK")
 
 
+def t11_device_dispatch(patched, c, cd):
+    """T11 tier-1 dispatch (the C-ABI device path): env precedence, arg
+    wiring end to end (fake device module that emulates the in-kernel fp8
+    store via the host API -> byte-compare vs the torch tier), TypeError
+    fallback, and the REAL vkernels.dsa_kpool_device wrapper's marshaling
+    (dims / pointers / round_scale / stream / in-place contract) against a
+    fake shared library."""
+    import types
+
+    # -- A. dispatch matrix -------------------------------------------------
+    os.environ["VKERNELS_DSA_KPOOL_NUMPY"] = "1"
+    assert patched._vk_dsa_kpool_use_device() is False, "NUMPY must veto tier 1"
+    os.environ.pop("VKERNELS_DSA_KPOOL_NUMPY", None)
+    os.environ["VKERNELS_DSA_KPOOL_TORCH"] = "1"
+    assert patched._vk_dsa_kpool_use_device() is False, "TORCH must veto tier 1"
+    os.environ.pop("VKERNELS_DSA_KPOOL_TORCH", None)
+
+    saved_mod = patched._VK_DSA_KPOOL_DEVICE_MODULE
+    pool = Pool(slots_per_page=c["ssp"])
+
+    def fake_device_mod(raise_on_call=False):
+        def rec(kind):
+            def call(buf, *rest, **kw):
+                if raise_on_call:
+                    raise TypeError("fake device-ABI contract violation")
+                assert buf.dtype == torch.uint8 and buf.dim() == 2
+                ssp = buf.shape[1] // (HEAD + 4)
+                (chunk_k, chunk_score, tail_k, tail_score, ape, rpi, nft,
+                 css, tlb, loc) = rest[:10]
+                wm = rest[10] if len(rest) > 10 else kw.get("write_mask")
+                assert ape.dtype == torch.float32
+                assert kw.get("round_scale") is False
+                # emulate the in-kernel store: host-API math + requant
+                n = lambda t: np.ascontiguousarray(
+                    t.detach().to(torch.float32).numpy(), dtype=np.float32)
+                i32 = lambda t: np.ascontiguousarray(
+                    t.detach().numpy(), dtype=np.int32)
+                scratch = np.zeros(buf.shape[0] * ssp * HEAD, dtype=np.float32)
+                if kind == "asm":
+                    patched._VK_DSA_KPOOL_ASSEMBLE(
+                        n(chunk_k), n(chunk_score), n(tail_k), n(tail_score),
+                        n(ape), i32(rpi), i32(nft), i32(css), i32(tlb), i32(loc),
+                        slots_per_page=ssp, num_pages=buf.shape[0], out=scratch)
+                    rows = np.arange(rpi.shape[0])
+                    if wm is not None:
+                        rows = rows[i32(wm) != 0]
+                    loc_l = i32(loc)[rows]
+                    patched._vk_bridge_requant_store(
+                        buf, buf.shape[0], ssp, loc_l // ssp, loc_l % ssp,
+                        scratch.reshape(-1, ssp, HEAD)[loc_l // ssp, loc_l % ssp],
+                        kw.get("round_scale", False))
+                else:
+                    (key, slot_score, tk, ts, ape2, bt, rp, pos, sl, ocl) = rest
+                    scratch2 = np.zeros(buf.shape[0] * ssp * HEAD, dtype=np.float32)
+                    tkh = n(tk).copy()
+                    tsh = n(ts).copy()
+                    patched._VK_DSA_KPOOL_DECODE(
+                        n(key), n(slot_score), tkh, tsh, n(ape2), i32(bt),
+                        i32(rp), i32(pos), i32(sl), i32(ocl),
+                        tail_size=tk.shape[1], slots_per_page=ssp,
+                        num_pages=buf.shape[0], out=scratch2)
+                    tk.copy_(torch.from_numpy(tkh).to(tk.dtype))
+                    ts.copy_(torch.from_numpy(tsh).to(ts.dtype))
+                    pos64 = pos.detach().to(torch.int64)
+                    valid = ((rp.detach().to(torch.int64) >= 0)
+                             & (rp.detach().to(torch.int64) < tk.shape[0])
+                             & (ocl.detach().to(torch.int64) != 0)
+                             & (pos64 >= 0) & (pos64 < sl.detach().to(torch.int64)))
+                    written = valid & ((pos64 % 4) == 3)
+                    sel = written.nonzero(as_tuple=True)[0]
+                    if sel.numel():
+                        pid = pos64[sel] // 4
+                        tpr = ((pid // ssp) * 4).clamp(0, bt.shape[1] - 1)
+                        page = bt.detach().to(torch.int64)[sel, tpr]
+                        x = scratch2.reshape(-1, ssp, HEAD)[page, pid % ssp]
+                        patched._vk_bridge_requant_store(
+                            buf, buf.shape[0], ssp, page, pid % ssp, x,
+                            kw.get("round_scale", False))
+                buf._fake_called = True
+            return call
+        return types.SimpleNamespace(
+            available=lambda: True,
+            dsa_kpool_assemble_fp8=rec("asm"),
+            dsa_kpool_decode_update_fp8=rec("dec"),
+            dsa_kpool_assemble=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("bf16 native tier not exercised here")),
+            dsa_kpool_decode_update=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("bf16 native tier not exercised here")),
+        )
+
+    # tier 1 selected and reached; arg wiring reproduces the torch tier
+    patched._VK_DSA_KPOOL_DEVICE_MODULE = fake_device_mod()
+    buf_t = torch.zeros(c["num_pages"], c["ssp"] * (HEAD + 4), dtype=torch.uint8)
+    patched.kpool_assemble_softmax_rotate_write_cache(
+        pool, buf_t, c["chunk_k"], c["chunk_score"], c["tail_k"],
+        c["tail_score"], c["rpi"], c["nft"], c["css"], c["tlb"], c["ape"],
+        c["loc"], write_mask=None, round_scale=False)
+    assert getattr(buf_t, "_fake_called", False), "tier 1 not reached (assemble)"
+    os.environ["VKERNELS_DSA_KPOOL_TORCH"] = "1"
+    buf_ref = torch.zeros_like(buf_t)
+    patched.kpool_assemble_softmax_rotate_write_cache(
+        pool, buf_ref, c["chunk_k"], c["chunk_score"], c["tail_k"],
+        c["tail_score"], c["rpi"], c["nft"], c["css"], c["tlb"], c["ape"],
+        c["loc"], write_mask=None, round_scale=False)
+    os.environ.pop("VKERNELS_DSA_KPOOL_TORCH", None)
+    touched = (buf_t.view(c["num_pages"], c["ssp"], -1).any(-1)
+               | buf_ref.view(c["num_pages"], c["ssp"], -1).any(-1))
+    v_t = buf_t.view(c["num_pages"], c["ssp"], -1)
+    v_r = buf_ref.view(c["num_pages"], c["ssp"], -1)
+    assert torch.equal(v_t[touched], v_r[touched]) or _one_ulp(
+        buf_t, buf_ref, c["ssp"], touched), "tier-1 wiring != torch tier"
+
+    # TypeError from the device entry -> torch-tier fallback, same result
+    patched._VK_DSA_KPOOL_DEVICE_MODULE = fake_device_mod(raise_on_call=True)
+    buf_fb = torch.zeros_like(buf_t)
+    patched.kpool_assemble_softmax_rotate_write_cache(
+        pool, buf_fb, c["chunk_k"], c["chunk_score"], c["tail_k"],
+        c["tail_score"], c["rpi"], c["nft"], c["css"], c["tlb"], c["ape"],
+        c["loc"], write_mask=None, round_scale=False)
+    assert not getattr(buf_fb, "_fake_called", False), "fallback not taken"
+    v_fb = buf_fb.view(c["num_pages"], c["ssp"], -1)
+    assert torch.equal(v_fb[touched], v_r[touched]), "fallback != torch"
+
+    # decode bridge tier-1 wiring (tails updated by the fake in place)
+    patched._VK_DSA_KPOOL_DEVICE_MODULE = fake_device_mod()
+    poold = Pool(slots_per_page=cd["ssp"])
+    buf_d = torch.zeros(cd["num_pages"], cd["ssp"] * (HEAD + 4), dtype=torch.uint8)
+    tk = cd["tail_k"].clone()
+    ts = cd["tail_score"].clone()
+    patched.kpool_decode_update_and_maybe_write_cache(
+        poold, buf_d, tk, ts, cd["key"], cd["slot_score"], cd["ape"],
+        cd["block_tables"], cd["rpi"], cd["pos"], cd["seq_lens"], cd["ocl"],
+        round_scale=False)
+    assert getattr(buf_d, "_fake_called", False), "tier 1 not reached (decode)"
+    patched._VK_DSA_KPOOL_DEVICE_MODULE = saved_mod
+    patched._VK_DSA_KPOOL_DEVICE_MODULE = None  # re-resolve lazily
+
+    # -- B. real dsa_kpool_device marshaling against a fake shared lib ------
+    sys.path.insert(0, str(COOKBOOK / "third_party" / "vkernels" / "src" / "python"))
+    from vkernels import dsa_kpool_device as dev
+
+    calls = []
+
+    def _rec(kind):
+        def f(*a):
+            calls.append((kind, a))
+        return f
+
+    FakeLib = types.SimpleNamespace(
+        vk_hip_dsa_kpool_assemble=_rec("asm"),
+        vk_hip_dsa_kpool_assemble_fp8=_rec("asm_fp8"),
+        vk_hip_dsa_kpool_decode_update=_rec("dec"),
+        vk_hip_dsa_kpool_decode_update_fp8=_rec("dec_fp8"),
+    )
+
+    saved_cache = dict(dev._lib_cache)
+    dev._lib_cache["lib"] = FakeLib
+    try:
+        # argtypes must match the C ABI exactly (hip_capi.hpp) — a stale
+        # prototype raises ctypes.ArgumentError on the first real call.
+        dev._set_kpool_prototypes(dev._lib_cache["lib"])
+        header = COOKBOOK / "third_party" / "vkernels" / "src" / "c" / "vkernels" / "capi" / "hip_capi.hpp"
+        sig = header.read_text()
+        for entry, want in (("vk_hip_dsa_kpool_assemble", 21),
+                            ("vk_hip_dsa_kpool_assemble_fp8", 22),
+                            ("vk_hip_dsa_kpool_decode_update", 20),
+                            ("vk_hip_dsa_kpool_decode_update_fp8", 21)):
+            i = sig.index(entry + "(")
+            body = sig[i + len(entry) + 1:sig.index(");", i)]
+            depth, n = 0, 1
+            for ch in body:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    n += 1
+            got = len(getattr(FakeLib, entry).argtypes)
+            assert got == n == want, \
+                f"{entry}: argtypes {got} / header {n} (expected {want})"
+
+        ssp = 4
+        num_pages, n_chunks, n_reqs, tail = 3, 7, 2, 6
+        cache = torch.zeros(num_pages, ssp * (HEAD + 4), dtype=torch.uint8)
+        ck = torch.randn(n_chunks, HEAD).to(torch.bfloat16)
+        cs = torch.randn(n_chunks, HEAD).to(torch.bfloat16)
+        tkb = torch.randn(n_reqs, tail, HEAD).to(torch.bfloat16)
+        tsb = torch.randn(n_reqs, tail, HEAD).to(torch.bfloat16)
+        ape = torch.randn(4, HEAD)
+        rpi = torch.tensor([0, 1], dtype=torch.int64)
+        nft = torch.tensor([2, 1], dtype=torch.int64)
+        css = torch.tensor([1, 3], dtype=torch.int64)
+        tlb = torch.tensor([0, 2], dtype=torch.int64)
+        loc = torch.tensor([0, 5], dtype=torch.int64)
+        wm = torch.tensor([True, False])
+        dev.dsa_kpool_assemble_fp8(cache, ck, cs, tkb, tsb, ape, rpi, nft,
+                                   css, tlb, loc, write_mask=wm,
+                                   round_scale=True, stream=None)
+        tag, a = calls[-1]
+        assert tag == "asm_fp8"
+        n_pools, pool_size, head, tsize, ssp_, pages, chunks, reqs = a[:8]
+        assert (n_pools, pool_size, head, tsize) == (2, 4, HEAD, tail)
+        assert (ssp_, pages, chunks, reqs) == (ssp, num_pages, n_chunks, n_reqs)
+        import ctypes as _ct
+        assert len(a) == 22, f"assemble_fp8: 8 dims + 14 ptr args, got {len(a)}"
+        vals = [p.value if isinstance(p, _ct.c_void_p) else p for p in a[8:]]
+        # bf16/fp32 tensors pass through un-cast -> exact pointers; the int64
+        # index vectors and the bool mask are cast to int32 -> fresh buffers
+        # (only non-nullness is assertable).
+        assert vals[0:5] == [ck.data_ptr(), cs.data_ptr(), tkb.data_ptr(),
+                             tsb.data_ptr(), ape.data_ptr()], \
+            "bf16/fp32 inputs must pass through un-cast"
+        assert all(v is not None for v in vals[5:10]), "index ptrs non-null"
+        assert vals[10] is not None, "bool write_mask cast to int32"
+        assert vals[11] == cache.data_ptr(), "cache ptr passes through"
+        assert vals[12] is not None, "round_scale=True must pass a device flag"
+        assert vals[13] is None, "CPU tensors -> NULL stream"
+        # decode: in-place bf16 tails required; fp32 tails must raise
+        bt = torch.zeros(2, 8, dtype=torch.int64)
+        pos = torch.tensor([3, 4], dtype=torch.int64)
+        sl = torch.tensor([9, 9], dtype=torch.int64)
+        ocl = torch.tensor([11, 12], dtype=torch.int64)
+        key = torch.randn(2, HEAD).to(torch.bfloat16)
+        ss = torch.randn(2, HEAD).to(torch.bfloat16)
+        dev.dsa_kpool_decode_update_fp8(cache, key, ss, tkb, tsb, ape, bt,
+                                        rpi, pos, sl, ocl, round_scale=False)
+        tag, a = calls[-1]
+        assert tag == "dec_fp8"
+        batch, pool_size2, head2, tsize2, ssp2, btc, nreqs2, pages2 = a[:8]
+        assert (batch, pool_size2, head2, tsize2) == (2, 4, HEAD, tail)
+        assert (ssp2, btc, nreqs2, pages2) == (ssp, 8, n_reqs, num_pages)
+        assert len(a) == 21, f"decode_fp8: 8 dims + 13 ptr args, got {len(a)}"
+        vals = [p.value if isinstance(p, _ct.c_void_p) else p for p in a[8:]]
+        assert vals[0] == key.data_ptr() and vals[1] == ss.data_ptr(), \
+            "bf16 key/slot_score pass through un-cast"
+        assert vals[2] == tkb.data_ptr() and vals[3] == tsb.data_ptr(), \
+            "tails must pass through un-cast (updated in place)"
+        assert all(v is not None for v in vals[4:10]), "int casts non-null"
+        assert vals[10] == cache.data_ptr(), "cache ptr passes through"
+        assert vals[11] is None, "round_scale=False -> NULL flag"
+        assert vals[12] is None, "CPU tensors -> NULL stream"
+        try:
+            dev.dsa_kpool_decode_update_fp8(cache, key, ss,
+                                            tkb.float(), tsb, ape, bt, rpi,
+                                            pos, sl, ocl)
+            raise AssertionError("fp32 tail must violate the in-place ABI")
+        except TypeError:
+            pass
+        # bool write_mask cast, bf16 cache view for the native (bf16) entries
+        dev.dsa_kpool_assemble(torch.zeros(num_pages, ssp, HEAD,
+                                           dtype=torch.bfloat16),
+                               ck, cs, tkb, tsb, ape, rpi, nft, css, tlb,
+                               loc, write_mask=wm)
+        assert calls[-1][0] == "asm"
+    finally:
+        dev._lib_cache.clear()
+        dev._lib_cache.update(saved_cache)
+    print("  T11 tier-1 dispatch (env precedence, arg wiring == torch tier, "
+          "TypeError fallback, dsa_kpool_device marshaling + in-place ABI): OK")
+
+
+def _one_ulp(buf_a, buf_b, ssp, touched):
+    da, sa = _dequant_legacy_buf(buf_a, ssp)
+    db, sb = _dequant_legacy_buf(buf_b, ssp)
+    err = (da[touched] - db[touched]).abs()
+    bound = 0.14 * da[touched].abs() + 4e-3
+    ok = bool((err <= bound).all())
+    if ok:
+        torch.testing.assert_close(sa[touched], sb[touched], rtol=1e-2, atol=1e-9)
+    return ok
+
+
 def main():
     os.environ["VKERNELS_DSA_KPOOL_FORCE"] = "1"
     print(f"cookbook root: {COOKBOOK}")
@@ -851,8 +1130,9 @@ def main():
     t8_shim_logits()
     t9_act_quant_sm80()
     t10_torch_numpy_parity(patched)
+    t11_device_dispatch(patched, c, cd)
     print("\nALL TESTS PASSED -- vkernels#60 dsa_kpool wiring (native + legacy-"
-          "layout bridge + torch-on-GPU serving path), the SM80 deep_gemm shim "
+          "layout bridge + device/torch serving tiers), the SM80 deep_gemm shim "
           "and the SM80 act_quant fallback are semantically sound.")
 
 

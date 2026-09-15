@@ -196,6 +196,19 @@ mkdir -p "$TRITON_CACHE_DIR" "$HF_HOME" "$TMPDIR" "$ENROOT_CACHE_PATH"
 export VKERNELS_PYTHON="${VKERNELS_PYTHON:-$DEPLOY_DIR/vkernels-python}"
 [ -d "$VKERNELS_PYTHON/vkernels" ] || \
   { echo "FATAL: vkernels python package not found: $VKERNELS_PYTHON/vkernels" >&2; exit 1; }
+
+# Tier-1 kpool dispatch: the CUDA build of libvkernels_c.so (vkernels
+# 'cuda' preset, sm_80; export vk_hip_dsa_kpool_* via capi/cuda_capi_kpool.cpp).
+# Deploy it next to the python package; the bridge auto-falls back to the
+# torch-on-GPU tier when absent (VKERNELS_DSA_KPOOL_TORCH=1 pins that).
+export VKERNELS_LIB="${VKERNELS_LIB:-$VKERNELS_PYTHON/lib/libvkernels_c.so}"
+if [ -f "$VKERNELS_LIB" ]; then
+  echo "[kpool] device tier: $VKERNELS_LIB"
+else
+  echo "[kpool] device tier: libvkernels_c.so not deployed -> torch-on-GPU tier"
+  unset VKERNELS_LIB
+fi
+
 export PYTHONPATH="${SGLANG_PATCH_DIR}:${VKERNELS_PYTHON}:${OVL}/sgl-workspace/sglang/python:${OVL}/sgl-workspace/transformers/src:${OVL}/site-extra-cp312:${PYTHONPATH:-}"
 
 # Propagate PYTHONPATH into the container unchanged.  Note: pyxis's

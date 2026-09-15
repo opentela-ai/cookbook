@@ -26,12 +26,22 @@ KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # roundings (mean, Hadamard) as the Triton kernels (validated in
 # tests_local/test_dsa_kpool_wiring.py, T1-T7).
 #
-# The vkernels compute runs as a torch-on-GPU port of the fallback math
-# (``_vk_dsa_kpool_{assemble,decode}_torch``: no host round trip, no giant
-# fp32 scratch, no per-call syncs -- the numpy fallback cost ~0.95 s/step
-# in ``numpy .fill`` alone, profiled in bristen job 83120). The numpy
-# fallback remains available as a reference via ``VKERNELS_DSA_KPOOL_NUMPY=1``
-# and is parity-validated in tests_local/test_dsa_kpool_wiring.py (T10).
+# The vkernels compute runs, in dispatch order:
+#
+#   1. C-ABI device kernels (``vkernels.dsa_kpool_device``: ctypes ->
+#      ``libvkernels_c.so`` on CUDA / ``libvkernels_hip.so`` on ROCm -- the
+#      SM80-proven ``dsa_kpool`` device kernels from 1de4eec, sync-free,
+#      caller-stream-correct, graph-capturable; the ``*_fp8`` entries do the
+#      legacy fp8+scale requant IN-KERNEL). Default when the device library
+#      is deployed (``VKERNELS_LIB`` or a ``build/**`` discovery).
+#   2. torch-on-GPU port (``_vk_dsa_kpool_{assemble,decode}_torch``: no host
+#      round trip, no giant fp32 scratch, no per-call syncs -- the numpy
+#      fallback cost ~0.95 s/step in ``numpy .fill`` alone, profiled in
+#      bristen job 83120). Automatic fallback when the device library is
+#      absent; ``VKERNELS_DSA_KPOOL_TORCH=1`` forces it.
+#   3. numpy host reference (parity oracle, ~1 s/call on big caches):
+#      ``VKERNELS_DSA_KPOOL_NUMPY=1`` -- diagnostics only, parity-validated
+#      in tests_local/test_dsa_kpool_wiring.py (T10).
 # The compiled backend (VKERNELS_BUILD_PYTHON=ON) or the C-ABI adapters
 # (vk_dsa_kpool_*) remain the long-term option (PR #52).
 #
@@ -41,7 +51,9 @@ KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # 2-node PP2 smoke config.
 #
 # Env: ``VKERNELS_DSA_KPOOL_DISABLE=1`` vetoes the bridge (legacy Triton);
-# ``VKERNELS_DSA_KPOOL_FORCE=1`` forces it on any device (local CPU tests).
+# ``VKERNELS_DSA_KPOOL_FORCE=1`` forces it on any device (local CPU tests);
+# ``VKERNELS_DSA_KPOOL_TORCH=1`` forces the torch tier; ``VKERNELS_LIB``
+# points at the device library for tier 1.
 # The ``_vk_dsa_kpool_*_native`` (bf16-store) variants below are kept for the
 # upstream bf16-cache layout (vkernels#60 follow-up) and as the local-test
 # vehicle for the raw vkernels compute values.
@@ -55,6 +67,43 @@ try:
 except Exception:  # vkernels not importable -> legacy Triton paths only
     _VK_DSA_KPOOL_ASSEMBLE = None
     _VK_DSA_KPOOL_DECODE = None
+
+
+_VK_DSA_KPOOL_DEVICE_MODULE = None  # resolved once; False = not available
+
+
+def _vk_dsa_kpool_device_mod():
+    """Resolve the vkernels C-ABI device module once (None when absent).
+
+    ``dsa_kpool_device`` wraps ``libvkernels_c.so`` (CUDA build, exported by
+    ``capi/cuda_capi_kpool.cpp``) / ``libvkernels_hip.so`` via ctypes -- no
+    compiled Python extension needed. ``available()`` never raises.
+    """
+    global _VK_DSA_KPOOL_DEVICE_MODULE
+    if _VK_DSA_KPOOL_DEVICE_MODULE is None:
+        try:
+            from vkernels import dsa_kpool_device as _mod
+
+            _VK_DSA_KPOOL_DEVICE_MODULE = _mod if _mod.available() else False
+        except Exception:  # vkernels import issue -> torch tier below
+            _VK_DSA_KPOOL_DEVICE_MODULE = False
+    return _VK_DSA_KPOOL_DEVICE_MODULE or None
+
+
+def _vk_dsa_kpool_use_device() -> bool:
+    """True when tier 1 (C-ABI device kernels) should serve this call.
+
+    Precedence: ``VKERNELS_DSA_KPOOL_NUMPY=1`` (numpy reference) and
+    ``VKERNELS_DSA_KPOOL_TORCH=1`` (torch port) both veto tier 1; otherwise
+    tier 1 runs whenever the device library loads. A tier-1 call that hits
+    the device ABI's dtype/layout contract raises TypeError -> the bridge
+    falls back to the torch tier for that call.
+    """
+    if os.environ.get("VKERNELS_DSA_KPOOL_NUMPY") == "1":
+        return False
+    if os.environ.get("VKERNELS_DSA_KPOOL_TORCH") == "1":
+        return False
+    return _vk_dsa_kpool_device_mod() is not None
 
 
 def _vk_dsa_kpool_active(device: torch.device) -> bool:
@@ -343,6 +392,16 @@ def _vk_dsa_kpool_assemble_bridge(
     ``VKERNELS_DSA_KPOOL_NUMPY=1`` to run the numpy reference path instead
     (host round trip, ~1 s per call on big caches -- diagnostics only).
     """
+    if _vk_dsa_kpool_use_device():
+        try:
+            _vk_dsa_kpool_device_mod().dsa_kpool_assemble_fp8(
+                buf, chunk_k, chunk_score, tail_k, tail_score, ape,
+                req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base,
+                loc, write_mask=write_mask, round_scale=round_scale,
+            )
+            return
+        except (TypeError, RuntimeError):
+            pass  # device-ABI contract violation -> torch port below
     if os.environ.get("VKERNELS_DSA_KPOOL_NUMPY") != "1":
         _vk_dsa_kpool_assemble_torch(
             pool, buf, chunk_k, chunk_score, tail_k, tail_score,
@@ -416,6 +475,16 @@ def _vk_dsa_kpool_decode_bridge(
     against the numpy fallback in tests_local/test_dsa_kpool_wiring.py T10.
     Set ``VKERNELS_DSA_KPOOL_NUMPY=1`` for the numpy reference path.
     """
+    if _vk_dsa_kpool_use_device():
+        try:
+            _vk_dsa_kpool_device_mod().dsa_kpool_decode_update_fp8(
+                buf, key, slot_score, tail_k, tail_score, ape, block_tables,
+                req_pool_indices, positions, seq_lens, out_cache_loc,
+                round_scale=round_scale,
+            )
+            return
+        except (TypeError, RuntimeError):
+            pass  # device-ABI contract violation -> torch port below
     if os.environ.get("VKERNELS_DSA_KPOOL_NUMPY") != "1":
         _vk_dsa_kpool_decode_torch(
             pool, buf, tail_k, tail_score, key, slot_score, ape,
@@ -504,6 +573,17 @@ def _vk_dsa_kpool_assemble_native(
     per-vector fp8 scale is dropped. Only rows selected by ``loc`` (and not
     masked out) are touched; all other cache slots keep their content.
     """
+    if _vk_dsa_kpool_use_device():
+        try:
+            _vk_dsa_kpool_device_mod().dsa_kpool_assemble(
+                buf.view(buf.shape[0], pool.slots_per_page, INDEX_HEAD_DIM),
+                chunk_k, chunk_score, tail_k, tail_score, ape,
+                req_pool_idx, n_from_tail, chunk_src_start, tail_logical_base,
+                loc, write_mask=write_mask,
+            )
+            return
+        except (TypeError, RuntimeError):
+            pass  # device-ABI contract violation -> host path below
     import numpy as np
 
     n_pools = req_pool_idx.shape[0]
@@ -564,6 +644,16 @@ def _vk_dsa_kpool_decode_native(
     pool_size - 1``, valid) compress+rotate+write the pool (current token
     substituted); every valid row updates the live tail in place.
     """
+    if _vk_dsa_kpool_use_device():
+        try:
+            _vk_dsa_kpool_device_mod().dsa_kpool_decode_update(
+                buf.view(buf.shape[0], pool.slots_per_page, INDEX_HEAD_DIM),
+                key, slot_score, tail_k, tail_score, ape, block_tables,
+                req_pool_indices, positions, seq_lens, out_cache_loc,
+            )
+            return
+        except (TypeError, RuntimeError):
+            pass  # device-ABI contract violation -> host path below
     import numpy as np
 
     batch = key.shape[0]

@@ -67,7 +67,7 @@ The recipe side is prototyped here:
   upstream sglang file (submodule pin `third_party/sglang` @ `f5bed255`) with
   a dtype-dispatched vkernels path in the two host wrappers:
   cache `uint8` → **legacy-layout bridge** (default bristen path): vkernels
-  `dsa_kpool_*` compute + a torch requant store that reproduces the Triton
+  `dsa_kpool_*` compute + a requant store that reproduces the Triton
   kernels' fp8e4m3 + per-vector-scale bytes EXACTLY (same store offsets, same
   `absmax/448` scale, optional pow2 `round_scale`) — the cache buffer, its
   allocator, the deep_gemm/tilelang readers, cpu offload and `move()` all
@@ -75,7 +75,16 @@ The recipe side is prototyped here:
   (`[num_pages, ssp, 128]`, upstream #60 follow-up shape). Gated to SM80
   (`VKERNELS_DSA_KPOOL_FORCE=1` forces, `VKERNELS_DSA_KPOOL_DISABLE=1`
   vetoes). Call sites are unchanged — **no cache-allocation flip needed** for
-  the bridge path.
+  the bridge path. The compute runs in dispatch order:
+  **(1) C-ABI device kernels** (`vkernels.dsa_kpool_device`: ctypes →
+  `libvkernels_c.so`, the SM80-proven `1de4eec` device kernels + the fp8
+  requant done in-kernel; sync-free, caller-stream, graph-capturable) when
+  the library is deployed (`VKERNELS_LIB`, the sbatch auto-exports
+  `$VKERNELS_PYTHON/lib/libvkernels_c.so`); **(2) torch-on-GPU port**
+  (automatic fallback; `VKERNELS_DSA_KPOOL_TORCH=1` pins it, the job-83120/
+  83152 serving path); **(3) numpy host reference**
+  (`VKERNELS_DSA_KPOOL_NUMPY=1`, diagnostics). A tier-1 call that violates
+  the device ABI's dtype/layout contract falls back to tier 2 for that call.
 - `patched_sources/sitecustomize.py` — installed at `patches_full/` root
   (first on PYTHONPATH, auto-imported at interpreter startup): on SM80 it
   rebinds `deep_gemm.fp8_paged_mqa_logits` / `fp8_mqa_logits` /
@@ -123,14 +132,16 @@ The recipe side is prototyped here:
 
 Remaining before a bristen go/no-go (mirrors the vkernels#60 acceptance list):
 
-1. Device path: this dispatch currently uses the vkernels public Python API
-   (numpy fp32, host round trip) — fine for validation, not for serving.
-   Plug the C-ABI device adapters (`vk_dsa_kpool_assemble` /
-   `vk_dsa_kpool_decode_update`) into the two `_vk_dsa_kpool_*_native`
-   functions, mirroring `meta/diag/glm53/patch_dsa_vk.py` from PR #52, or
-   build the compiled backend (`VKERNELS_BUILD_PYTHON=ON`) in the container.
-   The bridge's requant store is plain torch (device-side, no JIT) and can
-   stay as-is.
+1. ~~Device path~~ **wired** — the dispatch's tier 1 now calls the C-ABI
+   device adapters (`vk_dsa_kpool_assemble_fp8` / `vk_dsa_kpool_decode_update_fp8`
+   via `vkernels.dsa_kpool_device`, ctypes — no compiled Python extension
+   needed) with the torch port as the automatic fallback (T11 covers the
+   dispatch matrix, arg wiring and the ABI contract). **On-cluster steps
+   left**: build `libvkernels_c.so` in the container (vkernels `cuda`
+   CMake preset, sm_80 — `meta/scripts/build_dsa_kpool_a100_cuda.sh` is the
+   wrapper) and deploy it to `$DEPLOY_DIR/vkernels-python/lib/`; the sbatch
+   then auto-exports `VKERNELS_LIB` and the bridge picks tier 1. Until that
+   lands, tier 2 (torch-on-GPU, job-83152 numbers) keeps serving.
 2. ~~First-forward smoke on bristen `flashmla_sparse`~~ **DONE** (see
    [Serving status](#serving-status)); 2-node PP2 `gen_correctness.py` →
    `PASS pass=5/6 crisp=3/3` (Clariden parity) still pending at full probe
@@ -192,7 +203,7 @@ tilelang`.
 
 Further throughput work (compiled vkernels backend, CUDA graphs,
 decode-kernel tuning) is the next lever; correctness of the serving path
-is proven (probe answers crisp, T0–T10 green).
+is proven (probe answers crisp, T0–T11 green).
 
 ## Quick start
 
@@ -213,7 +224,7 @@ SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_5
 | `apply_sm80_patch.sh` | Copy the Beverin overlay and apply the SM80 FP8→bf16 compute patches |
 | `patched_sources/sglang/...` | SM80-patched copies of `fp8_kernel.py`, `fused_moe_triton_kernels.py`, `srt/layers/attention/dsa/kpool_fp8_index.py` (vkernels #60 kpool bridge: legacy fp8+scale store, bf16 native path), and `kernels/ops/attention/dsa/triton_kernel.py` (SM80 `act_quant` torch fallback — job-83091 decode wall) |
 | `patched_sources/sitecustomize.py` | SM80 `deep_gemm` logits shim (paged + ragged torch fallbacks), auto-imported from `patches_full` |
-| `tests_local/test_dsa_kpool_wiring.py` | CPU-only validation of the vkernels #60 kpool wiring + deep_gemm shim (see below) |
+| `tests_local/test_dsa_kpool_wiring.py` | CPU-only validation of the vkernels #60 kpool wiring + deep_gemm shim (T0–T11, incl. the tier-1 device dispatch + `dsa_kpool_device` ABI cross-check vs `hip_capi.hpp`) |
 | `preflight.py` | In-container import test for the GLM-5.3 overlay |
 | `gen_correctness.py` | Greedy correctness/smoke probe against `/v1/completions` |
 | `README.md` | This file |
