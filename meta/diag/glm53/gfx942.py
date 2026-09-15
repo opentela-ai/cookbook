@@ -8,12 +8,13 @@ module-import hook fire, where torch and a GPU are certain.
 import sys
 
 
-def supports_current_device():
+def supports_current_device(tag="device gate"):
     """Return (is_gfx942, gcn_name) for CUDA device 0.
 
     True only on gfx942 (MI300A). Guards the engine patches so a CPU-only
     preflight or a non-MI300A node keeps sglang's native paths (harmless
     there). Returns (False, "") with a logged reason on any probe failure.
+    ``tag`` labels the per-patch failure message (e.g. "DSA-vkernels patch").
     """
     try:
         import torch
@@ -25,7 +26,7 @@ def supports_current_device():
         return ("gfx942" in gcn, gcn)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(
-            f"[sitecustomize] DSA-vkernels patch: device probe failed ({exc!r}); "
-            "NOT patching (sglang will use its native tilelang path)\n"
+            f"[sitecustomize] {tag}: device probe failed ({exc!r}); "
+            "NOT patching (sglang keeps its native path)\n"
         )
         return False, ""

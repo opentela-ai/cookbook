@@ -53,7 +53,8 @@ for p in "$PATCH_DIR"/tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch
          "$PATCH_DIR"/mhc-pre-outnorm-force-nonfused-on-hip.patch \
          "$PATCH_DIR"/mqa-rag-prefill-hip-torch-fallback.patch \
          "$PATCH_DIR"/dsa-kpool-fp8-fnuz-dtype-fix.patch \
-         "$PATCH_DIR"/dsa-kpool-fp8-index-fnuz-dtype-fix.patch; do
+         "$PATCH_DIR"/dsa-kpool-fp8-index-fnuz-dtype-fix.patch \
+         "$PATCH_DIR"/moe-aiter-fp32-topk-glmd.patch; do
   [ -f "$p" ] || continue
   echo "[$(date -Is)] applying patch: $(basename "$p")"
   ( cd "$OVL" && patch -p1 --forward < "$p" ) 2>&1 | grep -viE '^(patching file|Reversed.*previously applied|hunk.*succeeded at| hunk ignored)$' || true

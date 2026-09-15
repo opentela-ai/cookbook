@@ -388,6 +388,13 @@ def _validate_kda_once(kda_hip, kda_cpu, q, k, v, g, beta, B, H, S, D, C, out_de
 
 _DEFAULT_KDA_CHUNK = 64
 
+# One-shot per-process entry diagnostics (issue #45: prove WHICH impl
+# methods the fork's hybrid MLA machinery actually invokes at serving
+# time -- the validate hooks never fired in jobs 638605/639143, meaning
+# forward_mqa was never reached).
+_dbg_mqa_seen = False
+_dbg_mha_seen = False
+
 
 class VkernelMLAImpl(MLACommonImpl):  # type: ignore[misc]
     """Absorbed-form MLA impl that marshals ``vk_hip_mla_fwd`` via ctypes.
@@ -433,6 +440,12 @@ class VkernelMLAImpl(MLACommonImpl):  # type: ignore[misc]
             raise NotImplementedError("VkernelMLA: decode metadata required")
         if not on_gfx942():
             raise NotImplementedError("VkernelMLA: gfx942 only")
+
+        global _dbg_mqa_seen
+        if not _dbg_mqa_seen:
+            _dbg_mqa_seen = True
+            print(f"[VkernelMLA] forward_mqa ENTER B={q.shape[0]} H={q.shape[1]} "
+                  f"dtype={q.dtype} dev={q.device}", flush=True)
 
         decode = attn_metadata.decode
         block_table = decode.block_table
@@ -520,6 +533,22 @@ class VkernelMLABackend(MLACommonBackend):  # type: ignore[misc]
     @staticmethod
     def get_name() -> str:
         return "VKERNELS_MLA"
+
+    def forward_mha(self, *args, **kwargs):
+        """Prefill path: delegate to the fork's native (TRITON) forward_mha.
+
+        One-shot entry print (issue #45): prove the hybrid machinery routes
+        prefill through THIS impl rather than bypassing the backend."""
+        global _dbg_mha_seen
+        if not _dbg_mha_seen:
+            _dbg_mha_seen = True
+            try:
+                q = args[0]
+                print(f"[VkernelMLA] forward_mha ENTER (native prefill) "
+                      f"tokens={q.shape[0]}", flush=True)
+            except Exception:
+                print("[VkernelMLA] forward_mha ENTER", flush=True)
+        return super().forward_mha(*args, **kwargs)
 
     @staticmethod
     def get_impl_cls():

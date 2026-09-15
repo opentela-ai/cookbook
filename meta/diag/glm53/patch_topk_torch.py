@@ -60,7 +60,7 @@ def _install(target_module):
     # exec_module double check; env is normally fixed by then).
     if os.environ.get("GLM53_TOPK_TRANSFORM_BACKEND", "") != "torch":
         return
-    ok, gcn = supports_current_device()
+    ok, gcn = supports_current_device("topk-torch patch")
     if ok:
         _apply(target_module, gcn)
 

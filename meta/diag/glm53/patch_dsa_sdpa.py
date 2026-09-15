@@ -60,9 +60,14 @@ def _forward_standard_mha_sdpa(self, q, k, v, layer, forward_batch, metadata):
         if _qe <= _qs:
             continue
         _ks, _ke = int(cu_k[_i]), int(cu_k[_i + 1])
-        _qi = q[_qs:_qe][None]
-        _ki = k[_ks:_ke][None]
-        _vi = v[_ks:_ke][None]
+        # FIX 2026-09-05 (axis-swap bug): the previous [None]-only slicing fed
+        # SDPA (1, sl_q, H, D) -> softmax over the 64 HEADS instead of the
+        # sequence. Shape-valid, silently wrong in every DSA layer (real-weight
+        # factual probe 0/6: " Paris" absent from top-5 at 5 tokens). Mirrors
+        # clariden's validated _forward_standard_mha_fa3safe.
+        _qi = q[_qs:_qe].transpose(0, 1)[None]  # (1, H,  sl_q, D)
+        _ki = k[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, D)
+        _vi = v[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, Dv)
         _sl_q, _sl_k = _qe - _qs, _ke - _ks
         if causal and _sl_q == _sl_k:
             _oi = _F.scaled_dot_product_attention(
@@ -79,7 +84,7 @@ def _forward_standard_mha_sdpa(self, q, k, v, layer, forward_batch, metadata):
             _oi = _F.scaled_dot_product_attention(
                 _qi, _ki, _vi, scale=scale, enable_gqa=gqa
             )
-        out[_qs:_qe] = _oi[0]
+        out[_qs:_qe] = _oi[0].transpose(0, 1)  # back to (sl_q, H, D)
     return out
 
 
@@ -90,7 +95,7 @@ def _set_dsa_prefill_impl_sdpa(self, forward_batch=None):
     _orig_set_dsa_prefill_impl(self, forward_batch)
     # Device gate at FORWARD time (torch.cuda reliably ready here, unlike import
     # time). Only force use_mha=True on gfx942; non-MI300A keeps native MLA.
-    if not supports_current_device()[0]:
+    if not supports_current_device("DSA-SDPA")[0]:
         return
     if getattr(self, "use_mha", False):
         return
@@ -130,7 +135,7 @@ def _set_dsa_prefill_impl_sdpa(self, forward_batch=None):
 def _install(module):
     global _orig_set_dsa_prefill_impl
     try:
-        _, gcn = supports_current_device()
+        _, gcn = supports_current_device("DSA-SDPA")
     except Exception:  # noqa: BLE001
         gcn = ""
     gcn = gcn or "(no-cuda-device-0-here; gated again at forward time)"

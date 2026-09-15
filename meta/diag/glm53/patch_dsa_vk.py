@@ -87,7 +87,7 @@ def _apply(target_module, gcn):
 
 
 def _install(target_module):
-    ok, gcn = supports_current_device()
+    ok, gcn = supports_current_device("DSA-vkernels patch")
     if ok:
         _apply(target_module, gcn)
 

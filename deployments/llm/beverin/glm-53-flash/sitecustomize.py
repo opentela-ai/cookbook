@@ -8,6 +8,9 @@ module in $GLM53_DIAG_DIR (exported by the sbatch; default
 <cookbook>/meta/diag/glm53) and self-installs on import, gated by its own
 env var / device check:
 
+    patch_moe_dequant.py  routed-MoE expert weights fp8->bf16 in torch on
+                         gfx942, bypassing the broken in-kernel fp8 GEMM
+                         (GLM53_MOE_DEQUANT_BF16=1)
     patch_dsa_vk.py      tilelang DSA forward + topk logits -> vkernels HIP
                          (always on gfx942; the #51/#52 unblock)
     patch_topk_torch.py  kpool top-k transform -> torch bridge
@@ -38,7 +41,8 @@ if not _DIAG:
 else:
     if _DIAG not in sys.path:
         sys.path.insert(0, _DIAG)
-    for _mod in ("patch_dsa_vk", "patch_topk_torch", "fwd_probe", "patch_dsa_sdpa"):
+    for _mod in ("patch_moe_dequant", "patch_dsa_vk", "patch_topk_torch",
+                 "fwd_probe", "patch_dsa_sdpa"):
         try:
             __import__(_mod)
         except Exception as _exc:  # noqa: BLE001

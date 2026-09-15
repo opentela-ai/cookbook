@@ -235,6 +235,23 @@ def _arg_residual(args, kwargs):
     return None
 
 
+def _all_output_tensors(output):
+    """Every tensor in a (possibly nested) output, in order.  Unlike
+    _flat_output this KEEPS secondary tensors (e.g. TopK's (weights, ids))."""
+    import torch
+
+    out = []
+    if isinstance(output, (tuple, list)):
+        for x in output:
+            out.extend(_all_output_tensors(x))
+    elif isinstance(output, dict):
+        for x in output.values():
+            out.extend(_all_output_tensors(x))
+    elif isinstance(output, torch.Tensor):
+        out.append(output)
+    return out
+
+
 def _flat_output(output):
     """The layer may return (hidden_states, topk_indices); the residual is
     the first element.  self_attn/mlp return a single tensor (or tuple)."""
@@ -405,6 +422,62 @@ def _install_on_model(self):
             if sub is None:
                 continue
             _register(sub, _comp_sub_pre(role), _comp_sub_post(role))
+        # GLM53_COMP_CHILDREN=1: additionally hook the nn.Module children of
+        # the target layer (depth 2, so mlp's own gate/topk/experts are hit)
+        # saving child_<path>_{in,out} tensors.  Gated by GLM53_COMP_CHILD_RE
+        # (default 'gate|topk|experts|shared|router|shared_experts') so the
+        # MoE internals can be diffed across machines without reproducing
+        # sglang internals.  Secondary output tensors are saved as _out0,
+        # _out1, ... (TopK returns (weights, ids)).
+        if os.environ.get("GLM53_COMP_CHILDREN", "0") == "1":
+            import re as _re
+
+            import torch as _torch
+
+            pat = _re.compile(os.environ.get("GLM53_COMP_CHILD_RE", "gate|topk|experts|shared|router"))
+            hooked = 0
+            for name, mod in target.named_modules():
+                if mod is target or not isinstance(mod, _torch.nn.Module) or name == "":
+                    continue
+                norm = name.replace(".", "_")
+                if not pat.search(norm):
+                    continue
+                if getattr(mod, "_comp_child_hooked", False):
+                    continue
+                mod._comp_child_hooked = True
+                cls = type(mod).__name__
+
+                def _child_pre(module, args, kwargs, _norm=norm, _cls=cls):
+                    if not (_started and not _completed and _armed and _should_capture()):
+                        return
+                    try:
+                        hs = _arg_hidden_states(args, kwargs)
+                        _save(f"child_{_norm}_in", hs)
+                        _manifest[f"child_{_norm}_class"] = _cls
+                    except Exception:
+                        pass
+
+                def _child_post(module, args, kwargs, output, _norm=norm):
+                    if not (_started and not _completed and _armed and _should_capture()):
+                        return
+                    try:
+                        for i, t in enumerate(_all_output_tensors(output)):
+                            if t.numel() > 40_000_000:  # skip monster intermediates
+                                continue
+                            _save(f"child_{_norm}_out{i}", t)
+                    except Exception:
+                        pass
+
+                try:
+                    _handles.append(mod.register_forward_pre_hook(_child_pre, with_kwargs=True))
+                    _handles.append(mod.register_forward_hook(_child_post, with_kwargs=True))
+                    hooked += 1
+                    sys.stderr.write(
+                        f"[comp_capture] child hook {name} ({cls}) -> child_{norm}_*\n"
+                    )
+                except Exception as exc:
+                    sys.stderr.write(f"[comp_capture] child hook {name} failed: {exc!r}\n")
+            sys.stderr.write(f"[comp_capture] children hooked: {hooked}\n")
         # hc_attn_pre / hc_ffn_pre / hc_post: patch the communicator's
         # MHCState callables directly (NOT the layer's methods — the
         # communicator captured the bound methods at __init__ before our

@@ -808,3 +808,100 @@ SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` (real ~13 min cold start). The
 forward-path correctness bug (NameError + dtype assert crashing every
 ragged-kpool prefill) is FIXED; this validates that the dummy-weight forward
 now serves coherent text with real weights.
+
+---
+
+## REAL-WEIGHT factual probe (job 623407) — FAIL 0/6 → NEW bug found + FIXED: DSA-SDPA rebind axis swap
+
+### Setup + result
+
+First real-weight serve on beverin (`LOAD_FORMAT=auto GEN_CORRECTNESS_SMOKE=0
+GEN_CORRECTNESS_MIN_PASS=5 SMOKE=1`, job 623407, nid002744). Engine came up
+clean (health after ~3183 s; 62-shard multi-thread load; CUDA graphs captured;
+18 tok/s decode) — every prior fix holds (no NameError, no fnuz assert, hc_pre
+fix live). The factual gate FAILED 0/6:
+
+- Prompts 1-2: 180 s per-request timeouts (first-request JIT stall).
+- Prompts 3-6: **degenerate repetition** — "The first 10 10 10 10…",
+  " A: A: A: A:…", " : 5555 5555…", " : [3]3]3]3]…". Not random garbage:
+  locally-plausible tokens that collapse into loops.
+
+### Live-server token-1 diagnostic (engine held after probe failure, SMOKE=1)
+
+`srun --jobid=623407 --overlap curl 127.0.0.1:30000/v1/completions` with
+`max_tokens=1, logprobs=5` for "The capital of France is":
+
+```
+top-5: " is"(-1.42) " the"(-1.85) "is"(-2.79) " now"(-3.29) " not"(-3.35)
+```
+
+**" Paris" is not even in the top-5.** Token 1 is pure prefill → the PREFILL
+path is numerically corrupted at 5 tokens, producing a coherent-but-wrong
+distribution; decode then collapses into repetition attractors. This ALSO
+rules out the fp8 indexer paths we fixed (5-token prompts take
+`_forward_cuda_skip_logits` dense routing both prefill and decode — the
+`hip_fp8_mqa_logits` shim / ragged topk / dtype fixes are NOT exercised).
+
+### Root cause: `_forward_standard_mha_sdpa` in overlay `pylib/sitecustomize.py` feeds SDPA transposed axes
+
+The always-on gfx942 DSA-SDPA rebind ("direct rebind, clariden b8d5296 style")
+replaced `DeepseekSparseAttnBackend._forward_standard_mha` with a torch-SDPA
+ragged loop. The original sglang method (and clariden's own
+`_forward_standard_mha_fa3safe` patch in the clariden sbatch) both view
+q/k/v as **(total_tokens, H, D)** ("FA stores (total, H, D)") and SDPA requires
+**(batch, H, seq, D)** — clariden transposes: `q[s:e].transpose(0,1)[None]`
+and writes back with `_oi[0].transpose(0,1)`.
+
+The beverin rebind skipped the transposes:
+
+```python
+_qi = q[_qs:_qe][None]        # (1, sl_q, H, D) -> SDPA reads Hq=sl_q, L=H !
+out[_qs:_qe] = _oi[0]         # writes (sl_q, H, D) from an (sl_q, H, D) result
+```
+
+Softmax ran over the **64 heads** instead of the sequence. Shape-valid (the
+axes swap is dimension-compatible whenever one is willing to read the tensor
+wrong), so it never crashed — silently corrupting **every DSA layer** (43 of
+45; layers 0-2 are GDN/LinearAttention). Symptom ladder matches exactly:
+embeddings/GDN coherent → grammatical tokens; DSA layers garbage → wrong
+distribution + repetition collapse.
+
+Why it survived validation: (1) every beverin-vs-clariden capture diff was
+**layer-0 only** (GDN — doesn't touch the DSA rebind); (2) dummy-weight smokes
+only gate on non-empty output; (3) the rebind is shape-valid so no assert/
+traceback ever fired.
+
+### The fix (overlay `pylib/sitecustomize.py`, mirrored to the cookbook canonical)
+
+```python
+# FA/sglang store (total_tokens, H, D); SDPA wants (batch, H, seq, D).
+_qi = q[_qs:_qe].transpose(0, 1)[None]  # (1, H,  sl_q, D)
+_ki = k[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, D)
+_vi = v[_ks:_ke].transpose(0, 1)[None]  # (1, Hk, sl_k, Dv)
+...
+out[_qs:_qe] = _oi[0].transpose(0, 1)  # back to (sl_q, H, D)
+```
+
+Applied with backups (`sitecustomize.py.bak-sdpa-axeswap-20260905`) to BOTH
+the cookbook canonical (`deployments/llm/beverin/glm-53-flash/sitecustomize.py`,
+819 lines — what `build_overlay.sh` installs) and the live
+`$OVL/pylib/sitecustomize.py`; `py_compile` OK; both copies diff-identical;
+local repo canonicalized to the 819-line version (the old 51-line local
+dispatcher was stale and would have clobbered the canonical on rsync).
+clariden needs NO change (its fa3safe patch already had the transposes).
+Both rebind paths (meta_path `_SdpaWrapLoader` + direct rebind) assign the
+same function object, so one fix covers both.
+
+### Validation in flight
+
+- clariden job **3298938**: reference capture — real weights,
+  `GLM53_CAPTURE_PROBE=1 GLM53_PROBE_REPEATS=6` (~65-token deterministic
+  prompt), `GLM53_COMP_MODE=layers GLM53_COMP_MIN_TOKENS=40`
+  (init/graph forwards are ≤9 tokens, so the 65-token probe is the only
+  forward that can latch), tag `clariden_l45_s65`.
+- beverin job **623729**: identical capture config on the FIXED overlay
+  (tag `beverin_l45_s65_fixed`) + the full factual gen probe
+  (`GEN_CORRECTNESS_SMOKE=0 GEN_CORRECTNESS_MIN_PASS=5`,
+  `GEN_CORRECTNESS_PER_REQ_TIMEOUT=240` for the first-request JIT stall).
+  Success = factual probe ≥5/6 (all 3 crisp) AND `diff_layers.py
+  beverin_l45_s65_fixed clariden_l45_s65` shows all-45-layer parity.

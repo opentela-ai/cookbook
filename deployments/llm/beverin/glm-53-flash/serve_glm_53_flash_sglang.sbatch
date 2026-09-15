@@ -249,7 +249,10 @@ export GLM53_FWD_PROBE="${GLM53_FWD_PROBE:-1}"
 # Shared GLM-5.3 diagnostic harness (comp_capture/capture_probe/comp_diff,
 # import_hook, the engine patch modules). Lives in the cookbook checkout so
 # beverin and clariden run the IDENTICAL copies (one source of truth).
-export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/meta/diag/glm53}"
+# Same SLURM_SUBMIT_DIR-first pattern as SCRIPT_DIR above: under sbatch the
+# batch script can be spooled, so BASH_SOURCE alone may not resolve to this
+# recipe dir (job 625057 resolved GLM53_DIAG_DIR to /meta/diag/glm53).
+export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/../../../.." && pwd)/meta/diag/glm53}"
 # Component/layer I/O capture (comp_capture.py, gated by GLM53_COMP_CAPTURE).
 # First-forward-only; zero-cost when GLM53_COMP_CAPTURE is unset. Layer 0's
 # input is the embedding (deterministic, identical on any arch for the same
@@ -667,10 +670,28 @@ trap 'stop_otela' EXIT TERM INT
 # the container's python3 (cp310, not the login's 3.6) loads gen_correctness.py.
 (
   deadline=$(( SECONDS + HEALTH_TIMEOUT ))
-  until curl -sf --max-time 5 "http://127.0.0.1:$SERVE_PORT/health" >/dev/null 2>&1; do
-    [ $SECONDS -ge $deadline ] && { echo "[$(date -Is)] health timeout after ${HEALTH_TIMEOUT}s; not registering" >&2; exit 1; }
-    sleep 20
-  done
+  # Health gate, two modes:
+  #   default: poll /health (fast engines; the detok heartbeat stays fresh).
+  #   SLOW_ENGINE=1 (eager decode / streaming dequant): poll /generate with
+  #   max_tokens=1 instead.  /health livelocks on slow engines: every aborted
+  #   curl leaves a ~24-s generate queued, the detokenizer never idles, its
+  #   heartbeat goes stale and EVERY later /health fails until the deadline
+  #   (625724 lesson).  A 1-token /generate is the stronger end-to-end proof
+  #   anyway and it drains the queue instead of growing it.
+  if [ "${SLOW_ENGINE:-0}" = "1" ]; then
+    until curl -sf --max-time 300 -X POST "http://127.0.0.1:$SERVE_PORT/generate" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "ping", "sampling_params": {"max_new_tokens": 1, "temperature": 0}}' \
+            >/dev/null 2>&1; do
+      [ $SECONDS -ge $deadline ] && { echo "[$(date -Is)] health timeout after ${HEALTH_TIMEOUT}s; not registering" >&2; exit 1; }
+      sleep 30
+    done
+  else
+    until curl -sf --max-time 5 "http://127.0.0.1:$SERVE_PORT/health" >/dev/null 2>&1; do
+      [ $SECONDS -ge $deadline ] && { echo "[$(date -Is)] health timeout after ${HEALTH_TIMEOUT}s; not registering" >&2; exit 1; }
+      sleep 20
+    done
+  fi
   echo "[$(date -Is)] engine healthy after ~$((HEALTH_TIMEOUT - (deadline - SECONDS)))s"
 
   # --- capture probe (GLM53_CAPTURE_PROBE=1): fire ONE deterministic ~2k-token
