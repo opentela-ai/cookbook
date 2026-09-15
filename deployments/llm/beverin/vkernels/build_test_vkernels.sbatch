@@ -78,15 +78,33 @@ echo "[phase1] C ABI shared library:"
 HIP_SO=$(find "$B" -name "libvkernels_hip.so" 2>/dev/null | head -1)
 if [ -n "$HIP_SO" ]; then
   echo "  found: $HIP_SO"
-  nm -D "$HIP_SO" | grep -E "vk_fused|vk_mla|vk_kda" || echo "  WARNING: no vk_* symbols"
+  # vk_hip_* (device C ABI) and vk_fused_moe_mxfp4 (legacy MoE entry) both
+  # live here; nm -D shows them because the link is plain -fno-lto (#43).
+  nm -D "$HIP_SO" | grep -E "vk_hip_|vk_fused" | head -5 \
+    || echo "  WARNING: no vk_hip_*/vk_fused symbols"
 else
   echo "  WARNING: libvkernels_hip.so not found under $B"
 fi
+CPU_SO=$(find "$B" -name "libvkernels.so" 2>/dev/null | head -1)
+if [ -n "$CPU_SO" ]; then
+  echo "  found: $CPU_SO (host CPU-reference C ABI)"
+  nm -D "$CPU_SO" | grep -E "vk_mla_fwd|vk_kda_naive_delta_rule_fwd" \
+    || echo "  WARNING: CPU oracle symbols missing"
+else
+  echo "  WARNING: libvkernels.so (host CPU-reference C ABI) not found under $B"
+fi
 
 # ---- Phase 2: Python smoke test (ctypes + C ABI) ----
-echo "[phase2] Python smoke test (ctypes: libvkernels_hip.so) ..."
-export VKERNELS_DIR="'"$VKERNELS_DIR"'"
-python3 "'"$VKERNELS_DIR"'/test_hip_bindings.py" 2>&1
+# test_hip_bindings.py lived at the repo root of the pre-#55 tree and was
+# superseded by the C++ GPU tests above + the serving-side validators; skip
+# (not fail) when absent so phase-1 evidence is not discarded.
+if [ -f "'"$VKERNELS_DIR"'/test_hip_bindings.py" ]; then
+  echo "[phase2] Python smoke test (ctypes: libvkernels_hip.so) ..."
+  export VKERNELS_DIR="'"$VKERNELS_DIR"'"
+  python3 "'"$VKERNELS_DIR"'/test_hip_bindings.py" 2>&1
+else
+  echo "[phase2] SKIPPED: test_hip_bindings.py absent at this commit (C++ GPU tests are the gate)"
+fi
 
 echo "[done] all phases complete"
 '
