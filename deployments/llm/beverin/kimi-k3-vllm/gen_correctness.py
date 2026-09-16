@@ -290,6 +290,7 @@ def main():
         "crisp_total": CRISP_TOTAL,
         "pass": ok,
         "crisp_pass": crisp_ok,
+        "smoke": bool(smoke),
         "verdict": "PASS" if verdict else "FAIL",
         "kda_recall": kda_recall_entry,
         "elapsed_s": round(time.time() - t_start, 3),
