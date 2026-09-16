@@ -229,11 +229,15 @@ try:
         _orig_gpb = _oracle_mod._get_priority_backends
 
         def _patched_gpb():
-            return [
-                _oracle_mod.Mxfp4MoeBackend.AITER_MXFP4_BF16,
-                _oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16,
-                _oracle_mod.Mxfp4MoeBackend.TRITON_UNFUSED,
-            ]
+            # VKERNELS_MOE=0 removes our backend from the priority list so the
+            # fork falls through to the known-good TRITON_UNFUSED backend. Used
+            # to isolate issue #45 attention validation from the MoE backend
+            # (VKERNELS_MXFP4_BF16 has produced degenerate serving output).
+            backends = [_oracle_mod.Mxfp4MoeBackend.AITER_MXFP4_BF16]
+            if os.environ.get("VKERNELS_MOE", "1") == "1":
+                backends.append(_oracle_mod.Mxfp4MoeBackend.VKERNELS_MXFP4_BF16)
+            backends.append(_oracle_mod.Mxfp4MoeBackend.TRITON_UNFUSED)
+            return backends
 
         _oracle_mod._get_priority_backends = _patched_gpb
 except Exception as _e:
