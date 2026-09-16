@@ -808,3 +808,11 @@ else:
         "K3_DISABLE_KDA=1 (all-MLA fallback).",
         flush=True,
     )
+
+if os.environ.get("K3_NAN_CHECK", "0") == "1":
+    try:
+        from nan_hook import install as _nan_install
+
+        _nan_install()
+    except Exception as e:
+        print(f"[sitecustomize] NaN hook skipped: {e}", flush=True)
