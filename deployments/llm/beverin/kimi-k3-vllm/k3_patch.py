@@ -99,6 +99,20 @@ else:
     print("WARN: vkernels_attn.py not found next to k3_patch.py "
           f"({_va_src}), VkernelMLA/VkernelKDA disabled", flush=True)
 
+# --- install nan_hook.py into the overlay (issue #45 NaN localiser) ---
+# sitecustomize.py does ``from nan_hook import install`` when K3_NAN_CHECK=1;
+# the import resolves against $K3/home/pylib (first on PYTHONPATH), so the
+# module must live beside sitecustomize.py, not just in the deploy tree.
+_nh_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "nan_hook.py")
+if os.path.isfile(_nh_src):
+    _nh_dst = os.path.join(K3, "home/pylib", "nan_hook.py")
+    shutil.copyfile(_nh_src, _nh_dst)
+    print(f"installed nan_hook.py -> {_nh_dst} (K3_NAN_CHECK)", flush=True)
+else:
+    print("WARN: nan_hook.py not found next to k3_patch.py "
+          f"({_nh_src}), K3_NAN_CHECK disabled", flush=True)
+
 import glob as _glob_mod
 _vdir = os.environ.get("VKERNELS_DIR", "/capstor/scratch/cscs/xyao/vkernels")
 # WHY prefer build/hip/ over build/cabi/: the build/cabi/ .so (PR #44) is
