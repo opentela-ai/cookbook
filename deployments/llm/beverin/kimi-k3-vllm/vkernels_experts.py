@@ -8,9 +8,13 @@ passed as raw device pointers. The kernel does the full computation:
 gate-up GEMM -> activation (SwiGLU/SiTU) -> down GEMM -> routing weight
 application -> top-k summation. Output is fp32, converted to bf16.
 
-moe_align_block_size is done on CPU (small cost for routing metadata,
-O(M*top_k) tokens sorted by expert). This can be replaced with a GPU
-implementation later for performance.
+moe_align_block_size runs ON-DEVICE by default (issue #78): the HIP
+vk_hip_moe_align_block_size kernel keeps topk_ids/sids/eids on the GPU,
+removing the topk_ids.cpu() host round-trip that was 97-100% of PP0's
+per-call moe:vkernel_apply (and the ~3x PP1/PP2 breakable regression).
+Set VKERNELS_GPU_ALIGN=0 to force the legacy CPU path (A/B profiling);
+prefill (M*top_k > 1024, single-block kernel limit) and symbol-absent
+builds fall back to CPU automatically.
 
 Validated on MI300A (gfx942) — all 8 C++ GPU tests + 4 Python ctypes
 tests pass (job 596227). See deployments/llm/beverin/vkernels/README.md.
@@ -185,6 +189,65 @@ def _resolve_moe_fn(lib):
 
 
 # ---------------------------------------------------------------------------
+def resolve_align_fn(lib):
+    """Return the HIP on-device ``moe_align_block_size`` C ABI fn (or None).
+
+    ``vk_hip_moe_align_block_size`` (issue #78) reads ``topk_ids`` on-device
+    on the caller's stream — ordered after the expert-dispatch all-to-all —
+    and writes the block-aligned ``sorted_ids`` / ``expert_ids`` WITHOUT the
+    ``topk_ids.cpu()`` host round-trip.  Returns ``None`` when the symbol is
+    absent (older build) so the caller can fall back to the CPU path.
+    """
+    fn = getattr(lib, "vk_hip_moe_align_block_size", None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_int
+    fn.argtypes = [
+        ctypes.c_void_p,  # topk_ids      [N] int32 (device)
+        ctypes.c_void_p,  # expert_map    [num_experts] int32 (device), or NULL
+        ctypes.c_int,     # M
+        ctypes.c_int,     # top_k
+        ctypes.c_int,     # block_size
+        ctypes.c_int,     # num_experts   (global)
+        ctypes.c_int,     # local_n       (experts on this rank)
+        ctypes.c_int,     # max_EM        (host high-water bound)
+        ctypes.c_void_p,  # sorted_ids    [max_EM] int32 (device)
+        ctypes.c_void_p,  # expert_ids    [max_EM/block_size] int32 (device)
+        ctypes.c_void_p,  # out_EM        [1] int32 (device; NOT read fast-path)
+        ctypes.c_void_p,  # stream
+    ]
+    return fn
+
+
+# On-device moe_align_block_size is the DEFAULT (issue #78).  Set
+# VKERNELS_GPU_ALIGN=0 to force the legacy CPU align path (A/B profiling).
+_GPU_ALIGN = os.environ.get("VKERNELS_GPU_ALIGN", "1") not in ("0", "false")
+
+# Persistent [1] int32 device slot for the align kernel's out_EM — written
+# by the GPU, never read on the host fast-path.  Allocated once per device
+# on the eager warmup so the pointer is capture/replay-stable.
+_persistent_out_em: dict = {}
+
+
+def _align_em_bound(M, top_k, local_n, block_size):
+    """Tight host upper bound on ``EM`` (no device sync); issue #78.
+
+    Worst-case routing: each of ``min(N, local_n)`` experts gets at least
+    one token (a full block each); the remainder pads to block_size
+    multiples.  A constant per batch shape, so the GEMM grid
+    (``bound / block_size`` blocks) is capture-safe and the kernels
+    early-out the padding blocks/rows (sentinel ``sids == N``).
+    """
+    N = M * top_k
+    if N <= 0:
+        return block_size
+    head = min(N, local_n) * block_size
+    if N <= local_n:
+        return head
+    rem = ((N - local_n) + block_size - 1) // block_size * block_size
+    return head + rem
+
+
 # moe_align_block_size (CPU reference, matching vkernels' expected format)
 # ---------------------------------------------------------------------------
 
@@ -526,40 +589,95 @@ class VkernelFusedExperts(UnfusedOAITritonExperts):
         # Block size: 16 for decode (small M), 64 for prefill (large M)
         block_size = 16 if M <= 32 else 64
 
-        # moe_align_block_size (CPU, then copy to GPU). Phase profiling:
+        # moe_align_block_size: ON-DEVICE by default (issue #78) — the
+        # topk_ids.cpu() host round-trip (CPU fallback below) waited on the
+        # dispatch all-to-all and was 97-100% of PP0's per-call
+        # moe:vkernel_apply (and the ~3x PP1/PP2 breakable regression).
+        # Phase profiling (CPU fallback path):
         #   moe:apply.cpu_copy  — GPU->CPU sync (waits for the dispatch
         #     all-to-all that produced topk_ids) + the host copy
         #   moe:apply.cpu_align — the pure-Python _moe_align_block_size_cpu
         #   moe:apply.gpu_copy  — sids/eids host->device
         #   moe:apply.launch    — the ctypes C call (issues kernels on stream)
+        # GPU path: a single moe:apply.gpu_align region, no host wait.
         # record_function is a no-op when no profiler is attached.
-        with record_function("moe:apply.cpu_copy"):
-            topk_ids_flat = (
-                topk_ids.contiguous().view(-1).cpu().numpy().astype(np.int32)
-            )
-            expert_map_np = (
-                expert_map.cpu().numpy().astype(np.int32)
-                if expert_map is not None
-                else None
-            )
-        with record_function("moe:apply.cpu_align"):
-            sids_np, eids_np, EM = _moe_align_block_size_cpu(
-                topk_ids_flat, global_num_experts, block_size, expert_map_np
-            )
-        with record_function("moe:apply.gpu_copy"):
-            # Copy routing metadata INTO persistent buffers (no per-call GPU
-            # allocation).  The C kernel reads sids/eids via raw ctypes
-            # pointers that PyTorch's allocator cannot track, so re-
-            # allocating here would let the allocator recycle the storage
-            # mid-capture/replay -> "Memory access fault by GPU node-X".
-            d_sids = self._get_persistent_sids(
-                dev, EM, top_k, global_num_experts, E
-            )
-            d_eids = self._get_persistent_eids(
-                dev, EM, top_k, global_num_experts, E
-            )
-            d_sids.copy_(torch.from_numpy(sids_np))
-            d_eids[: EM // block_size].copy_(torch.from_numpy(eids_np))
+        # Acquired before the align branch (no sync): the on-device routing
+        # the GPU align reads when enabled, the input the CPU fallback
+        # .cpu()'s otherwise.  Kept alive for the whole apply so the raw
+        # device pointer cannot be recycled under an in-flight kernel.
+        topk_ids_dev = topk_ids.contiguous().view(-1)
+        stream = torch.cuda.current_stream().cuda_stream
+        align_fn = resolve_align_fn(lib) if _GPU_ALIGN else None
+        use_gpu = align_fn is not None and (M * top_k) <= 1024
+        if use_gpu:
+            with record_function("moe:apply.gpu_align"):
+                # High-water EM bound: a host constant per batch shape, so
+                # the GEMM grid (bound/block_size blocks) is capture-safe;
+                # the kernels early-out the padding blocks/rows.
+                EM = min(
+                    _align_em_bound(M, top_k, E, block_size),
+                    self._max_em_count(_max_num_tokens_hint(), top_k, E),
+                )
+                d_sids = self._get_persistent_sids(
+                    dev, EM, top_k, global_num_experts, E
+                )
+                d_eids = self._get_persistent_eids(
+                    dev, EM, top_k, global_num_experts, E
+                )
+                key = (dev.index,)
+                d_out_em = _persistent_out_em.get(key)
+                if d_out_em is None:
+                    d_out_em = torch.empty(1, dtype=torch.int32, device=dev)
+                    _persistent_out_em[key] = d_out_em
+                expert_map_dev = (
+                    expert_map.contiguous() if expert_map is not None else None
+                )
+                rc = align_fn(
+                    ctypes.c_void_p(topk_ids_dev.data_ptr()),
+                    ctypes.c_void_p(expert_map_dev.data_ptr())
+                    if expert_map_dev is not None else None,
+                    ctypes.c_int(M),
+                    ctypes.c_int(top_k),
+                    ctypes.c_int(block_size),
+                    ctypes.c_int(global_num_experts),
+                    ctypes.c_int(E),
+                    ctypes.c_int(EM),
+                    ctypes.c_void_p(d_sids.data_ptr()),
+                    ctypes.c_void_p(d_eids.data_ptr()),
+                    ctypes.c_void_p(d_out_em.data_ptr()),
+                    ctypes.c_void_p(stream),
+                )
+            if rc != 0:  # VK_OK
+                # ABI rejected the inputs; fall back to the proven CPU path.
+                use_gpu = False
+        if not use_gpu:
+            with record_function("moe:apply.cpu_copy"):
+                topk_ids_flat = (
+                    topk_ids_dev.cpu().numpy().astype(np.int32)
+                )
+                expert_map_np = (
+                    expert_map.cpu().numpy().astype(np.int32)
+                    if expert_map is not None
+                    else None
+                )
+            with record_function("moe:apply.cpu_align"):
+                sids_np, eids_np, EM = _moe_align_block_size_cpu(
+                    topk_ids_flat, global_num_experts, block_size, expert_map_np
+                )
+            with record_function("moe:apply.gpu_copy"):
+                # Copy routing metadata INTO persistent buffers (no per-call GPU
+                # allocation).  The C kernel reads sids/eids via raw ctypes
+                # pointers that PyTorch's allocator cannot track, so re-
+                # allocating here would let the allocator recycle the storage
+                # mid-capture/replay -> "Memory access fault by GPU node-X".
+                d_sids = self._get_persistent_sids(
+                    dev, EM, top_k, global_num_experts, E
+                )
+                d_eids = self._get_persistent_eids(
+                    dev, EM, top_k, global_num_experts, E
+                )
+                d_sids.copy_(torch.from_numpy(sids_np))
+                d_eids[: EM // block_size].copy_(torch.from_numpy(eids_np))
 
         # Routing weights: if already applied on input, use ones
         if apply_router_weight_on_input:
