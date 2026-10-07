@@ -540,7 +540,12 @@ except Exception as e:
 
 # ----------------------------------------------------------------- topology --
 HEAD="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
-HEAD_IP="$(scontrol show node "$HEAD" | awk -F'= *' '/NodeAddr=/{print $2; exit}')"
+# kimi-k3 JSC pattern: DNS-resolve the head hostname. scontrol show node's
+# NodeAddr line is "NodeAddr=IP NodeHostName=host" — an awk field split on
+# '=' yields "IP NodeHostName", which c10d then fails to resolve (the
+# 2215062 smoke hung in rendezvous "gai error" retries before this fix).
+HEAD_IP="$(getent hosts "$HEAD" | awk '{print $1}' | head -1)"
+[ -z "$HEAD_IP" ] && HEAD_IP="$(scontrol show node "$HEAD" | grep -oE 'NodeAddr=[^ ]+' | cut -d= -f2 | head -1)"
 export HEAD HEAD_IP
 echo "head: $HEAD ($HEAD_IP)  serve port: $SERVE_PORT"
 
