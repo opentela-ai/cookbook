@@ -622,9 +622,15 @@ export HOME="${HOME:-/e/scratch/reformo/yao4/glm-53-flash/home}"
 export HF_HOME="${HF_HOME:-/e/scratch/reformo/yao4/glm-53-flash/cache/hf}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/e/scratch/reformo/yao4/glm-53-flash/cache/xdg}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/e/scratch/reformo/yao4/glm-53-flash/cache/triton}"
+# sglang's compiled-kernel cache (DeepGEMM JIT, ~10-20 min first time).
+# SGLANG_CACHE_DIR defaults to $HOME/.cache/sglang, but apptainer remaps HOME
+# to the passwd home (/e/home — NFS, quota) regardless of the exported HOME
+# (observed on job 2215846), so pin it to /e/scratch: the JIT session is paid
+# ONCE, and every later job skips it.
+export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-/e/scratch/reformo/yao4/glm-53-flash/cache/sglang}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1
-mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR"
+mkdir -p "$HOME" "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$SGLANG_CACHE_DIR"
 
 # sitecustomize.py (weight-load barrier + kpool-tail + SDPA patches) is
 # auto-imported by Python at startup with PATCH_DIR first on PYTHONPATH;
