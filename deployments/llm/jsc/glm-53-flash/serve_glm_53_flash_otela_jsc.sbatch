@@ -787,6 +787,9 @@ exec "$OTELA_BIN" start \\
   --service.name "$OTELA_SERVICE_NAME" \\
   --service.port "$SERVE_PORT"
 OTELA_SH
+# Executable: the worker srun runs it via bash -c '"$0" …', which exec's the
+# path directly — without +x it dies with exit 126 (job 2217107).
+chmod +x "$RUNDIR/otela.sh"
 echo "otela worker: $OTELA_BIN ($OTELA_VERSION) via relay $RELAY_ADDR"
 
 # ================================================= registration + lifecycle ==
