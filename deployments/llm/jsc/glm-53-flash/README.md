@@ -116,6 +116,32 @@ clean LEFT).
 | `SERVEKIT_BENCH` | 1 | pre-registration bench C=16 n=64 |
 | `OTELA_REGISTER` | auto | auto/1/0: dummy-weight engines never hit the mesh; smoke run ends the job cleanly |
 
+## First bring-up (2026-10-07) — verified end-to-end
+
+- Weights: 306 GiB in **126 s** from HF (login node); engine-side shard
+  load **163 s** (4 ranks, /e/scratch EXA). Image build ~45 min (11 GB SIF).
+- Dummy smoke (job 2215846): pipeline healthy in **382 s**, SMOKE 6/6,
+  bench OK, registration correctly skipped, clean self-cancel.
+- Real run (job 2217607, TP4 on jpbo-078-36): healthy in **362 s** (JIT
+  cached), gen probe **5/6 crisp 3/3 PASS**, bench **333 output tok/s**
+  (C=16, n=64, in 1024 tok / out 256 tok), `max_total_num_tokens=286592`,
+  `max_running_requests=17` (the clariden shape). Worker registered via
+  the relay (`Registering LLM service` + `Relay reservation … succeeded`)
+  and **api.opentela.ai served correct completions from JSC** within
+  ~2 min of registration.
+- Findings fixed along the way (all committed):
+  1. `HEAD_IP` must come from `getent hosts` — scontrol's `NodeAddr=` line
+     splits into `"IP NodeHostName"`, and c10d hangs resolving it (2215062).
+  2. `otela.sh` needs `chmod +x` — the worker srun exec's the path and dies
+     with exit 126 otherwise (2217107).
+  3. apptainer remaps `HOME` to the passwd home (`/e/home`, NFS quota)
+     regardless of the exported HOME — pin `SGLANG_CACHE_DIR` to /e/scratch
+     so the DeepGEMM JIT session (10-20 min first run) is paid once.
+- Scheduling: a 12 h `--time` backfills poorly on busy days (planned-node
+  reservations eat idle capacity); the 4 h submit started in ~2 min.
+  Use `--time` to trade window length for queue latency; renewal is the
+  documented pattern anyway.
+
 ## Carried findings (why the defaults are what they are)
 
 - **tilelang DSA pins + sitecustomize patches** — the aarch64 image has no
