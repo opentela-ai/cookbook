@@ -77,8 +77,8 @@ export DEPLOY_DIR="${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-beverin
 # v0.5.18 image defaults.
 export OVL="${OVL:-$DEPLOY_DIR/overlay}"
 # Clariden aarch64/CUDA build = the only image shipping GLM-5.3 Python; its
-# source is extracted into $OVL (NOT the runtime image — the EDF's ROCm image is).
-export OVERLAY_SRC="${OVERLAY_SRC:-/capstor/scratch/cscs/xyao/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh}"
+# source is extracted into $OVL (NOT the runtime image — the EDF's ROCm image
+# is). Build it once: bash build_overlay.sh (stages from the aarch64 .sqsh).
 # ~306 GB FP8 e4m3; glm5_next resolves from the OVERLAY's transformers
 # (5.16.0.dev0), not the image's 5.12.
 export MODEL_PATH="${MODEL_PATH:-/capstor/scratch/cscs/xyao/models/zai-org/GLM-5.3-Flash}"
@@ -91,9 +91,8 @@ export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-1}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
-# FP8 e4m3 DYNAMIC (not mxfp4) -> native fp8 MoE path; `auto` lets the image
-# pick (pin MOE_BACKEND if auto dequantizes to bf16 and OOMs).
-export MOE_BACKEND="${MOE_BACKEND:-auto}"
+# FP8 e4m3 DYNAMIC (not mxfp4) -> native fp8 MoE path; GLM53_MOE_RUNNER=auto
+# lets the image pick (pin triton/marlin if auto dequantizes to bf16 and OOMs).
 
 # --- DSA backends (THE kpool>1 gate — see the header block) -----------------
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
