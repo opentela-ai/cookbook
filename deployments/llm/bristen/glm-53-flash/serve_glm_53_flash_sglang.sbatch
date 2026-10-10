@@ -23,18 +23,10 @@
 # Serve zai-org/GLM-5.3-Flash (FP8 e4m3 ~306 GB) on CSCS Bristen (4x A100 /
 # node, x86_64, NVIDIA) using the upstream CUDA SGLang image from Docker Hub.
 #
-# The Beverin overlay (built from the Clariden aarch64/CUDA image) supplies the
-# GLM-5.3 Python source code (sglang.srt.models.glm5_next +
-# transformers.models.glm5_next).  Its pure-Python files are prepended to
-# PYTHONPATH over the dev-cu13 image.  The overlay's ROCm-specific pieces
-# (overlay/pylib/sitecustomize.py, rocm_libs, overlay vkernels) are
-# intentionally NOT added, because they target MI300A gfx942.  The cookbook's
-# device-agnostic vkernels python package (vkernels#60, pure-Python fallback)
-# IS added instead — the SM80 DSA kpool bridge (patches_full) imports it.
-#
-# Memory note: GLM-5.3-Flash FP8 is ~306 GB.  On 4x A100 80 GB that is ~77 GB
-# weights / GPU, leaving very little headroom.  Keep --context-length small for
-# smoke tests (the recipe defaults to 2048) and --mem-fraction-static high.
+# GLM-5.3 Python sources come from the Beverin overlay (pure-Python files only,
+# ROCm pieces excluded; the device-agnostic vkernels#60 package is added for the
+# SM80 DSA kpool bridge). Details: README "Hardware / image" +
+# "SM80 DSA kpool wiring". A100 memory math: README "SM80 FP8 compute patch".
 #
 # Usage:
 #   sbatch serve_glm_53_flash_sglang.sbatch
@@ -46,9 +38,15 @@ set -uo pipefail
 # ----------------------------------------------------- script + deploy dirs --
 # Slurm may stage the batch script under /var/spool/slurmd/jobXXXX, so do not
 # derive helper-script paths from BASH_SOURCE.  The deploy dir is the fixed
-# location where preflight.py, engine.sh and gen_correctness.py live.
+# location where preflight.py, engine.sh and gen_correctness.py live
+# (up.sh stages them from this repo checkout).
 export DEPLOY_DIR="${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-bristen}"
 export SCRIPT_DIR="$DEPLOY_DIR"
+# gen_correctness.py: canonical copy lives in the repo's meta/common/; the
+# staged copy in $DEPLOY_DIR wins if present (up.sh stages it).
+GEN_PROBE_SCRIPT="$SCRIPT_DIR/gen_correctness.py"
+[ -f "$GEN_PROBE_SCRIPT" ] || GEN_PROBE_SCRIPT="${SLURM_SUBMIT_DIR:-}/meta/common/gen_correctness.py"
+[ -f "$GEN_PROBE_SCRIPT" ] || { echo "FATAL: gen_correctness.py not found in $SCRIPT_DIR nor ${SLURM_SUBMIT_DIR:-<unset>}/meta/common" >&2; exit 1; }
 
 # GLM-5.3 Python overlay (reused from Beverin; pure Python only)
 export OVL="${OVL:-/capstor/scratch/cscs/xyao/glm-53-flash-beverin/overlay}"
@@ -76,34 +74,19 @@ export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
 # aws_ofi_nccl plugin (engine.sh) carries the data path over CXI.
 export GLM53_NIC="${GLM53_NIC:-hsn0}"
 
-# A100 80GB is extremely tight at 1 node x TP4: FP8 weights ~306 GB / 4
-# GPUs = ~77 GiB/GPU, leaving ~2.4 GiB free. mem_fraction_static=0.98 makes
-# the activation reserve (slack = total * (1-mem)) ~1.6 GiB, below the ~2.25
-# GiB FP8->bf16 MoE upcast transient (job 82473 OOM). Lowering mem to fit the
-# transient is impossible at 1 node (KV+mamba = total*mem - weights - mamba
-# goes negative: 80*0.95 - 77 - 0.4 < 0).
-#
-# DEFAULT 2 nodes x TP4 x PP2 (8 GPUs) FIXES THIS: weights ~306 GB / 8 =
-# ~38 GiB/GPU, leaving ~41 GiB free. mem_fraction_static=0.93 gives slack
-# ~5.5 GiB (> the 2.25 GiB upcast transient, ~2.4x margin) while KV+mamba
-# stays ~35 GiB (vs going negative on 1 node). This is the path to a 12-hour
-# serve on A100-80GB. The mamba state cache is no longer binding (no
-# --max-mamba-cache-size needed); max_running_requests stays small as a
-# conservative first-boot choice.
+# 1-node TP4 is razor-edge (~2.4 GiB free; even mem=0.98 OOMs on the 2.25 GiB
+# FP8 upcast transient, job 82473). DEFAULT 2 nodes TP4xPP2: ~38 GiB/GPU
+# weights, mem=0.93 → ~5.5 GiB slack (~2.4x margin). Full math: README
+# "SM80 FP8 compute patch".
 export CTX_LEN="${CTX_LEN:-2048}"
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.93}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 
 # Request-length bound + KV pool sizing.
-# CUDA-graph capture of decode is currently BLOCKED on the SM80 DSA kpool
-# decode bridge (kpool_fp8_index.py::_vk_dsa_kpool_decode_torch calls
-# torch.nonzero() twice -> data-dependent dynamic shape -> non-capturable;
-# job 83168 cudaErrorStreamCaptureUnsupported). The proper fix is a single
-# fused Triton kpool-decode kernel (graph-safe by construction, and also
-# cuts the host-launch overhead that dominates eager mode). Until that
-# lands, decode runs eager = the validated 83166 path (5.1 tok/s bs=1,
-# 38.6 tok/s bs=8). Re-enable AFTER the kernel with DISABLE_CUDA_GRAPH=0.
+# Decode CUDA-graph capture is BLOCKED on the SM80 kpool bridge (torch.nonzero
+# → data-dependent shape; job 83168) — decode runs eager, the validated 83166
+# path. Re-enable with DISABLE_CUDA_GRAPH=0 after a graph-safe fused kernel.
 export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 export SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-1}"
 
@@ -144,10 +127,8 @@ export OTELA_SEED="${OTELA_SEED:-$RANDOM$RANDOM}"
 export OTELA_API_PORT="${OTELA_API_PORT:-18094}"
 
 # --- load format ------------------------------------------------------------
-# LOAD_FORMAT=dummy: random weights.  For GLM-5.3 dummy weights are allocated
-# in bfloat16 (~612 GB) and OOM on 4x A100 80 GB, so real weights are the
-# practical default for this model.
-# LOAD_FORMAT=auto: real FP8 weights (~306 GB, 60-90 min load from /capstor).
+# LOAD_FORMAT=dummy OOMs here (dummy weights are allocated in bf16, ~612 GB
+# > 4x A100) — real FP8 weights are the practical default (60-90 min load).
 export LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
 # ------------------------------------------------------------------- dirs ----
@@ -185,14 +166,10 @@ export TMP="$TMPDIR"
 export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH:-$DEPLOY_DIR/cache/enroot}"
 mkdir -p "$TRITON_CACHE_DIR" "$HF_HOME" "$TMPDIR" "$ENROOT_CACHE_PATH"
 
-# PYTHONPATH: patches_full first (the SM80-patched sglang tree + the
-# sitecustomize deep_gemm shim, auto-imported at interpreter startup), then
-# the vkernels #60 python package (the DSA kpool bridge imports it; the
-# pure-Python fallback works without the compiled ext), then the overlay
-# source, then a cp312-compatible tokenizers 0.23.1 sidecar (extracted from
-# the overlay's cp310 pkgs310 because tokenizers is abi3).  Do NOT put
-# pkgs310 itself on PYTHONPATH -- it contains cp310-only compiled extensions
-# (e.g. regex) that break on cp312.
+# PYTHONPATH order (details: README "Hardware / image" + "SM80 DSA kpool
+# wiring"): patches_full (SM80-patched tree + sitecustomize deep_gemm shim) →
+# vkernels#60 python package → overlay sources → cp312 tokenizers sidecar
+# (abi3; do NOT put the cp310-only pkgs310 itself on the path).
 export VKERNELS_PYTHON="${VKERNELS_PYTHON:-$DEPLOY_DIR/vkernels-python}"
 [ -d "$VKERNELS_PYTHON/vkernels" ] || \
   { echo "FATAL: vkernels python package not found: $VKERNELS_PYTHON/vkernels" >&2; exit 1; }
@@ -270,7 +247,7 @@ chmod +x "$RUNDIR/engine.sh"
       timeout "$((GEN_PROBE_TIMEOUT + 300))" \
       srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
            -w "$HEAD" --export=ALL "${CONTAINER_OPTS[@]}" \
-           python3 "$SCRIPT_DIR/gen_correctness.py" \
+           python3 "$GEN_PROBE_SCRIPT" \
                "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
                "$PROBE_OUT" "$GEN_CORRECTNESS_MAX_TOKENS" "$GEN_CORRECTNESS_MIN_PASS"
     rc=$?
@@ -291,20 +268,11 @@ chmod +x "$RUNDIR/engine.sh"
     echo "[$(date -Is)] starting otela worker on $HEAD for $SERVED_MODEL_NAME bootstrap=$OTELA_RELAY_ADDR"
     srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --export=ALL "${CONTAINER_OPTS[@]}" \
-      # Official otela v0.2.4: --service.type / --service.llm.endpoint /
-      # --api-port do NOT exist (never did — original script was never
-      # runnable), and --subprocess STARTS an LLM instead of registering an
-      # existing one. sglang is already up on :SERVE_PORT (engine.sh), so
-      # register the running endpoint: --service.name llm triggers auto
-      # model=<id> identity groups from /v1/models; --label pins the routing
-      # identity pre-/v1/models; --role worker designates this node
-      # (v0.2.4 splits mode=cluster-topology from role=this-node);
-      # --tcpport/--udpport are one word. In-container only /capstor is
-      # mounted (NOT /users), so the worker wallet at ~/.config/opentela is
-      # unreachable -> run anonymous (--account.wallet ""); the head (QmTtn)
-      # accepts anonymous providers (solana.skip_verification in cfg).
-      # otela_cfg.yaml (in $DEPLOY_DIR, /capstor-mounted) pins the worker
-      # HTTP API port (18092) + loglevel debug + solana.skip_verification.
+      # otela v0.2.4 form (the old sai-v0.0.6 flags in earlier drafts never
+      # existed). Why each flag: README "OpenTela registration" — register
+      # the RUNNING endpoint; anonymous wallet (/users not mounted);
+      # otela_cfg.yaml ($DEPLOY_DIR, /capstor-mounted) pins the API port,
+      # loglevel and solana.skip_verification.
       "$OTELA_BIN" start --config "$DEPLOY_DIR/otela_cfg.yaml" \
         --role worker --service.name "$OTELA_SERVICE_NAME" --service.port "$SERVE_PORT" \
         --label "model=$SERVED_MODEL_NAME" \

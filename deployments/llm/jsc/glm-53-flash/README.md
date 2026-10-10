@@ -25,7 +25,8 @@ mandatory pre-registration generation probe.
 | `serve_glm_53_flash_otela_jsc.sbatch` | the deployment: preflight → engine → gen probe → bench → otela worker |
 | `build_glm_5_3_flash_image.sh` | login-node: apptainer build of the .sif (once) |
 | `download_glm_5_3_flash.sh` | login-node: HF snapshot download, resumable (once) |
-| `gen_correctness.py` | the mandatory pre-registration generation probe (stdlib-only) |
+| [`meta/common/gen_correctness.py`](../../../../meta/common/gen_correctness.py) | the mandatory pre-registration generation probe (stdlib-only; shared canonical copy) |
+| `up.sh` | one-shot: build image if missing → ensure the login-node relay (idempotent) → sbatch (extra args pass through) |
 
 ## One-time staging (JSC login node)
 
@@ -46,12 +47,26 @@ bash /e/scratch/reformo/yao4/otela-relay/start_relay_jsc.sh status
 
 The sbatch's preflight prints the exact missing-command for any of these.
 
+⚠️ **Paths: `/e/scratch` only.** `/e/scratch` (EXA) IS mounted on compute
+nodes — `/p/scratch` (JUSTSCRATCH) is NOT (jobs with output on /p/scratch die
+with `ExitCode=0:53` in ~8 s, glm-47-flash finding). Every artefact this job
+reads must stay under `/e/scratch` (or `/e/data1`, also mounted).
+
 **Why a relay:** JSC compute nodes have no outbound internet (not even
 Cloudflare:443); the login node does. The relay (tmux on the login node,
 peer `QmakkeU7ZYN…CPVpEvSqzgd` on `10.128.1.1:45195`) is started by
 `deployments/llm/jsc/kimi-k3/start_relay_jsc.sh` and shared by all jobs.
 The serving sbatch reads `/e/scratch/reformo/yao4/otela-relay/
-relay.multiaddr` (or `$OTELA_RELAY_ADDR`).
+relay.multiaddr` (or `$OTELA_RELAY_ADDR`). No socat is needed: the otela
+worker runs ON the serving node and apptainer shares the host network
+namespace, so sglang genuinely is on `localhost:$SERVE_PORT` for the
+registrar's health check.
+
+Peer identity: v0.2.4 resolves its BadgerDB home via `/etc/passwd` (NOT the
+`$HOME` env — verified live), landing at `$PASSWD_HOME/.ocfcore` on
+NFS-backed `/e/home`, which goes ESTALE after a few days and freezes the
+CRDT. The relay script symlinks `$PASSWD_HOME/.ocfcore -> /e/scratch/...`;
+the worker's short-lived per-job store tolerates it for a 12 h job.
 
 ## Submit
 
@@ -114,6 +129,7 @@ clean LEFT).
 | `GLM53_SPECULATIVE` | 0 | EAGLE draft path unvalidated on sm_90 |
 | `DISABLE_CUDA_GRAPH`/`SKIP_SERVER_WARMUP` | 0 | capture-crash escape hatches |
 | `SERVEKIT_BENCH` | 1 | pre-registration bench C=16 n=64 |
+| `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` | 0 | 0 = /health returns 200 without a generation round-trip (a heartbeat stall would 503 a healthy engine) |
 | `OTELA_REGISTER` | auto | auto/1/0: dummy-weight engines never hit the mesh; smoke run ends the job cleanly |
 
 ## First bring-up (2026-10-07) — verified end-to-end

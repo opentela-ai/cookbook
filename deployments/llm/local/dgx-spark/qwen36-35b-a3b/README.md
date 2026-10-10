@@ -13,6 +13,20 @@ sources sit as sibling checkouts (`./sglang-src`, `./entrypoint-src`). Nothing
 is pinned to a specific home directory or host layout — every path is an
 overridable env var with a portable default.
 
+## Start here
+
+On the DGX Spark host:
+
+```bash
+bash build_image.sh                   # once: overlay image (~30 s; needs ./sglang-src + ./entrypoint-src)
+bash serve_qwen36_dgx_spark.sh        # engine container; prints READY when serving
+bash register_qwen36_otela.sh daemon  # otela sidecar → mesh
+# or all three in one shot (skips what already exists):  bash up.sh
+
+curl -s http://localhost:30000/v1/models | python3 -m json.tool   # engine up
+tail -f ./run/otela/otela.log                                     # sidecar: look for "connected: true"
+```
+
 ## Why this site
 
 A single GB10 in a workstation form factor is the whole point — no cluster, no
@@ -84,6 +98,7 @@ KV cache supports 1,670,348 tokens. `max_model_len` = 262,144.
 | `build_image.sh` | Host-side: preflight golden image, stage the two source tarballs in a temp context, `docker build` the overlay |
 | `serve_qwen36_dgx_spark.sh` | Start/stop the engine container; waits on `/v1/models`, writes `last_service.env` |
 | `register_qwen36_otela.sh` | Start/stop/status the standalone `otela` sidecar that publishes the `llm` service |
+| `up.sh` | One-shot bring-up: build image if missing → serve → register |
 
 ## Build
 

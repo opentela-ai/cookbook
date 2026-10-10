@@ -9,6 +9,21 @@ outbound internet and reach the bootstrap `/ip4/148.187.108.178/...` directly, s
 each rank runs `otela start --mode node --subprocess <sglang-wrapper>` on the
 same node as SGLang.
 
+## Start here
+
+On the Beverin login node:
+
+```bash
+sbatch serve_glm_47_flash_sglang.sbatch    # 1 node, TP=4 — or: bash up.sh
+# scale out: sbatch --nodes=4 serve_glm_47_flash_sglang.sbatch
+
+tail -f /capstor/scratch/cscs/xyao/glm47-flash-sglang-beverin/logs/opentela-<JOB>-0.log
+srun --jobid=<JOB> --overlap bash -lc 'curl -s http://127.0.0.1:8080/v1/models | python3 -m json.tool'
+```
+
+First run pulls ~26 GiB into the EDF image store; pre-warm command in
+[Submit](#submit).
+
 ## Why the `mi300` partition
 
 sglang only publishes ROCm builds for **MI300A (gfx942, `*-mi30x`)** and the
@@ -17,11 +32,11 @@ though the login node is MI250X the job **must** run on `mi300`. The image
 (`lmsysorg/sglang@sha256:80d046…` = `v0.5.16-rocm720-mi30x`) is pinned by digest
 so the Triton JIT caches on shared `/capstor` stay warm across launches.
 
-## MI300A-specific fixes (all baked into the sbatch)
+## Site-specific fixes (all baked into the sbatch)
 
-Five ROCm/MI300A issues had to be worked around vs the CUDA (GH200) recipe.
-All five are handled automatically by the sbatch + EDF; nothing needs to be
-done manually unless tuning.
+Eight ROCm/MI300A/OpenTela issues had to be worked around vs the CUDA (GH200)
+recipe. All eight are handled automatically by the sbatch + EDF; nothing needs
+to be done manually unless tuning.
 
 1. **NUMA CPU affinity crash** — `SGLANG_SET_CPU_AFFINITY=1` (from the image's
    `/etc/environment`) pins each TP rank to its GPU's NUMA die using *host* CPU
@@ -57,11 +72,23 @@ done manually unless tuning.
    With `mem_fraction_static=0.85` each of 4 TP ranks computes a ~301 GB KV
    budget; 4 × 301 ≫ 365 GB physically free → cgroup OOM (SIGKILL, exit -9)
    ~35 s after `Load weight end`, with no Python traceback. **Fix:** the
-   sbatch writes `sglang_launcher_mi300a.py` — a thin launcher that wraps
+   sbatch writes the MI300A launcher (canonical: [`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py)) — a thin launcher that wraps
    `torch.cuda.get_device_properties()` in a proxy reporting
    `is_integrated=False`, so sglang uses the correct 137 GB-per-GPU value.
    Result: each rank gets ~87 GB KV (1.7 M-token total budget) with 17.8 GB
    free, exactly like a discrete GPU.
+
+6. **Per-rank libp2p port offset** — every peer used to bind the same fixed
+   tcp/udp port, so multiple peers sharing one NAT egress collided on a single
+   external mapping to the bootstrap and only ~half registered. **Fix:**
+   `TCP_PORT=$((43905 + SLURM_PROCID))`, `UDP_PORT=$((59820 + SLURM_PROCID))`.
+
+7. **Staggered peer joins** — all N ranks hitting the single bootstrap in the
+   same instant (thundering herd) correlated with failed registrations.
+   **Fix:** `sleep $((SLURM_PROCID * 10))` before `otela start`.
+
+8. **otela exits on stdin EOF** — run as a foreground process with EOF on
+   stdin it shuts down. **Fix:** background it with `< /dev/zero`.
 
 ## Files
 
@@ -69,7 +96,8 @@ done manually unless tuning.
 |------|---------|
 | `sglang-rocm.toml` | EDF: image (by digest), mounts, ROCm env |
 | `serve_glm_47_flash_sglang.sbatch` | One self-contained sbatch: per-rank SGLang wrapper (with MI300A memory fix + transformers upgrade) + otela worker + (optional) vmagent |
-| `sglang_launcher_mi300a.py` | Standalone copy of the MI300A `is_integrated=False` launcher (also generated inline by the sbatch) |
+| [`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py) | The MI300A `is_integrated=False` launcher, canonical shared copy (also generated inline by the sbatch) |
+| `up.sh` | One-shot submit (forwards extra sbatch args, e.g. `bash up.sh --nodes=4`) |
 
 ## Submit
 

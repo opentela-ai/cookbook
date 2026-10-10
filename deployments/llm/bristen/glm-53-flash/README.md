@@ -4,6 +4,20 @@ Serve `zai-org/GLM-5.3-Flash` on **Bristen** (CSCS, 4× A100 80 GB / node,
 x86_64, NVIDIA) with the upstream CUDA SGLang image and the Beverin
 GLM-5.3 Python overlay, then register it on OpenTela.
 
+## Start here
+
+On the Bristen login node (from the repo checkout; `up.sh` stages the helper
+files to `$DEPLOY_DIR` first — the sbatch runs them from there, not from this
+directory):
+
+```bash
+bash up.sh                              # stage + sbatch (defaults: SMOKE=1, real weights, no otela)
+# full serve + OpenTela registration:
+SMOKE=0 bash up.sh
+
+tail -f /capstor/scratch/cscs/xyao/glm-53-flash-bristen/logs/<job>.out   # preflight → engine healthy → GEN_PROBE
+```
+
 > **Current status — experimental SM80 fallback, A100 FP8 floor (not a serving target):** the
 > model ships in FP8 (`e4m3`, ~306 GB). The recipe applies a local patch
 > that upcasts the FP8 MoE expert weights/activations to the compute dtype
@@ -226,7 +240,9 @@ SMOKE=0 LOAD_FORMAT=auto sbatch deployments/llm/bristen/glm-53-flash/serve_glm_5
 | `patched_sources/sitecustomize.py` | SM80 `deep_gemm` logits shim (paged + ragged torch fallbacks), auto-imported from `patches_full` |
 | `tests_local/test_dsa_kpool_wiring.py` | CPU-only validation of the vkernels #60 kpool wiring + deep_gemm shim (T0–T11, incl. the tier-1 device dispatch + `dsa_kpool_device` ABI cross-check vs `hip_capi.hpp`) |
 | `preflight.py` | In-container import test for the GLM-5.3 overlay |
-| `gen_correctness.py` | Greedy correctness/smoke probe against `/v1/completions` |
+| [`meta/common/gen_correctness.py`](../../../../meta/common/gen_correctness.py) | Greedy correctness/smoke probe against `/v1/completions` (shared canonical copy; `up.sh` stages it into `$DEPLOY_DIR`) |
+| `up.sh` | One-shot: stage helpers to `$DEPLOY_DIR` (rsync) → sbatch (forwards extra sbatch args) |
+| `find_bad_nodes.sh` / `submit_pinned.sh` / `nccl_*` | Node-boot blacklist refresher, pinned-GRES submit helper, NCCL/CXI smoke probes |
 | `README.md` | This file |
 
 ## Hardware / image
@@ -273,29 +289,38 @@ rcc --profile bristen job tail <JOBID> -f
 ## OpenTela registration
 
 Once the engine is healthy, register it on the public OpenTela bootstrap.
-The sbatch already defaults to `SMOKE=1` (no otela); set `SMOKE=0` to register,
-or run the otela command manually from inside the allocation on the head node:
+The sbatch already defaults to `SMOKE=1` (no otela); set `SMOKE=0` to register.
+The sbatch's otela invocation uses the **v0.2.4** form
+(`$OTELA_DIR/opentela-v0.2.4`); the older manual snippet that used
+sai-v0.0.6-style flags (`--service.type`, `--service.llm.endpoint`,
+`--api-port`, `--tcp-port`) is gone — **those flags never existed**, and
+`--subprocess` starts a new LLM instead of registering a running one. The
+working invocation registers the *running* endpoint:
 
 ```bash
-export OTELA_BIN=/capstor/scratch/cscs/xyao/opentela/otela
-export OTELA_RELAY_ADDR=/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7
-export OTELA_SERVICE_NAME=llm
-export OTELA_TCP_PORT=43905
-export OTELA_UDP_PORT=59820
-export OTELA_SEED=42        # stable peer identity across restarts
-export OTELA_API_PORT=18094
-
 srun --jobid=<JOBID> --overlap --gres=none --nodes=1 -n1 -w <HEAD> \
-  --container-image=/capstor/scratch/cscs/xyao/glm-53-flash-bristen/cache/enroot/sglang-dev-cu13.sqsh \
-  --container-name=sglang-cu13 --container-env=PYTHONPATH \
-  "$OTELA_BIN" start --mode node --subprocess \
-    --service.type llm --service.name "$OTELA_SERVICE_NAME" \
-    --service.llm.endpoint "http://127.0.0.1:30000" \
-    --label model=zai-org/GLM-5.3-Flash \
+     --container-image=$IMAGE --container-name=sglang-cu13 \
+     --container-env=PYTHONPATH \
+  "$OTELA_BIN" start --config "$DEPLOY_DIR/otela_cfg.yaml" \
+    --role worker --service.name llm --service.port 30000 \
+    --label "model=zai-org/GLM-5.3-Flash" \
     --bootstrap.static "$OTELA_RELAY_ADDR" \
-    --tcp-port "$OTELA_TCP_PORT" --udp-port "$OTELA_UDP_PORT" \
-    --api-port "$OTELA_API_PORT" --seed "$OTELA_SEED"
+    --tcpport 43905 --udpport 59820 \
+    --seed "$OTELA_SEED" --account.wallet ""
 ```
+
+Why each piece (v0.2.4 semantics):
+
+- `--config $DEPLOY_DIR/otela_cfg.yaml` — the file is on the /capstor mount
+  (reachable in-container; `/users` is NOT mounted), and pins the worker HTTP
+  API port (18092), `loglevel: debug`, and `solana.skip_verification`.
+- `--role worker` — v0.2.4 splits cluster topology (`--mode`) from this-node
+  role; `--service.name llm` triggers auto `model=<id>` identity groups from
+  `/v1/models`, and `--label` pins the routing identity before that.
+- `--account.wallet ""` — anonymous provider: the worker wallet at
+  `~/.config/opentela` is unreachable in-container, and the head accepts
+  anonymous providers (`solana.skip_verification`).
+- `--tcpport/--udpport` are one word in v0.2.4.
 
 The same `--served-model-name zai-org/GLM-5.3-Flash` and `--label model=...`
 keep direct calls and routed calls consistent (see `conventions/README.md`).

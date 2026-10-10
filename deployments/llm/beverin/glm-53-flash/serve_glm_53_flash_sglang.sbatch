@@ -4,10 +4,8 @@
 #SBATCH --partition=mi300
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-# Do NOT set --cpus-per-task here: shrinking the cpuset breaks the image's
-# SGLANG_SET_CPU_AFFINITY=1 (set in /etc/environment), whose NUMA pinning
-# assumes the full 0..191 logical-CPU cpuset (one MI300A die per TP rank:
-#   gpu0->[0-23,96-119] gpu1->[24-47,120-143] gpu2->[48-71,144-167] gpu3->[72-95,168-191]).
+# No --cpus-per-task here: shrinking the cpuset breaks SGLANG_SET_CPU_AFFINITY=1
+# NUMA pinning (needs the full 0..191 cpuset, one MI300A die per TP rank).
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
 #SBATCH --time=01:00:00
@@ -21,22 +19,15 @@
 #SBATCH --output=/capstor/scratch/cscs/xyao/glm-53-flash-beverin/logs/%x-%j.out
 #
 # =============================================================================
-# Serve zai-org/GLM-5.3-Flash (FP8 e4m3 ~306 GB, DeepSeek Sparse Attention +
-# linear/KDA attention + MTP, MULTIMODAL) on CSCS Beverin (4x MI300A / node,
-# x86_64, gfx942) via a PYTHON-SOURCE OVERLAY of the only GLM-5.3 image (the
-# Clariden aarch64/CUDA build) onto the upstream ROCm v0.5.18 image — and
-# register it on OpenTela.
+# Serve zai-org/GLM-5.3-Flash (FP8 e4m3 ~306 GB, DSA + linear/KDA + MTP,
+# MULTIMODAL) on CSCS Beverin (4x MI300A / node, gfx942) via a PYTHON-SOURCE
+# OVERLAY of the only GLM-5.3 image (Clariden aarch64/CUDA build) onto the
+# upstream ROCm v0.5.18 image — and register it on OpenTela.
 #
-# The overlay (build_overlay.sh, sibling): extracts the Clariden sglang +
-# transformers source (pure Python, cp312 — imports on cp310; no ABI) to
-# $OVL and prepends them on PYTHONPATH over the v0.5.18 image. The compiled
-# torch/sgl_kernel/aiter/tilelang come from the ROCm image; a few skewed
-# pure/compiled deps (tokenizers, huggingface_hub, safetensors, regex,
-# accelerate) are bumped to clariden transformers 5.16's pins as cp310 wheels
-# in $OVL/pkgs310. Import gate VERIFIED (all of sglang, transformers, sgl_kernel,
-# torch, sglang.srt.configs.glm5_next, models.glm5_next, models.glm5_next_nextn,
-# function_call.glm47_moe_detector, transformers.models.glm5_next, and
-# AutoConfig.from_pretrained(GLM-5.3-Flash) load OK on this ROCm container).
+# The overlay (build_overlay.sh, sibling): pure-Python sglang+transformers
+# sources from the Clariden image prepended on PYTHONPATH over the ROCm image;
+# skewed pure/compiled deps shipped as cp310 wheels in $OVL/pkgs310. Import
+# gate verified (see the in-container preflight below). Full story: README.
 #
 # Submit (SMOKE default — fast forward-path gate with dummy weights, NO otela):
 #   rcc --profile beverin run --cwd "$PWD" -- sbatch serve_glm_53_flash_sglang.sbatch
@@ -50,112 +41,28 @@
 #       --export=ALL,GLM53_DSA_PREFILL=aiter,GLM53_DSA_DECODE=aiter \
 #       serve_glm_53_flash_sglang.sbatch
 #
-# NOTE on `rcc run --cwd`: `rcc job submit` runs sbatch from the remote_dir
-# root (NOT this directory), so SLURM_SUBMIT_DIR points there and the sibling
-# files are not found. `rcc run --cwd <ABSOLUTE recipe dir> -- sbatch <script>`
-# makes BASH_SOURCE + SCRIPT_DIR land here. Always use the absolute recipe dir.
+# NOTE: `rcc job submit` submits from the remote_dir root and siblings are not
+# found — use `rcc run --cwd <ABSOLUTE recipe dir>` (up.sh does).
 #
-# What it does, in order:
-#   1. preflights the EDF/image, overlay, weights (or LOAD_FORMAT=dummy), otela
-#      binary (SMOKE=0 only), and the gen_correctness.py + sglang-rocm.toml +
-#      sglang_launcher_mi300a.py siblings.
-#   2. srun's ONE SGLang engine rank (1 node, TP4) INSIDE the sglang-rocm
-#      container (enroot/EDF). Rank 0 binds 0.0.0.0:$SERVE_PORT (HTTP head).
-#   3. once the head's /health answers, runs a MANDATORY generation probe
-#      BEFORE any registration — /health alone is not enough (deepseek-v4 / K3 /
-#      glm52 lesson: an engine can answer /health while a broken kernel path
-#      serves garbage or hangs). gen_correctness.py sends greedy /v1/completions
-#      prompts and checks each for its expected substring (smoke: non-empty
-#      continuation; real: factual substring with min_pass).
-#   4. (SMOKE=0 only) ONLY if the probe passes, starts ONE otela WORKER —
-#      inside the container, on the head via srun --overlap --gres=none — which
-#      registers the `llm` service. On job end, SIGTERM (never KILL) the otela
-#      step so it announces LEFT cleanly.
+# Flow: preflight (EDF/overlay/weights/otela + siblings) → ONE TP4 engine rank
+# in the sglang-rocm container → MANDATORY gen probe BEFORE registration
+# (deepseek-v4/K3/glm52 lesson: /health can pass while the kernel path serves
+# garbage or hangs) → (SMOKE=0 only) ONE otela worker on the head → SIGTERM
+# on job end (LEFT).
 #
 # -----------------------------------------------------------------------------
 # THE LOAD-BEARING UNKNOWN: DSA kpool>1 on MI300A (gfx942)
 # -----------------------------------------------------------------------------
-# GLM-5.3 is MULTIMODAL with dsa_index_kpool > 1. sglang's DeepseekSparseAttnBackend
-# has a HARD correctness gate (_check_kpool_tail_backend, raised on EVERY
-# forward when kpool>1) that ONLY permits {fa3, tilelang, trtllm}:
-#   "index_kpool > 1 appends tail tokens to topk_indices and is currently only
-#    supported by the FA3/TileLang/TRTLLM DSA backend."
-# On Beverin (ROCm, no flash-attention-3, no TRTLLM), tilelang is the ONLY
-# kpool>1-legal backend PRESENT. So GLM53_DSA_PREFILL=GLM53_DSA_DECODE=tilelang
-# is forced — it is the ONLY choice that can pass both guards.
+# GLM-5.3 is MULTIMODAL with dsa_index_kpool > 1: sglang's hard gate
+# (_check_kpool_tail_backend, every forward) only permits {fa3, tilelang,
+# trtllm}; on ROCm tilelang is the ONLY one present -> DSA is FORCED to
+# tilelang. GLM-5.2's aiter-prefill workaround is NOT kpool>1-legal here.
+# Boot-blocker chain (612093 deep_gemm NameError -> 612201 MHC smem abort ->
+# 612262 TVM FloorMod -> vkernels PR #52 HIP kernel) + the kpool gate:
+# README "Boot-blocker history" + "The kpool>1 gate".
 #
-# THE RISK (carried over from the GLM-5.2 MI300A bring-up, v0.5.16):
-#   * tilelang CRASHED in forward_c4_indexer during the first forward on
-#     MI300A (job 594304 silent hang at 0% GPU for 2.5 h; job 594340 fast
-#     SIGQUIT in forward_c4_indexer). GLM-5.2 worked around this with the
-#     aiter backend for PREFILL — but aiter is NOT kpool>1-legal, so that
-#     workaround is UNAVAILABLE here (GLM-5.2 is not multimodal kpool>1).
-#   * This smoke is the empirical gate: does v0.5.18's tilelang forward_c4_indexer
-#     work on MI300A for GLM-5.3's kpool>1 layers? If it faults, GLM-5.3
-#     CANNOT run on Beverin with the current upstream stack (no other legal
-#     backend exists). Capture the full engine log on the first fault.
-# Valid CLI DSA backends: flashmla_sparse, flashmla_sparse_q8, flashmla_kv,
-#   flashmla_auto, fa3, tilelang, aiter, trtllm (fa3/trtllm NVIDIA-only;
-#   flashmla_*/aiter NOT kpool>1-legal -> will fail _check_kpool_tail_backend).
-#
-# EMPIRICAL RESULTS (beverin, v0.5.18 overlay, jobs 612093/612201/612262):
-#   * 612093 (no SGLANG_OPT_DEEPGEMM_HC_PRENORM): crashed at the VERY FIRST
-#     forward — NameError 'deep_gemm' in mhc.py:850/1450 (MHC pre-norm's
-#     deep_gemm path; deep_gemm is CUDA-only, NOT imported on ROCm).
-#     FIX: SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 -> tilelang/Triton MHC fallback.
-#   * 612201 (DEEPGEMM_HC_PRENORM=0): crashed at MHC pre-norm's tilelang kernel —
-#     "Requested dynamic shared memory 98304 exceeds device limit 65536 for
-#     mhc_pre_gemm_sqrsum_splitk_stage_0_kernel". tilelang's HIP codegen
-#     (jit/adapter/wrapper.py PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY_HIP) only
-#     QUERIES hipDeviceAttributeMaxSharedMemoryPerBlock (the 64 KB *non-optin*
-#     cap on MI300A) and never calls hipFuncSetAttribute to opt in to the
-#     larger ~228 KB dynamic cap (known tilelang HIP gap).
-#     FIX: tilelang-mhc-reduce-hidden_block-for-mi300a-64KB-LDS.patch (applied
-#     by build_overlay.sh) reduces hidden_block 256->128 in BOTH MHC pre-norm
-#     tilelang kernels (splitk for num_tokens<=2048, simple for >2048) ->
-#     per-stage 24.5 KB -> 49152 < 65536 (largest power-of-2 divisor of
-#     hc_hidden_size=16384 and split_size=512 that fits).
-#   * 612262 (BOTH fixes): got PAST the deep_gemm NameError AND the MHC smem
-#     abort, all the way through KV/Mamba/radix-cache alloc to the FIRST
-#     forward's DSA DECODE kernel — the load-bearing gate above. NEW BLOCKER:
-#     sparse_mla_fwd_decode_partial (sglang/kernels/ops/attention/dsa/
-#     tilelang_kernel.py:830) hits a tilelang/TVM *vectorizer* bug during JIT:
-#     tvm::tl::VectorizePlanner::ComputeBufferVectorSize -> IsExprInvariantIn-
-#     VectorBoundary -> CanonicalSimplifier::VisitExpr_(FloorModNode) raises
-#     'Check failed: pb->value != 0 (0 vs. 0) : Divide by zero' (a symbolic
-#     FloorMod divisor folds to 0 for GLM-5.3's kpool>1 decode shape). This is
-#     a DIFFERENT tilelang issue from the MHC smem one and has NO flag-switch
-#     escape (tilelang is the ONLY kpool>1-legal DSA decode backend on MI300A;
-#     fa3/trtllm are NVIDIA-only, flashmla_*/aiter fail _check_kpool_tail_backend).
-#     RESOLVED via vkernels PR #52 (commit d76517c): the DSA forward is
-#     re-implemented as a plain gfx942 HIP kernel (vk_hip_dsa_sparse_fwd in
-#     libvkernels_hip.so) that takes tail_dim==0 as a RUNTIME branch (the
-#     rope-tail dot loop runs zero iterations — no zero-size GEMM, so the
-#     TVM vectorizer is never invoked). Validated on beverin (test_dsa_correct
-#     11/11, both tail_dim==0 GLM-5.3 and tail_dim>0 DeepSeek-V3). Wired in by
-#     sitecustomize.py + vkernels_dsa.py on $OVL/pylib (FIRST on PYTHONPATH,
-#     installed by build_overlay.sh); sitecustomize rebinds sglang's
-#     tilelang_sparse_fwd -> vk_hip_dsa_sparse_fwd on gfx942 at startup, before
-#     the first DSA forward (forward_extend L3223 + forward_decode L3525).
-#     See the header's "PR #52 wiring" note + vkernels issue #51 for the ABI.
-#     FIRST SERVE SMOKE: pending re-run (VKERNELS_LIB=.../build/hip-roc72/src/c/libvkernels_hip.so, SMOKE=1).
-#
-# -----------------------------------------------------------------------------
-# GLM-5.3 vs GLM-5.2 (why the args differ)
-# -----------------------------------------------------------------------------
-#   * MULTIMODAL (Glm5NextForConditionalGeneration) -> needs --mm-attention-backend
-#     triton_attn (the vision tower's own dispatch; sm_100/gfx942 auto-defaults
-#     to fa3, which is MISSING on ROCm -> ImportError). triton_attn uses Triton
-#     kernels, no flash_ops dep.
-#   * kpool>1 (see above) -> DSA pinned to tilelang (GLM-5.2's aiter workaround
-#     is illegal here).
-#   * FP8 e4m3 DYNAMIC (quant_method=fp8 in config.json) -> NOT mxfp4 (no AITER
-#     FlyDSL / marlin MXFP4 MoE path). MOE_BACKEND=auto lets the image pick.
-#   * MTP nextn=1 -> --disable-cuda-graph + --skip-server-warmup (the MI300A
-#     MTP/nextn crash lesson from glm47/glm52; capture crashes cuda-graph).
-#   * Parsers: --reasoning-parser glm45 --tool-call-parser glm47 (verified
-#     present in the clariden overlay; gated by GLM53_ENABLE_PARSERS).
-#
+# GLM-5.3 vs GLM-5.2 arg differences (mm-attention, FP8-dynamic MoE, chat
+# template, bf16-gemm backend): README "GLM-5.3 vs GLM-5.2".
 # =============================================================================
 set -uo pipefail
 
@@ -166,137 +73,82 @@ export OTELA_EDF_NAME="${OTELA_EDF_NAME:-sglang-rocm}"
 
 # ---------------------------------------------------------------- deployment --
 export DEPLOY_DIR="${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-beverin}"
-# The overlay (built once by build_overlay.sh, cached on /capstor). The EDF's
-# PYTHONPATH prepends these over the v0.5.18 image defaults.
+# Overlay built once by build_overlay.sh; EDF PYTHONPATH prepends it over the
+# v0.5.18 image defaults.
 export OVL="${OVL:-$DEPLOY_DIR/overlay}"
-# Clariden aarch64/CUDA build = the only image shipping GLM-5.3 Python. Its
-# Python source is extracted into $OVL by build_overlay.sh (it is NOT the
-# runtime image — the ROCm v0.5.18 image in the EDF is the runtime).
+# Clariden aarch64/CUDA build = the only image shipping GLM-5.3 Python; its
+# source is extracted into $OVL (NOT the runtime image — the EDF's ROCm image is).
 export OVERLAY_SRC="${OVERLAY_SRC:-/capstor/scratch/cscs/xyao/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh}"
-# GLM-5.3-Flash on /capstor (HF cache). ~306 GB FP8 e4m3. config.json has
-# max_position_embeddings=1048576; glm5_next model class resolved from the
-# overlay's transformers (5.16.0.dev0), NOT the image's 5.12.
+# ~306 GB FP8 e4m3; glm5_next resolves from the OVERLAY's transformers
+# (5.16.0.dev0), not the image's 5.12.
 export MODEL_PATH="${MODEL_PATH:-/capstor/scratch/cscs/xyao/models/zai-org/GLM-5.3-Flash}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
 
 # ------------------------------------------------------------------- shape ----
-# 1 node x 4 GPU = TP4 (PP1). GLM-5.3-Flash ~306 GB FP8 / 4 MI300A (137 GiB
-# HBM3 each) = ~77 GiB weights/GPU, leaving ~60 GiB for KV + activations +
-# JIT. EP_SIZE=TP keeps expert dispatch intra-node (288 routed experts,
-# top-8 -> 72 experts/GPU, manageable). For >1 node, set NNODES and PP_SIZE
-# (the kimi-k3 distributed pattern); DSA allreduce then crosses Slingshot.
+# TP4 (PP1): ~306 GB FP8 / 4 MI300A = ~77 GiB weights/GPU. EP_SIZE=TP keeps
+# expert dispatch intra-node. >1 node: set NNODES + PP_SIZE (kimi-k3 pattern).
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-1}"
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
-# MoE runner backend. GLM-5.3-Flash is FP8 e4m3 DYNAMIC (not mxfp4) -> SGLang's
-# native fp8 MoE path is standard; `auto` lets the image pick. If `auto`
-# dequantizes to bf16 and OOMs (the kimi-k3 anti-pattern), pin MOE_BACKEND.
+# FP8 e4m3 DYNAMIC (not mxfp4) -> native fp8 MoE path; `auto` lets the image
+# pick (pin MOE_BACKEND if auto dequantizes to bf16 and OOMs).
 export MOE_BACKEND="${MOE_BACKEND:-auto}"
 
 # --- DSA backends (THE kpool>1 gate — see the header block) -----------------
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
-# DSA top-k TRANSFORM (the THIRD DSA path, after the paged-MQA scorer
-# vk_hip_dsa_topk_logits (#51) and the sparse fwd vk_hip_dsa_sparse_fwd (PR
-# #52)). sgl-kernel (the default) JIT-compiles sgl_kernel_jit_kpool_topk_
-# transform_512 from dsa/kpool_topk_transform.cuh, which #include <cuda_fp16.h>
-# — absent on the ROCm container — so the JIT build fails (RuntimeError:
-# Failed to build JIT module ... 'cuda_fp16.h' file not found) and the engine
-# SIGQUITs at the first DeepseekV2AttentionMLA (the kpool>1 indexer).
-# 'torch' routes to topk_transform_512_pytorch_vectorized (pure torch.topk,
-# no JIT, no hang risk — same fallback pattern as the two vkernels rebinds in
-# sitecustomize.py). The 'torch' backend currently requires
-# SGLANG_DSA_FUSE_TOPK=false (avoids _append_kpool_tail_to_topk_kernel crash);
-# set it explicitly since sglang only auto-forces that under deterministic
-# inference (server_args.py:8913), not under --dsa-topk-backend torch itself.
+# DSA top-k TRANSFORM (third DSA path, after #51 scorer + PR #52 fwd):
+# sgl-kernel's default JIT #includes <cuda_fp16.h> (absent on ROCm) and
+# SIGQUITs the engine; 'torch' = pure-torch fallback (needs
+# SGLANG_DSA_FUSE_TOPK=0, set below — sglang only auto-forces that under
+# deterministic inference).
 export GLM53_DSA_TOPK_BACKEND="${GLM53_DSA_TOPK_BACKEND:-torch}"
-# NOTE: --dsa-topk-backend torch (above) is the sglang server flag, but the
-# ACTIVE GLM-5.3 kpool path (kpool_fp8_index.py:topk_from_pooled_history_logits)
-# calls fast_kpool_topk_transform_fused (the TVM JIT) UNCONDITIONALLY for
-# group_topk in (128,160,192,224,256,512) — the 'torch' routing is aspirational
-# (it targets the dsv4/C4 indexer, not this path). The ACTUAL torch bridge for
-# the kpool top-k transform (vkernels #56) is the sitecustomize.py rebind,
-# gated here:
+# BUT the active GLM-5.3 kpool path calls the TVM JIT unconditionally — the
+# ACTUAL torch bridge (vkernels #56) is the sitecustomize rebind, gated here:
 export GLM53_TOPK_TRANSFORM_BACKEND="${GLM53_TOPK_TRANSFORM_BACKEND:-torch}"
-# 'torch' rebinds sglang.kernels.ops.moe.kpool_topk_transform.
-# fast_kpool_topk_transform_fused to vkernels_dsa_topk.fast_kpool_topk_transform_fused
-# (pure torch, numerically equal to kpool_topk_transform.cuh:249-310, 7/7 by
-# test_vkernels_dsa_topk.py; NOT graph-safe — fine for the smoke probe).
-# Goals: (1) UNBLOCK decode if the JIT hangs; (2) LOCALISE the hang to a
-# bookend kernel if it persists; (3) REFERENCE for the future HIP kernel (#56).
-# Set GLM53_TOPK_TRANSFORM_BACKEND=sgl (or empty) to keep the JIT as the control.
+# Pure torch, 7/7 parity (test_vkernels_dsa_topk.py), not graph-safe; =sgl
+# keeps the JIT as the control.
 export SGLANG_DSA_FUSE_TOPK="${SGLANG_DSA_FUSE_TOPK:-0}"
-# MoE runner: the auto pick (aiter) JIT-hangs ~52min on gfx942 for GLM-5.3's
-# fp8-e4m3 ck2stages kernel (Current hipcc not support: -amdgpu-coerce-
-# illegal-types=1, skip it). Pin triton (pure Triton, no CK JIT, ROCm-mature)
-# to bypass until the aiter hang is fixed. Override: GLM53_MOE_RUNNER=<b>.
+# auto pick (aiter) JIT-hangs ~52 min on gfx942 for the fp8-e4m3 ck2stages
+# kernel; triton bypasses it until aiter is fixed.
 export GLM53_MOE_RUNNER="${GLM53_MOE_RUNNER:-triton}"
-# Mamba SSM kernel backend. Choices: triton (default, pure Triton; the
-# stochastic-rounding sub-path needs SM100/Blackwell but the base scan does
-# not) | flashinfer (needs `import flashinfer.mamba`, often absent on ROCm).
-# Override: GLM53_MAMBA_BACKEND=<b>. The job-612826 first-forward stall is
-# suspected in this layer's mamba/SSM scan OR its TritonKDA (linear-attn)
-# kernel; flashinfer isolates the SSM scan from KDA (KDA is triton-only on
-# gfx942 -> no backend switch for it; the forward-probe localises it).
+# Mamba SSM backend: triton (default; stochastic-rounding sub-path needs
+# SM100, base scan does not) | flashinfer (isolates the SSM scan from KDA for
+# the job-612826 stall hunt; KDA is triton-only on gfx942).
 export GLM53_MAMBA_BACKEND="${GLM53_MAMBA_BACKEND:-triton}"
-# Forward-probe (sitecustomize.py): logs each decoder layer + self_attn + mlp
-# ENTER/EXIT on the FIRST forward only, so the last line before a silent
-# stall names the exact hanging op (mamba-linear-attn / DSA / MoE / NCCL).
-# Default ON while we diagnose the job-612826 first-forward stall; set
-# GLM53_FWD_PROBE=0 for production serving (zero-cost when off).
+# Forward-probe: logs layer/op ENTER/EXIT on the first forward — the last
+# line before a silent stall names the hanging op. Default ON (campaign);
+# GLM53_FWD_PROBE=0 for production.
 export GLM53_FWD_PROBE="${GLM53_FWD_PROBE:-1}"
-# Shared GLM-5.3 diagnostic harness (comp_capture/capture_probe/comp_diff,
-# import_hook, the engine patch modules). Lives in the cookbook checkout so
-# beverin and clariden run the IDENTICAL copies (one source of truth).
-# Same SLURM_SUBMIT_DIR-first pattern as SCRIPT_DIR above: under sbatch the
-# batch script can be spooled, so BASH_SOURCE alone may not resolve to this
-# recipe dir (job 625057 resolved GLM53_DIAG_DIR to /meta/diag/glm53).
+# Shared diag harness — identical copies on beverin + clariden (one source of
+# truth). SLURM_SUBMIT_DIR-first: spooled batch scripts may not resolve
+# BASH_SOURCE (job 625057 resolved to /meta/diag/glm53).
 export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/../../../.." && pwd)/meta/diag/glm53}"
-# Component/layer I/O capture (comp_capture.py, gated by GLM53_COMP_CAPTURE).
-# First-forward-only; zero-cost when GLM53_COMP_CAPTURE is unset. Layer 0's
-# input is the embedding (deterministic, identical on any arch for the same
-# prompt) so the component bisect vs a pure-torch reference is immediately
-# meaningful with no dependency on prior layers.
-# DIAGNOSTIC DEFAULTS (like the FWD_PROBE/TILELANG_PROBE blocks): remove the
-# =1 defaults once the beverin-vs-clariden bisect closes.
+# Component/layer I/O capture: first-forward-only, layer 0 starts from the
+# deterministic embedding so the bisect vs pure-torch is meaningful.
+# DIAGNOSTIC DEFAULTS: remove the =1 once the bisect closes.
 export GLM53_COMP_CAPTURE="${GLM53_COMP_CAPTURE:-1}"
 export GLM53_COMP_MODE="${GLM53_COMP_MODE:-components}"
 export GLM53_COMP_LAYER="${GLM53_COMP_LAYER:-0}"
 export GLM53_COMP_TAG="${GLM53_COMP_TAG:-beverin_l0}"
 export GLM53_COMP_DIR="${GLM53_COMP_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash-beverin/comp_capture}"
-# tilelang DSA-topk JIT probe (GLM53_TILELANG_PROBE=1) + DEBUG log
-# (GLM53_TL_LOG=DEBUG) to localize the fp8_paged_mqa_logits JIT hang on
-# gfx942. Default ON for this diagnostic run; remove after diagnosis.
+# tilelang DSA-topk JIT probe + DEBUG log: localizes the fp8_paged_mqa_logits
+# JIT hang on gfx942. Campaign default; remove after diagnosis.
 export GLM53_TILELANG_PROBE="${GLM53_TILELANG_PROBE:-1}"
 export GLM53_TL_LOG="${GLM53_TL_LOG:-DEBUG}"
-# vkernels library (PR #52 DSA HIP kernel). VKERNELS_LIB is the EXACT path to
-# the libvkernels_hip.so built INSIDE this v0.5.18 container (ROCm 7.2,
-# libamdhip64.so.7) — the adapter (_find_libvkernels_hip) checks it FIRST.
-# The login-node build/hip links libamdhip64.so.6 (ROCm 6.3, absent in the
-# container) and FAILS dlopen; hip-roc72 is the clean container-ROCm build.
-# sitecustomize.py (on $OVL/pylib, FIRST on PYTHONPATH) rebinds sglang's DSA
-# tilelang_sparse_fwd -> vk_hip_dsa_sparse_fwd on gfx942, bypassing the
-# tilelang/TVM FloorMod(_,0) JIT abort (issue #51, job 612262's blocker).
-# The adapter calls the kernel with torch.cuda.synchronize() before/after
-# (stream-0 launch, no stream arg yet — the #44 threading is the follow-up).
+# vkernels HIP lib (PR #52). MUST be the container-ROCm build (hip-roc72,
+# ROCm 7.2): the login-node build/hip links libamdhip64.so.6 (absent in the
+# container) and fails dlopen. sitecustomize.py ($OVL/pylib) rebinds sglang's
+# tilelang_sparse_fwd -> vk_hip_dsa_sparse_fwd on gfx942 (README PR #52).
 export VKERNELS_LIB="${VKERNELS_LIB:-/capstor/scratch/cscs/xyao/vkernels/build/hip-roc72/src/c/libvkernels_hip.so}"
-# Multimodal vision-tower attention. GLM-5.3 auto-defaults to fa3 on gfx942,
-# which is MISSING on ROCm -> ImportError. Pin triton_attn (Triton kernels,
-# no flash_ops dep; VisionTritonAttention in STRIDED_QKV_BACKENDS).
+# Vision tower auto-defaults to fa3 (missing on ROCm) -> ImportError; pin
+# triton_attn (no flash_ops dep).
 export GLM53_MM_ATTENTION="${GLM53_MM_ATTENTION:-triton_attn}"
 
-# Unquantized BF16 GEMM backend. GLM-5.3 keeps the MLA projections
-# (q_a/kv_a/q_b/kv_b/o_proj, etc., listed in config.json modules_to_not_convert)
-# in bf16 while the experts are FP8. On ROCm with SGLANG_USE_AITER=1 the
-# sglang UnquantLinearMethod.apply routes EVERY bf16 GEMM through aiter's
-# tuned-GEMM dispatcher (tgemm.mm), which has no tuned config for the M:1
-# decode shapes (M:1,N:6144,K:4096 and friends) and falls back to an untuned
-# aiter GEMM that SIGKILLs on gfx942 (beverin job 613339, ~336 s stall then
-# exit -9 in DeepseekV2AttentionMLA). Routing bf16 to `torch` (rocBLAS) keeps
-# FP8 aiter on for the experts and lets the MLA forward complete. The
-# underlying sglang bug (the _use_aiter branch short-circuited --bf16-gemm-backend)
-# is fixed by sglang-unquant-bf16-gemm-respect-backend-flag.patch.
+# bf16 GEMMs (MLA projections) routed to rocBLAS: with aiter on, sglang sent
+# every bf16 GEMM through the tuned-GEMM dispatcher, which has no config for
+# M:1 decode shapes and SIGKILLs (job 613339) — README "GLM-5.3 vs GLM-5.2".
 export GLM53_BF16_GEMM_BACKEND="${GLM53_BF16_GEMM_BACKEND:-torch}"
 
 # Reasoning + tool-call parsers (verified present in the clariden overlay).
@@ -304,39 +156,23 @@ export GLM53_REASONING_PARSER="${GLM53_REASONING_PARSER:-glm45}"
 export GLM53_TOOL_CALL_PARSER="${GLM53_TOOL_CALL_PARSER:-glm47}"
 export GLM53_ENABLE_PARSERS="${GLM53_ENABLE_PARSERS:-1}"
 
-# Request-length bound + KV pool sizing. GLM-5.3 supports 1M positions; the
-# KV pool is sized by MEM_FRAC (not this). 32768 for a fast cold start + probe
-# (shorter than kimi-k3's 1M; raise toward 1M once the forward is proven).
+# 32768 for a fast cold start + probe (1M supported; raise once proven).
 export CTX_LEN="${CTX_LEN:-32768}"
-# APU: MI300A shares one ~513 GB HBM pool across CPU + 4 dies. At 0.88 each die
-# reserves 104.7 GB (weights 75.9 + KV/Mamba ~29), leaving only ~14 GB/die for
-# the serving-time inductor/Triton JIT (bf16 F.linear -> triton_mm, triton_poi_fused),
-# and a second JIT round (decode shapes) OOMs with allocator fragmentation.
-# 0.80 frees ~24 GB/die GPU headroom BUT — because it is unified memory — also
-# leaves only ~20% of the pool for the 4 ranks' HOST-side structures
-# (scheduler procs, mamba state cache, detokenizer workers, KV-bookkeeping).
-# On slow cold starts (>=24 min torch-dist init + >=36 min weights at
-# ~22 s/shard) this OOMs the scheduler at init: Rank N scheduler died
-# (exit code -9 = OS OOM killer) right after `max_running_requests` is capped by
-# the mamba cache (job 621559). 0.70 restores headroom (weights still fit,
-# KV/Mamba ~550K ctx, and the mamba-cache cap drops max_running_requests to
-# ~54 anyway, so the extra GPU reservation buys nothing for a correctness
-# re-serve). Override per-deploy (e.g. GPU_MEM_UTIL=0.75 for prod).
+# APU memory math (unified ~513 GB pool; 0.88 OOMs the JIT round, 0.80 OOMs
+# the HOST side on cold starts — job 621559): README "APU memory math".
+# 0.70 restores headroom; override per-deploy (0.75 for prod).
 export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.70}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 
-# MI300A workarounds: --skip-server-warmup stays on (MTP/nextn warmup
-# crash). CUDA graph is now ON (was the kpool>1 gate -> fa3 ImportError
-# during capture; patched _resolve_kpool_tail_backend routes MI300A ->
-# tilelang, whose forward is the PR #52 vkernels HIP shim). Capture is the
-# real cuda-graph perf win (no per-step host launch overhead).
+# skip-warmup stays on (MTP warmup crash). CUDA graphs ON: capture-time fa3
+# ImportError is routed to tilelang (PR #52 shim) by a patched resolver —
+# capture is the real per-step perf win.
 export DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 export SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-1}"
 
 # --- networking + ports -----------------------------------------------------
-# Slingshot NIC (h<n>; engine.sh pins NCCL_SOCKET_IFNAME=$GLM53_NIC). Single
-# node -> no cross-node RCCL; the value only matters for >1 node.
+# Slingshot NIC; only matters >1 node (no cross-node RCCL at TP4/PP1).
 export GLM53_NIC="${GLM53_NIC:-hsn0}"
 # Stable ports across the single head (override at submit time if occupied).
 export SERVE_PORT="${SERVE_PORT:-30000}"
@@ -345,8 +181,7 @@ export MASTER_PORT="${MASTER_PORT:-30011}"
 # --- watchdogs --------------------------------------------------------------
 export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-3600}"
 export DIST_TIMEOUT="${DIST_TIMEOUT:-1800}"
-# Health gate: how long to wait for /health before declaring failure. Real
-# weights ~13 min cold start (FP8 306 GB on 4 GPU); dummy ~3-5 min (JIT).
+# Real weights ~13 min cold start (FP8 306 GB); dummy ~3-5 min (JIT).
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-900}"
 export GEN_PROBE="${GEN_PROBE:-1}"
 export GEN_PROBE_TIMEOUT="${GEN_PROBE_TIMEOUT:-600}"
@@ -357,9 +192,8 @@ export GEN_CORRECTNESS_MIN_PASS="${GEN_CORRECTNESS_MIN_PASS:-1}"
 # continuation — proving the full DSA -> HTTP forward pipeline without real
 # weights. Set 0 (with LOAD_FORMAT=auto) for the factual-substring gate.
 export GEN_CORRECTNESS_SMOKE="${GEN_CORRECTNESS_SMOKE:-1}"
-# SMOKE=1 (default): run the forward + probe, do NOT register on otela
-# (leaves the mesh clean while you iterate on the DSA path). Set SMOKE=0
-# (with LOAD_FORMAT=auto) for the full serve + otela registration.
+# SMOKE=1 (default): forward + probe, NO otela registration (mesh stays clean
+# while iterating). SMOKE=0 (+ LOAD_FORMAT=auto): full serve + registration.
 export SMOKE="${SMOKE:-1}"
 
 # --- load format ------------------------------------------------------------
@@ -425,9 +259,20 @@ _sib() { # name, why
     echo "FATAL: $1 not found next to this sbatch: $SCRIPT_DIR/$1" >&2
     echo "       $2" >&2; exit 1; }
 }
-_sib gen_correctness.py "The recipe is a 4-file bundle (sbatch + sglang-rocm.toml + sglang_launcher_mi300a.py + gen_correctness.py) + build_overlay.sh."
+# Shared scripts (gen_correctness.py, sglang_launcher_mi300a.py) are
+# canonical in the repo's meta/common/ — walk up from the recipe dir.
+COMMON_DIR=""
+_cwd="$SCRIPT_DIR"
+for _ in 1 2 3 4 5 6; do
+  [ -d "$_cwd/meta/common" ] && { COMMON_DIR="$_cwd/meta/common"; break; }
+  _cwd="$(dirname "$_cwd")"
+done
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/ not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+export COMMON_DIR   # reaches the container via srun-inherited env
+unset _cwd
+[ -f "$COMMON_DIR/gen_correctness.py" ] || { echo "FATAL: $COMMON_DIR/gen_correctness.py missing" >&2; exit 1; }
+[ -f "$COMMON_DIR/sglang_launcher_mi300a.py" ] || { echo "FATAL: $COMMON_DIR/sglang_launcher_mi300a.py missing" >&2; exit 1; }
 _sib sglang-rocm.toml "The EDF (v0.5.18 image + overlay PYTHONPATH + MI300A env). Found via EDF_PATH=$SCRIPT_DIR."
-_sib sglang_launcher_mi300a.py "The is_integrated MI300A memory-accounting fix launcher."
 [ -f "$GLM53_DIAG_DIR/capture_probe.py" ] || {
   echo "FATAL: capture_probe.py not found in $GLM53_DIAG_DIR" >&2
   echo "       (the shared diag harness lives in <cookbook>/meta/diag/glm53; submit from a full cookbook checkout)" >&2; exit 1; }
@@ -593,7 +438,7 @@ echo "[rank $RANK] launching SGLang (head=HTTP+probe$([ "$SMOKE" = 0 ] && echo "
 # The is_integrated MI300A memory-accounting fix launcher (patches
 # torch.cuda.get_device_properties.is_integrated=False so each MI300A GPU's
 # 137 GiB HBM3 is accounted per-GPU, not as shared sysmem).
-exec python3 "$SCRIPT_DIR/sglang_launcher_mi300a.py" "${SGLANG_ARGS[@]}"
+exec python3 "$COMMON_DIR/sglang_launcher_mi300a.py" "${SGLANG_ARGS[@]}"
 ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
@@ -717,7 +562,7 @@ trap 'stop_otela' EXIT TERM INT
       timeout "$((GEN_PROBE_TIMEOUT + 300))" \
       srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
            -w "$HEAD" --environment="$OTELA_EDF_NAME" \
-           python3 "$SCRIPT_DIR/gen_correctness.py" \
+           python3 "$GEN_PROBE_SCRIPT" \
                "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
                "$PROBE_OUT" "$GEN_CORRECTNESS_MAX_TOKENS" "$GEN_CORRECTNESS_MIN_PASS"
     rc=$?

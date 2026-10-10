@@ -33,3 +33,11 @@ glm53-*.txt
 
 # Core dumps from crashed jobs on HPC nodes (nid*)
 core_*
+
+# Editor/periodic backups of recipe files (*.bak-<ts>, *.bak-<tag>)
+*.bak
+*.bak-*
+
+# Captured sbatch output dumps (tag_jobid.txt convention, e.g. cgcm10_602284.txt)
+cg*.txt
+bc_done.txt

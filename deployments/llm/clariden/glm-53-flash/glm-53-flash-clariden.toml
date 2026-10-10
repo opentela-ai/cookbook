@@ -16,15 +16,14 @@
 # first import). On artifact source the com.hooks.aws_ofi_nccl.variant
 # annotation is IGNORED; on the rare source=host, the docs' recommended variant
 # is cuda-dl (not static cuda13).
-image = "/capstor/scratch/cscs/xyao/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh"
+image = "/iopsstor/scratch/cscs/xyao/glm-53-flash/images/sglang-glm-5.3-flash.aarch64.sqsh"
 
 mounts = [
-  "/capstor:/capstor",
   "/users/xyao:/users/xyao",
   "/iopsstor:/iopsstor",
 ]
 
-workdir = "/capstor/scratch/cscs/xyao/glm-53-flash"
+workdir = "/iopsstor/scratch/cscs/xyao/glm-53-flash"
 
 [env]
 # Per-rank HOME on /capstor (NOT /users — quota-limited NFS). otela writes a
@@ -33,10 +32,10 @@ workdir = "/capstor/scratch/cscs/xyao/glm-53-flash"
 # ESTALE which freezes the CRDT (the JSC recipe documents this failure in
 # detail). The serve script overrides this per rank (SLURM_PROCID); the value
 # here is the base for rank 0 / single-rank runs.
-HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/home"
-HF_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/hf"
-XDG_CACHE_HOME = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/xdg"
-TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/glm-53-flash/cache/triton"
+HOME = "/iopsstor/scratch/cscs/xyao/glm-53-flash/home"
+HF_HOME = "/iopsstor/scratch/cscs/xyao/glm-53-flash/cache/hf"
+XDG_CACHE_HOME = "/iopsstor/scratch/cscs/xyao/glm-53-flash/cache/xdg"
+TRITON_CACHE_DIR = "/iopsstor/scratch/cscs/xyao/glm-53-flash/cache/triton"
 HF_HUB_OFFLINE = "1"
 TRANSFORMERS_OFFLINE = "1"
 TOKENIZERS_PARALLELISM = "false"
@@ -58,3 +57,17 @@ NCCL_DEBUG = "WARN"
 # see README fix #11/#12 for the Gloo peer-disconnect stalls (carried from the
 # kimi-k3 clariden recipe, same site/fabric).
 com.hooks.aws_ofi_nccl.enabled = "true"
+# WORKAROUND (2026-09-17): CSCS decommissioned /capstor and remounted its
+# filesystems at /iopsstor (= /iopsstor/scratch, /iopsstor/store,
+# /iopsstor/datacache). The cluster's netstack hook (/etc/enroot/hooks.d/
+# 10-netstack.sh, dated the migration day) still hardcodes the artifact base
+# path /capstor/store/cscs/cscs/public/containers/netstack/, which no longer
+# exists (and has no /iopsstor equivalent yet), so source=artifact (the
+# default) fails container start site-wide:
+#   [ERROR] [NETSTACK hook] Invalid netstack path '/capstor/store/...'
+# Fall back to the host netstack (documented source=host path; variant
+# cuda-dl is the docs' recommended value for source=host). This covers the
+# single-node TP4 default (intra-node NVLink, no CXI needed). Revert to the
+# artifact once CSCS republishes it under /iopsstor/store.
+com.hooks.netstack.source = "host"
+com.hooks.aws_ofi_nccl.variant = "cuda-dl"

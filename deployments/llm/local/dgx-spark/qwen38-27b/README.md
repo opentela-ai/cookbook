@@ -9,6 +9,20 @@ e4m3/dynamic) — on the **same DGX Spark** that ran `Qwen/Qwen3.6-35B-A3B-FP8`
 via a standalone `otela` sidecar. There is no scheduler: the two scripts are
 run by hand on the host.
 
+## Start here
+
+On the DGX Spark host (no build step — this recipe reuses the
+`s3er-qwen36-dgx-spark` image from the `qwen36-35b-a3b` recipe):
+
+```bash
+bash serve_qwen38_dgx_spark.sh        # engine container; prints READY when serving
+bash register_qwen38_otela.sh daemon  # otela sidecar → mesh
+# or both in one shot (also checks the image exists):  bash up.sh
+
+curl -s http://localhost:30000/v1/models | python3 -m json.tool   # engine up
+tail -f ./run/otela/otela.log                                     # sidecar: look for "connected: true"
+```
+
 ## Why this site (and no `build_image.sh`)
 
 A single GB10 in a workstation form factor is the whole point — no cluster, no
@@ -91,6 +105,7 @@ otela binary/version as the qwen36 recipe:
 |------|---------|
 | `serve_qwen38_dgx_spark.sh` | Start/stop the engine container (reuses `s3er-qwen36-dgx-spark`); waits on `/v1/models`, writes `last_service.env` |
 | `register_qwen38_otela.sh` | Start/stop/status the standalone `otela` sidecar that publishes the `llm` service |
+| `up.sh` | One-shot bring-up: check image → serve → register |
 | `.gitignore` | Excludes `run/` (runtime state) and the out-of-band weights |
 
 ## Run

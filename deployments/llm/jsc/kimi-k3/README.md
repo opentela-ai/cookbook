@@ -9,6 +9,35 @@ wins, the ones that don't and why, and the exact failures behind each choice.
 The companion `serve_llm_otela_jsc.sbatch` is the runnable artifact; the
 findings here are the "why" behind its non-obvious settings.
 
+## Start here
+
+On a login node (`cd deployments/llm/jsc/kimi-k3` first; from a workstation,
+prefix each command with `rcc --profile jsc run --`):
+
+```bash
+bash build_kimi_k3_image.sh          # once: .sif on /e/scratch (10–25 min)
+bash start_relay_jsc.sh              # once: relay in tmux, writes relay.multiaddr
+sbatch serve_llm_otela_jsc.sbatch    # per job: sglang on 8 nodes + otela worker on the head
+# or all three in one shot (skips what already exists):  bash up.sh
+```
+
+```bash
+# verify (login node CANNOT reach compute — run inside the allocation)
+JOB=<jobid>; D=/e/scratch/reformo/$USER/otela-llm
+HEAD=$(grep SERVICE_HEAD_NODE $D/last_service.env | cut -d= -f2)
+srun --jobid=$JOB --overlap --nodes=1 -w "$HEAD" curl -s http://127.0.0.1:30000/health
+grep -iE "regist|LEFT|error" $D/run-$JOB/otela.log   # registration + clean leave
+tmux attach -t jsc-otela-relay-$(id -un)             # relay log
+
+# end-to-end through the public API:
+curl -s https://api.opentela.ai/v1/service/llm/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"ping"}]}'
+```
+
+Everything below is the verified findings behind those settings — read it when
+a run misbehaves or before changing a default, not before the first submit.
+
 ---
 
 ## TL;DR — the verified operating point
@@ -39,7 +68,7 @@ Why each of these is pinned the way it is (each was a discovered failure mode):
 - **`--moe-runner-backend marlin`** — Marlin is the *only* SM90 MoE backend that
   keeps K3's mxfp4 weights **packed** (W4A16). The `auto` default would pick
   Triton-Kernels, whose `upcast_from_mxfp4()` dequantizes to bf16 and OOMs a
-  4-bit model on 96 GiB. (Recipe comment line ~162.)
+  4-bit model on 96 GiB.
 - **TP4** — keeps tensor-parallel collectives inside one node's **4-GH200 NVLink
   domain**. No cross-node all-reduce. Cross-node traffic is pipeline send/recv
   only (point-to-point, always fine).
@@ -51,6 +80,10 @@ Why each of these is pinned the way it is (each was a discovered failure mode):
 - **FlashKDA / FlashMLA / HiCache / Marlin** — the SGLang Kimi-K3 cookbook's
   Hopper capacity levers. All already applied; most other capacity knobs would
   raise the 136-slot KDA ceiling, which is *not* the binding constraint at C=32.
+  FlashKDA is **auto-enabled** by the sbatch when a built prefix exists at
+  `$DEPLOY_DIR/flashkda_prefix` (build it with `build_flashkda_prefix.sh`):
+  measured **+14% / +19% aggregate at C=8 / C=16** (prefill-bound), flat at
+  C=32 (pipeline-bound). No-op if absent.
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 256-out)
 
@@ -216,7 +249,8 @@ default `~/.deep_ep`) — the recipe makes that rank-local too for the same reas
 
 | File | Purpose |
 |------|---------|
-| `serve_llm_otela_jsc.sbatch` | One self-contained sbatch: sglang engine (apptainer `--nv`) + otela worker + optional vmagent. Defaults: Kimi-K3, 8 nodes, TP4×PP8. |
+| `up.sh` | One-shot: build image if missing → start the relay (idempotent) → `sbatch`. The three Start-here steps as a single command; extra args are passed to `sbatch`. |
+| `serve_llm_otela_jsc.sbatch` | One self-contained sbatch: sglang engine (apptainer `--nv`) + servekit cold-start profile + pre-registration bench + otela worker. Defaults: Kimi-K3, 8 nodes, TP4×PP8. |
 | `start_relay_jsc.sh` | Login-node relay (tmux, writes `relay.multiaddr`). Run once before submitting; outlives every job. Per-user ports by default + `attach`/`stop` guards, so multiple operators coexist on one login node. See §6. |
 | `build_kimi_k3_image.sh` | Build the sglang `.sif` on a login node. CUDA-13 (default) and CUDA-12 (`-cu12`, required for SHARP) variants. |
 | `stage_sharp_plugin.sh` | One-command: stage a self-contained SHARP plugin dir on `/e/scratch` (closes all 5 gaps in §2). Run once on a login node. |
@@ -275,6 +309,15 @@ in the serving sbatch header, ported here so the relay doesn't trip them):
   released yet. NB the v0.2.x asset is named `opentela-arm64`, not
   `otela-arm64` (≤ v0.1.12) or `ocf-arm64` (≤ v0.1.11).
 
+- **Signed binaries only, end to end.** Peers silently DISCARD every CRDT
+  record published by a binary without a build attestation (self-built
+  binaries report version `dev`): the node connects, relays HTTP and serves
+  traffic — but never registers and never announces LEFT. The failure is
+  silent and one-directional. `OTELA_REQUIRE_SIGNED=true` on the worker is
+  only safe when every node in the path (relay included) runs an official
+  signed release; the recipe defaults it to `false` to stay operable with
+  self-built worker binaries.
+
 ### Concurrency on one login node
 
 Two operators on the **same** login node used to both try to bind the fixed
@@ -305,7 +348,72 @@ For a fully independent relay (own peer ID, own store), set `DEPLOY_DIR` and
 `start_relay_jsc.sh`, then point the sbatch at the new `relay.multiaddr`
 with `RELAY_ADDR_FILE`.
 
+## §7. Teardown: how the job leaves OpenTela cleanly
+
+The registry failure mode this choreography exists for: an otela worker that
+is SIGKILLed never publishes its LEFT record, and the head then keeps a
+`connected: true` row pointing at a dead endpoint — the staleness sweep skips
+peers that registered a service, so the head keeps round-robining real traffic
+into a worker that no longer exists. Three coordinated mechanisms prevent it:
+
+1. **`#SBATCH --signal=B:TERM@120`** — signals the *batch shell* (that is what
+   `B:` is for) 120 s before wall-time expiry, which is the window `stop_otela`
+   needs. Without it the only grace is `KillWait` (default 30 s) between
+   SIGTERM and SIGKILL — less than stop_otela's poll plus otela's ~10 s
+   shutdown (AnnounceLeave → 5 s CRDT drain → `srv.Shutdown`) — so teardown
+   loses the race at every wall-time expiry and the LEFT record is never
+   published.
+2. **Signal the step, not the task.** The worker runs as an `srun --overlap`
+   step (`-J otela-worker-$JOBID`) because srun does not reliably relay signals
+   to the task; `stop_otela` finds the step via `squeue` and `scancel -s TERM`s
+   it, then polls up to **20 s**. On the `scancel` path the only grace is
+   KillWait's 30 s, so a longer poll just guarantees we are still waiting when
+   the SIGKILL lands.
+3. **Verify, never assume.** "Step already gone" and "left cleanly" used to
+   look identical in job logs, which made a lost LEFT invisible after the
+   fact. The teardown now WARNs loudly when the step is missing, and greps
+   `Announcing myself as LEFT|Leaving network` in `otela.log` to confirm the
+   leave. ("Leaving network" is logged at the *start* of shutdown and the CRDT
+   delta drains after it — don't cut the wait short on that line.)
+
+`stop_otela` also guards against double execution: bash runs the EXIT trap
+after the TERM handler returns, so without the guard the teardown runs twice
+and the second pass reports a spurious warning.
+
+## §8. Engine-env guards (the lines that look paranoid)
+
+Each of these is in the sbatch's `engine.sh` because its absence failed live:
+
+- **`NCCL_SOCKET_FAMILY=IPv4` + `GLOO_SOCKET_FAMILY=IPv4`** — some JSC racks
+  resolve peer hostnames to IPv6 (`fdff::`); NCCL's bootstrap tries the AAAA
+  record, fails with errno 97 (address family not supported) and has **no
+  fallback** → PP/EP communicator init deadlocks. Verified: TP8/EP8/PP4 init
+  completes all 32 comms with this set, vs **5/32 without**.
+- **`NCCL_IB_RETRY_CNT=7` + `NCCL_IB_TIMEOUT=22`** — the defaults (0 retries,
+  ~36 s timeout) let one transient switch hiccup abort the RC QP; raised
+  values let the transport ride out the hiccup.
+- **`DIST_TIMEOUT=60`** — racks whose GH200s advertise CUDA multimem make
+  sglang attempt a `CUDASymmetricMemory` rendezvous on the default (32-rank,
+  cross-node) process group; IPC handles cannot cross nodes, and every rank
+  burns the full NCCL default (600 s) before falling back. 60 s is ample for
+  the real rendezvous (sub-second) while keeping the fallback fast.
+- **Metrics OFF by default (`ENABLE_METRICS`)** — PyTorch's NCCL watchdog, on
+  a collective timeout, re-registers Prometheus metrics that sglang already
+  registered → `prometheus_client` `DuplicateTimeseries` → the *server
+  crashes*. One transient cross-node hang is enough to bring down the whole
+  deployment. Opt in only for short, supervised benchmarking runs.
+- **Caches on `/e/scratch`, never `/e/home`** — `/e/home` is quota-limited
+  NFS; `$HOME`, HF/XDG/Triton caches are redirected, and the JIT cache dirs
+  are rank-local (§4).
+- **No socat/forwarder is needed** — otela's registrar health-checks the
+  hardcoded `localhost:$SERVE_PORT`; the worker runs *on* the serving node and
+  apptainer shares the host network namespace, so the engine genuinely is on
+  localhost. Forwarders are only for engine/worker on different hosts.
+
 ## Submit
+
+(The step-by-step commands are in [Start here](#start-here) at the top; this
+section adds the rcc flow and the TP32/EP32 experiment form.)
 
 ### From the login node (SSH)
 
@@ -409,8 +517,15 @@ Every launch also produces, without any of the above: **before** the otela
 worker registers, a verification bench C=16 n=64 written into
 `$RUNDIR/coldstart.node0.json` (merged with the cold-start timeline), and a
 per-node cold-start profile `$RUNDIR/coldstart.node<RANK>.json` — the
-engine's phase timestamps from spawn to serving. `SERVEKIT_BENCH=0` disables
-the bench; a missing servekit checkout just skips both, with a WARN.
+engine's phase timestamps from spawn to serving. The bench runs **before**
+registration so otela traffic cannot pollute the numbers; `SERVEKIT_BENCH=0`
+disables the bench; a missing servekit checkout just skips both, with a WARN.
+
+Two servekit profile semantics worth knowing: `servekit profile` **kills** the
+engine on `--timeout` expiry, so its timeout tracks `HEALTH_TIMEOUT` — never
+set it shorter. Workers are profiled on sglang's multi-node "Dummy health
+check server started" log line; if a future image stops printing it, workers
+stay unprofiled (check `coldstart.node<R>.json` after image bumps).
 
 Confirm SHARP engagement in the sglang log (`NCCL_DEBUG=INFO`):
 ```
@@ -427,13 +542,19 @@ NET/IB : Using [0]mlx5_0:1/IB/SHARP ...   (/SHARP suffix = engaged)
 | `PP_SIZE` | `$NNODES` | one stage/node. |
 | `EP_SIZE` | `$TP_SIZE` | only meaningful with `MOE_A2A_BACKEND` set. |
 | `MOE_BACKEND` | `marlin` | only SM90 mxfp4-packed runner. |
+| `CG_DECODE` | `full` | decode CUDA-graph backend. |
 | `MOE_A2A_BACKEND` | *(empty=none)* | `deepep`/`megamoe` crash on K3-sm90 (§3); kept for Blackwell. |
 | `SHARP_PLUGIN_DIR` | *(empty=off)* | set to the staged dir + a cu12 image to enable cross-node SHARP (§2). |
 | `MEM_FRAC` | 0.90 | |
 | `CTX_LEN` | 1048576 | Kimi-K3's native 1 Mi-token window; bounds request length, does not size the KV pool. |
 | `IMAGE` | `.../sglang-kimi-k3.sif` | use `-cu12.sif` for SHARP. |
 | `MODEL_PATH` | `/e/data1/.../Kimi-K3` | shared model cache (no internet on compute). |
-| `DIST_TIMEOUT` | 60 | raise for large TP/EP init. |
+| `DIST_TIMEOUT` | 60 | short on purpose — skips the doomed cross-node multimem rendezvous fast (§8). |
+| `HEALTH_TIMEOUT` | 5400 | health wait before giving up registration; the servekit profile timeout tracks it (never set shorter, §"Verify"). |
+| `K3_NIC` / `DIST_PORT` / `SERVE_PORT` | `ib0` / 20000 / 30000 | fabric iface, torch-dist rendezvous port, engine port. |
+| `FLASHKADA_PREFIX` | `$DEPLOY_DIR/flashkda_prefix` | auto-enables FlashKDA when built (§1); injects `SGLANG_PYTHONPATH_EXTRA` unless that is already set. |
+| `ENABLE_METRICS` | *(empty=off)* | `1` opts into Prometheus metrics — crash risk, see §8. |
+| `OTELA_REQUIRE_SIGNED` | `false` | set `true` only when every node in the path is an official signed release (§6). |
 | `TVM_FFI_CACHE_DIR` / `EP_JIT_CACHE_DIR` | rank-local under `$DEPLOY_DIR/cache` | race-proof (§4). |
 | `SGLANG_EXTRA_ARGS` | *(empty)* | appended to the `sglang serve` line. |
 | `SERVEKIT_DIR` | `$DEPLOY_DIR/servekit` | servekit checkout on shared FS (stdlib-only, no install; stage once from a login node). Missing → WARN, engine runs unprofiled, auto-bench skipped. |

@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
 #SBATCH --time=01:30:00
-#SBATCH --output=/capstor/scratch/cscs/xyao/glm-53-flash/logs/image-%j.out
-#SBATCH --error=/capstor/scratch/cscs/xyao/glm-53-flash/logs/image-%j.out
+#SBATCH --output=/iopsstor/scratch/cscs/xyao/glm-53-flash/logs/image-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/xyao/glm-53-flash/logs/image-%j.out
 #
 # Import docker://lmsysorg/sglang:glm-5.3-flash (a GLM-5.3-specific SGLang
 # build, multi-arch — on aarch64 this pulls the arm64 manifest with sm_90
@@ -28,7 +28,7 @@
 set -uo pipefail
 
 PROJECT="${PROJECT:-infra02}"
-export GLM53_DIR="${GLM53_DIR:-/capstor/scratch/cscs/$USER/glm-53-flash}"
+export GLM53_DIR="${GLM53_DIR:-/iopsstor/scratch/cscs/$USER/glm-53-flash}"
 export IMAGE="${IMAGE:-$GLM53_DIR/images/sglang-glm-5.3-flash.aarch64.sqsh}"
 SRC="${IMAGE_SOURCE:-docker://lmsysorg/sglang:glm-5.3-flash}"
 IMG_DIR="$(dirname "$IMAGE")"

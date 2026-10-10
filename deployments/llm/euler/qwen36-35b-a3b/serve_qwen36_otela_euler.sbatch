@@ -15,54 +15,15 @@
 # Self-contained sbatch, no sibling scripts (the relay is started separately
 # on a login node — see the README and start_relay_euler.sh).
 #
-# Submit:
-#   sbatch serve_qwen36_otela_euler.sbatch
-#   sbatch --export=ALL,SERVED_MODEL_NAME=Qwen/Qwen3.6-35B-A3B-FP8 \
-#          serve_qwen36_otela_euler.sbatch
-#
-# What it does, in order:
-#   1. Resolves the shared OpenTela relay on the login node (started by
-#      start_relay_euler.sh; prefilled default below).
-#   2. Starts sglang (apptainer --nv, single GPU) serving the FP8 model.
-#   3. Waits for /health, then starts an otela WORKER on the same compute
-#      node that registers the `llm` service + model id via the relay.
-#   4. On job end / scancel, stops the worker so it announces LEFT cleanly.
-#
-# -----------------------------------------------------------------------------
-# WHY A LOGIN-NODE RELAY (same topology as JSC)
-# -----------------------------------------------------------------------------
-# Euler compute nodes have NO outbound raw-TCP internet (api.opentela.ai:443,
-# p2p.opentela.ai:443, github.com:443 all fail with "Cannot assign requested
-# address"). The `eth_proxy` module gives HTTP(S) egress only — NOT the raw
-# TCP that libp2p needs. The login node DOES have raw-TCP egress to the public
-# internet (verified: bootstraps.opentela.ai:443, 140.238.223.116:8092 both
-# OPEN). So the compute-side otela worker cannot reach the public head
-# directly; it hops through a relay running on a login node:
-#
-#   client ─https─▶ api.opentela.ai ──P2P──▶ ocf head
-#                                              ▲ WSS out via p2p.opentela.ai:443
-#   ┌── Euler login node (e.g. eu-login-02, 129.132.93.77) ──────────────┐
-#   │  RELAY  otela --role relay   (tmux; shared by all jobs/users)       │
-#   │  listens on <login-ip>:18905 peer QmPAfjhRSrnR…M8n (seed 99)      │
-#   └─────────────────────────────────────────────────────────────────────┘
-#                          ▲ TCP, Euler-internal (compute CAN reach login)
-#   ┌── compute node (this job, e.g. eu-g7-003) ─────────────────────────┐
-#   │  WORKER  otela --role worker --service.port $SERVE_PORT             │
-#   │  sglang serve (apptainer --nv, host netns) on 127.0.0.1:$SERVE_PORT │
-#   └─────────────────────────────────────────────────────────────────────┘
-#
-# CRITICAL — otela BadgerDB (.ocfcore) must NOT go on /cluster/home (over
-# quota, 46/48 GB at time of writing) NOR on Lustre scratch (stale file
-# handles after days — documented in the JSC recipe). The worker's HOME is
-# overridden to $TMPDIR/otela-home (node-local tmpfs/SSD, auto-cleaned by
-# Slurm). With cleanslate: true the worker starts fresh each time, so the
-# loss of BadgerDB on requeue is harmless.
-#
-# NO socat IS NEEDED (same as JSC): otela health-checks a hardcoded
-# localhost:<port>. Because the worker runs ON the serving node (and
-# apptainer shares the host network namespace), sglang genuinely is on
-# 127.0.0.1:$SERVE_PORT.
-# =============================================================================
+# Submit:   sbatch serve_qwen36_otela_euler.sbatch            (relay must be up)
+#           sbatch --export=ALL,SERVED_MODEL_NAME=Qwen/Qwen3.6-35B-A3B-FP8 \
+#                  serve_qwen36_otela_euler.sbatch
+# Steps:    resolve relay → sglang (apptainer --nv, host netns) → wait /health →
+#           otela worker registers via the relay → clean LEFT on job end.
+# Why a login-node relay (compute has no raw-TCP egress), the topology diagram,
+# the BadgerDB home/Lustre placement, and why no socat is needed:
+#           README.md → “Site-specific fixes” #1/#4 and “Architecture”.
+# ============================================================================
 
 set -uo pipefail
 
@@ -76,11 +37,8 @@ export MODEL="${MODEL:-$DEPLOY_DIR/model/Qwen3.6-35B-A3B-FP8}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.6-35B-A3B-FP8}"
 
 # ------------------------------------------------------------------- otela ----
-# The otela binary is OpenTela v0.2.3 (commit e9d1696, built 2026-07-29),
-# pre-downloaded to scratch from
-#   https://github.com/eth-easl/OpenTela/releases/download/v0.2.3/opentela-amd64
-# The old ~/opentela/entry (sai-v0.0.6) is NOT used — v0.2.3 is required.
-# To update: curl -L -o $DEPLOY_DIR/bin/otela <github-release-url>; chmod +x
+# OpenTela v0.2.3 (commit e9d1696) — the old sai-v0.0.6 entry is NOT used.
+# Download + relay config: README.md → Prerequisites.
 OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/bin/otela-v0.2.3}"
 # The shared login-node relay (started by start_relay_euler.sh). An explicit
 # $OTELA_RELAY_ADDR or a non-empty $RELAY_ADDR_FILE overrides this default.
@@ -89,16 +47,11 @@ OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/bin/otela-v0.2.3}"
 OTELA_RELAY_DEFAULT="/ip4/129.132.93.77/tcp/18905/p2p/QmPAfjhRSrnRJn526V4QEHmoVASYMCAxCuVxgrQtmEM8n"
 RELAY_ADDR_FILE="${RELAY_ADDR_FILE:-$DEPLOY_DIR/relay.multiaddr}"
 OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
-# Labels attached to the service announcement (visible to the gateway as
-# service.identity_group). The Euler otela binary has no --label flag, so
-# labels are written to a cfg.yaml in the --config-dir (see below).
-# Override with a space-separated list of "key=value" pairs.
+# Service labels (gateway identity_group); written to cfg.yaml because this
+# binary has no --label flag (see the worker section). Space-separated k=v list.
 OTELA_IDENTITY_GROUP="${OTELA_IDENTITY_GROUP:-model=$SERVED_MODEL_NAME cluster=euler gpu=rtx_pro_6000}"
-# Fresh peer ID per invocation (avoids the LEFT-tombstone stall documented in
-# the dgx-spark recipe: a graceful stop announces LEFT; restarting with the
-# same seed reproduces the peer ID but a fresh CRDT cannot override the
-# tombstone, so the peer never re-appears on the gateway for many minutes).
-# Set OTELA_SEED to a constant ONLY if you want a stable peer ID.
+# Fresh peer ID per invocation — avoids the LEFT-tombstone stall (dgx-spark
+# recipe; README fix #7). Set OTELA_SEED constant only for a stable peer ID.
 OPENTELA_SEED="${OPENTELA_SEED:-$$}"
 OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
 OTELA_UDP_PORT="${OTELA_UDP_PORT:-59820}"

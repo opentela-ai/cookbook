@@ -5,127 +5,43 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-# Full node (288 logical CPUs): the sglang glm-5.3 image pins TP ranks to GPU
-# NUMA domains using host CPU ids; a shrunken cpuset raises "CPU number N is
-# not eligible" and kills ranks. 1 task/node x 288 cpus = whole node.
+# Whole node (288 logical CPUs): the image pins TP ranks to GPU NUMA domains
+# via host CPU ids; a shrunken cpuset kills ranks.
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
-# No --mem/--exclusive: clariden normal has OverSubscribe=EXCLUSIVE
-# (jobs get dedicated whole nodes via 288 cpus + 4 gpus/node), and /dev/shm
-# is a fixed 334 GiB tmpfs per node — enough for servekit's per-rank
-# presharded staging with headroom.
-# B:TERM@120 signals the BATCH SHELL (B:) 120 s before wall-time, giving the
-# stop_otela trap below a window to scancel the otela step with TERM. Without
-# B: the signal goes to the job steps, the batch-shell trap never runs, and
-# the only grace is KillWait (30 s) — less than otela's ~10 s graceful leave
-# (AnnounceLeave -> 5 s CRDT drain -> srv.Shutdown), so no LEFT is published
-# and the head keeps a `connected: true` row round-robining traffic into a
-# dead endpoint.
+# No --mem/--exclusive: normal is OverSubscribe=EXCLUSIVE (whole nodes);
+# /dev/shm is a fixed 334 GiB tmpfs per node.
+# B:TERM@120 gives the stop_otela trap a TERM window before KillWait —
+# without B: no LEFT is published and the head round-robins into a dead
+# endpoint.
 #SBATCH --signal=B:TERM@120
-#SBATCH --output=/capstor/scratch/cscs/xyao/glm-53-flash/logs/serve-%j.out
-#SBATCH --error=/capstor/scratch/cscs/xyao/glm-53-flash/logs/serve-%j.out
+#SBATCH --output=/iopsstor/scratch/cscs/xyao/glm-53-flash/logs/serve-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/xyao/glm-53-flash/logs/serve-%j.out
 #
 # =============================================================================
-# Serve zai-org/GLM-5.3-Flash (FP8 e4m3 dynamic, ~306 GiB, multimodal
-# vision+text, DSA + linear + KDA hybrid attention, 45 layers / 288 routed
-# experts top-8, MTP) on CSCS Clariden (4x GH200 / node, aarch64, Slingshot
-# fabric, NO InfiniBand) and register it on OpenTela — one self-contained
-# sbatch, no sibling scripts.
-#
-# Submit:
-#   sbatch serve_glm_5_3_flash_otela_clariden.sbatch        # default: 1 node, TP4 (validated)
-#   sbatch --nodes=2 --export=ALL,NNODES=2,PP_SIZE=2 \
-#          serve_glm_5_3_flash_otela_clariden.sbatch        # 2 nodes, TP4 x PP2 (more KV; unvalidated)
-#   sbatch --nodes=4 --export=ALL,NNODES=4,PP_SIZE=4 \
-#          serve_glm_5_3_flash_otela_clariden.sbatch        # 4 nodes, TP4 x PP4
-#
-# FAST FIRST-BRING-UP (recommended — isolates the GLM-5.3 forward path in
-# ~10-15 min, not the multi-hour real-weight cold start; mirrors how the
-# Kimi-K3 / GLM-5.2 forward hangs were root-caused via dummy-weight smoke):
-#   sbatch --export=ALL,LOAD_FORMAT=dummy,GEN_CORRECTNESS_SMOKE=1 \
-#          serve_glm_5_3_flash_otela_clariden.sbatch
-#
-# What it does, in order:
-#   1. preflights the image, weights (or LOAD_FORMAT=dummy), and otela binary
-#      (prints exact staging commands on failure)
-#   2. srun's one sglang engine rank per node INSIDE the glm-5.3-flash-clariden
-#      container (enroot/EDF), forming a single distributed TP4 x PP<NNODES>
-#      engine. Only rank 0 (head) serves HTTP.
-#   3. once the head's /health answers, runs a MANDATORY generation probe
-#      BEFORE registration — /health alone is not enough (deepseek-v4 /
-#      kimi-k3 / glm-5.2 lesson: an engine can answer /health while a broken
-#      kernel path serves garbage or hangs). gen_correctness.py (reused from
-#      the kimi-k3/glm52 recipes, model-agnostic) sends six greedy
-#      /v1/completions prompts and checks each answer for its expected
-#      factual substring.
-#   4. ONLY if the probe passes does it start ONE otela WORKER — also inside
-#      the container, on the head node via srun --overlap --gres=none — which
-#      registers the `llm` service with the OpenTela mesh
-#   5. on job end / scancel, SIGTERM (never KILL) the otela step so it
-#      announces LEFT cleanly
-#
-# -----------------------------------------------------------------------------
-# THE TOPOLOGY: ONE distributed engine across all nodes (like kimi-k3)
-# -----------------------------------------------------------------------------
-# GLM-5.3-Flash is ~306 GiB FP8 e4m3 — it does NOT fit on one 4x96 GB GH200
-# node, so this is NOT the Beverin per-node-independent-replicas pattern. It
-# is the JSC / kimi-k3 pattern: ONE distributed sglang engine across all
-# nodes, ONE otela worker on the head registering the single head HTTP
-# endpoint.
-#
-#   clariden compute (host netns; enroot container shares it)
-#     rank 0 (HEAD)  -> sglang launch_server (HTTP on 0.0.0.0:$SERVE_PORT) + otela
-#     rank 1..N      -> sglang workers (no HTTP; pipeline P2P to neighbours)
-#
-# TP4 keeps tensor-parallel all-reduce INSIDE one node's 4-GH200 NVLink domain.
-# PP<NNODES> puts one pipeline stage per node, so the only traffic that
-# crosses the Slingshot fabric is pipeline send/recv (point-to-point) —
-# bandwidth-tolerant and CUDA-graph-safe. Cross-node allreduce (TP8 flat on
-# 2 nodes) boots but is ~1-5 tok/s and cannot be captured in a CUDA graph on
-# Slingshot/CXI (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only
-# supports RDMA transport protocol") — same finding as kimi-k3 on clariden.
-#
-# Memory (2 nodes TP4 x PP2, 8 GPUs total):
-#   306 GiB FP8 weights / 8 GPUs = ~38 GiB weights/GPU of 96 GiB HBM
-#   -> ~58 GiB free for KV pool + activations + JIT. Comfortable (unlike the
-#      1.5 TB kimi-k3 on 24 GPUs). PP2 = 23 layers/stage (45 / 2, odd split —
-#      stage 0 takes 23, stage 1 takes 22; sglang's load balancing handles
-#      uneven layer counts).
-#
-# -----------------------------------------------------------------------------
-# CONTAINER + NCCL ON SLINGSHOT (the clariden-specific part)
-# -----------------------------------------------------------------------------
-# Image is docker://lmsysorg/sglang:glm-5.3-flash (a GLM-5.3-specific SGLang
-# build, multi-arch amd64 + arm64 — on aarch64 enroot import pulls the arm64
-# manifest with sm_90 cubins for GH200) imported to a local .sqsh ONCE
-# (build_glm_5_3_flash_image.sbatch). The EDF (glm-53-flash-clariden.toml,
-# found via EDF_PATH below) carries com.hooks.aws_ofi_nccl.enabled=true.
-# Clariden defaults to netstack source=artifact, so the hook bind-mounts the
-# dynamically-linked (+dl) aws-ofi-ccl plugin + libfabric CXI provider at
-# container start. That gives NCCL the native Slingshot transport — clariden
-# has NO InfiniBand verbs, so NCCL's built-in IB transport is unused. The
-# per-rank engine.sh below adds FI_CXI_* / NCCL_* tunables as := fallbacks
-# that yield to whatever the hook sets (reconciled with CSCS resource-hook
-# docs, carried from the verified kimi-k3 clariden recipe).
+# Serve zai-org/GLM-5.3-Flash (~306 GiB FP8 e4m3, DSA + linear + KDA hybrid)
+# on CSCS Clariden (4x GH200/node, aarch64, Slingshot) + OpenTela — one
+# self-contained sbatch.
+# Submit variants (incl. the dummy-weight fast smoke), the flow, registration
+# details and the full "why" essays: README.md.
+# Flow: preflight -> one sglang rank/node in the EDF container (TP4 x
+# PP<NNODES>, head serves HTTP) -> /health -> MANDATORY gen probe -> ONE
+# otela worker on the head -> SIGTERM/LEFT on end.
+# Topology: one distributed engine (JSC/kimi-k3 pattern). TP4 keeps allreduce
+# on NVLink; PP<NNODES> = only point-to-point send/recv crosses Slingshot
+# (flat TP8: ~1-5 tok/s, no CUDA-graph capture — kimi-k3 finding). 2-node
+# TP4xPP2: ~38 GiB weights/GPU, ~58 GiB free; 45/2 = 23+22 layers/stage.
+# Container + NCCL: EDF hooks aws_ofi_nccl (netstack source=artifact
+# bind-mounts the +dl plugin + CXI provider; no IB verbs on clariden);
+# engine.sh's FI_CXI_*/NCCL_* tunables are := fallbacks yielding to the hook.
 # =============================================================================
 
 set -uo pipefail
 
 # ----------------------------------------------------- script + deploy dirs --
-# Locate the EDF ($OTELA_EDF_NAME.toml) regardless of the submit working
-# directory, so both submit styles work:
-#   - manual:  `cd <deploy-dir> && sbatch serve_*.sbatch`  (SLURM_SUBMIT_DIR
-#     is the deploy dir, so the EDF is a sibling there)
-#   - rcc:     `rcc job submit deployments/.../serve_*.sbatch` runs sbatch from
-#     the repo root (remote_dir), so SLURM_SUBMIT_DIR is the ROOT and the EDF
-#     lives in the deployments/llm/clariden/glm-53-flash subdirectory.
-# Without this search pyxis fails at the preflight srun with "failed to find a
-# readable environment file" (observed on kimi-k3 jobs 3032795/3034577,
-# submitted from the root; the prior successful runs were submitted manually
-# from the subdir). Slurm copies the sbatch to /var/spool/slurmd/job<id>/ and
-# runs it from there, so ${BASH_SOURCE[0]} is the SPOOL copy and is NOT the
-# EDF dir — BASH_SOURCE is only a last-resort fallback for non-Slurm runs.
-# Keep ~/.edf on EDF_PATH so a pre-existing ~/.edf/<name>.toml remains usable.
+# Locate the EDF for both submit styles (manual from the recipe dir; rcc from
+# the repo root — kimi-k3 jobs 3032795/3034577 are why this search exists).
+# BASH_SOURCE is the spool copy — last resort only. ~/.edf kept for legacy.
 OTELA_EDF_NAME="${OTELA_EDF_NAME:-glm-53-flash-clariden}"
 _edf_dir=""
 for _cand in \
@@ -143,214 +59,92 @@ export SCRIPT_DIR="$_edf_dir"
 unset _edf_dir _cand
 
 # ---------------------------------------------------------------- deployment --
-# Reuses the existing /capstor/scratch/cscs/xyao/glm-53-flash tree: the
-# imported image, EDF cache dirs, and a warm Triton cache live here, so a
-# fresh submit does not re-pull or re-JIT from cold.
-export DEPLOY_DIR="${DEPLOY_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash}"
-# Shared GLM-5.3 diagnostic harness (comp_capture/capture_probe/comp_diff).
-# Lives in the cookbook checkout so beverin and clariden run the IDENTICAL
-# copies (one source of truth — no cross-site path hardcoding).
+# Reuses the /iopsstor tree (image, caches, warm Triton — no re-pull/re-JIT).
+export DEPLOY_DIR="${DEPLOY_DIR:-/iopsstor/scratch/cscs/xyao/glm-53-flash}"
+# Shared GLM-5.3 diagnostic harness — identical copies on beverin + clariden
+# (one source of truth).
 export GLM53_DIAG_DIR="${GLM53_DIAG_DIR:-$(cd "$SCRIPT_DIR/../../../.." && pwd)/meta/diag/glm53}"
 export IMAGE="${IMAGE:-$DEPLOY_DIR/images/sglang-glm-5.3-flash.aarch64.sqsh}"
-# Weights on /capstor/scratch (verified fast metadata; the /capstor/store MDT
-# was overloaded during download, so the canonical HF cache move was deferred
-# — see download_glm_5_3_flash.sbatch. Serving from /capstor/scratch matches
-# the existing HF_HOME convention and is the better serving location anyway.)
-export MODEL_PATH="${MODEL_PATH:-/capstor/scratch/cscs/xyao/models/zai-org/GLM-5.3-Flash}"
-# Served under the canonical HF id so the peer is the GLM-5.3-Flash endpoint
-# on the mesh (coexists with the kimi-k3 / glm47-flash registrations). Override
-# to a short alias if the mesh's served-model routing prefers one.
+# Weights on /iopsstor/scratch (the /capstor/store MDT was overloaded during
+# download — see download_glm_5_3_flash.sbatch).
+export MODEL_PATH="${MODEL_PATH:-/iopsstor/scratch/cscs/xyao/glm-53-flash/models/GLM-5.3-Flash}"
+# Served under the canonical HF id (coexists with kimi-k3 / glm47 peers).
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
 
 # ------------------------------------------------------------------- shape ----
-# WHY TP4 x PP<NNODES> is the default (verified on clariden for kimi-k3, same
-# site/fabric/runtime):
-# TP4 keeps collectives on the intra-node 4-GH200 NVLink domain. PP<NNODES>
-# stages one pipeline stage per node, so only point-to-point send/recv
-# crosses Slingshot — stable and CUDA-graph-safe. The flat TP8 alternative
-# (2 nodes x 4 GPUs = 8) boots but every MoE allreduce goes cross-node over
-# CXI without graph capture (~1-5 tok/s measured on kimi-k3; CG_DECODE must
-# be `disabled`). Default PP_SIZE = NNODES (one stage/node); for 2 nodes
-# that gives 45/2 = 23/22 layers per stage (uneven, handled by sglang).
+# TP4 x PP<NNODES>: allreduce stays on NVLink, only pipeline send/recv
+# crosses Slingshot (TP8 flat: ~1-5 tok/s, no graph capture). PP=NNODES.
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
-# EP_SIZE for GLM-5.3-Flash: 288 routed experts, top-8. With TP4, EP_SIZE=TP
-# gives 288/4 = 72 experts/GPU (manageable). GLM-5.3's config does not pin a
-# strict ep_size * moe_dp_size == tp_size rule (unlike kimi-k3), but EP=TP is
-# the safe default that keeps expert dispatch intra-node. TODO(unverified):
-# confirm on first run that the glm-5.3 image accepts --ep-size; if it errors
-# or requires a different value, override EP_SIZE.
+# EP=TP: 288 routed experts / 4 = 72 experts/GPU, dispatch stays intra-node.
 export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
 
-# MoE runner backend. GLM-5.3-Flash is FP8 e4m3 dynamic (quant_method=fp8 in
-# config.json), NOT mxfp4 like kimi-k3. SGLang's fp8 MoE path is standard on
-# sm_90 (GH200) — `auto` lets the image pick the right backend. Unlike kimi-k3
-# (which NEEDED marlin to keep mxfp4 packed), fp8 dynamic quant has a mature
-# native path. TODO(unverified): if `auto` picks a backend that dequantizes
-# to bf16 and OOMs (the kimi-k3/Triton-Kernels anti-pattern), pin
-# MOE_BACKEND=marlin or the image's validated fp8 runner. Check the first
-# run's "Using MoE runner backend" log line.
+# FP8 e4m3 dynamic (NOT mxfp4) — mature native path on sm_90; `auto` picks.
 export MOE_BACKEND="${MOE_BACKEND:-auto}"
 
-# Attention backends. GLM-5.3-Flash has a HYBRID attention scheme:
-#   - 34/45 layers are LINEAR attention (linear_attn_config: 64 heads,
-#     head_dim 128, short_conv_kernel_size 4, with KDA on 34 of them)
-#   - 11/45 layers are DeepSeek Sparse Attention (DSA) — every 4th layer
-#     (indices 3,7,11,...,43)
-# The glm-5.3-flash image auto-resolves attention_backend=dsa,
-# mamba_backend=triton (the 34 linear/KDA layers — no flash dep) and the
-# DSA backends from the model's layer_types + index_types config.
-#
-# THE kpool>1 HARD GATE (the load-bearing constraint, jobs 3208159 /
-# 3208291 / 3209156):
-# GLM-5.3 is MULTIMODAL with dsa_index_kpool > 1. sglang's
-# DeepseekSparseAttnBackend has TWO guards around kpool>1:
-#   1. _resolve_kpool_tail_backend (L887): perf override flashmla_sparse
-#      -> fa3 on sm_90 (-> trtllm on sm_100+). Fixed by sitecustomize.py
-#      (availability-aware: keeps flashmla_sparse when FA3 absent).
-#   2. _check_kpool_tail_backend (L869): a HARD correctness gate, raised on
-#      EVERY forward (not just capture) when kpool>1 and dsa_impl is NOT in
-#      {fa3, tilelang, trtllm}: "index_kpool > 1 appends tail tokens to
-#      topk_indices and is currently only supported by the FA3/TileLang/
-#      TRTLLM DSA backend." flashmla_sparse is NOT in that set — it does
-#      not implement the tail-token append. So forcing flashmla_sparse
-#      (the kimi-k3 fix, one level up) is WRONG here: job 3209156 got a
-#      clean NotImplementedError at capture instead of the cryptic FA3
-#      ImportError, proving BOTH guards and pinpointing the real fix.
-#
-# aarch64 availability of the kpool>1-legal backends (verified on this
-# image):
-#   fa3         -> sgl_kernel.flash_ops MISSING    (ImportError)
-#   trtllm      -> tensorrt_llm MISSING             (NVIDIA-only)
-#   tilelang    -> IMPORTABLE (sglang.kernels.ops.attention.dsa.
-#                  tilelang_kernel.tilelang_sparse_fwd). _forward_tilelang
-#                  (L4143) explicitly handles the kpool tail (mask-pads to
-#                  next 64-col block) and has NO FA3 dependency.
-# => tilelang is the ONLY kpool>1 DSA backend both supported AND present
-#    on aarch64. Pin BOTH --dsa-prefill-backend AND --dsa-decode-backend to
-#    it: forward_extend (L3080) AND forward_decode (L3409) both hit the
-#    hard gate, so the prefill backend must be tilelang too.
-# Do NOT pass the kimi-k3 GENERAL knobs (--prefill/decode-attention-backend):
-# those target non-DSA models and would break the 34 linear-attention layers
-# (mamba_backend=triton, no flash dep — needs no override).
-# PERF TODO(unverified): tilelang on sm_90 may be slower than the fa3 path
-# is on x86. If a future GLM-5.3 aarch64 image adds sgl_kernel.flash_ops,
-# revisit (fa3 would then pass both guards AND run).
+# Attention backends. HYBRID: 34/45 linear/KDA (mamba_backend=triton, no
+# flash dep) + 11/45 DSA (every 4th layer). THE kpool>1 HARD GATE (jobs
+# 3208159/3208291/3209156; full trail in README "Site fixes"): GLM-5.3 is
+# multimodal with dsa_index_kpool > 1, guarded twice — a perf override
+# (_resolve_kpool_tail_backend) that sends flashmla_sparse -> fa3 on sm_90,
+# and a hard raise (_check_kpool_tail_backend) on EVERY forward unless the
+# backend is fa3/tilelang/trtllm. On this aarch64 image fa3 (flash_ops) and
+# trtllm are MISSING; tilelang handles the kpool tail natively => pin BOTH
+# DSA knobs to tilelang (forward_extend AND forward_decode hit the gate).
+# Forcing flashmla_sparse (the kimi-k3 fix) trips the hard gate (3209156).
+# Do NOT pass the kimi-k3 GENERAL attention knobs — they'd break the 34
+# linear layers. PERF TODO(unverified): tilelang on sm_90 may be slower than
+# fa3 on x86; revisit if a future image ships flash_ops.
 export GLM53_DSA_PREFILL="${GLM53_DSA_PREFILL:-tilelang}"
 export GLM53_DSA_DECODE="${GLM53_DSA_DECODE:-tilelang}"
 export CG_DECODE="${CG_DECODE:-full}"
 
-# Multimodal (vision-tower) attention backend. GLM-5.3-Flash is MULTIMODAL
-# (Glm5NextForConditionalGeneration); every prefill that touches an image
-# routes the vision patches through sglang.srt.layers.attention.vision.
-# _determine_attention_backend (vision.py:1221) picks the backend by:
-#   server arg (--mm-attention-backend) > constructor arg > platform default
-# and the platform default on CUDA Hopper (sm_90, our GH200) is "fa3"
-# (vision.py:1227) -> VisionFlash3Attention.forward (L579) ->
-# flash_attn_func (L60, ver=3) -> flash_attention_v3 -> sgl_kernel.flash_ops
-# -> ImportError (job 3209753). This is the THIRD FA3 path, completely
-# independent of the DSA backends above (those govern the TEXT/DSA layers;
-# the vision tower has its own dispatch). The image has no
-# sgl_kernel.flash_ops, so pin --mm-attention-backend triton_attn
-# (VisionTritonAttention, L1003; in STRIDED_QKV_BACKENDS L1016; the
-# documented non-FA3 CUDA default per vision.py:1229) to bypass the sm_90
-# -> fa3 auto-selection. triton_attn uses Triton kernels, no flash_ops dep
-# (verified: flash_attn_func has zero call sites in VisionTritonAttention).
+# Multimodal (vision-tower) attention: platform default on sm_90 is fa3 ->
+# ImportError (job 3209753) — the THIRD FA3 path, independent of the DSA
+# backends. Pin triton_attn (Triton kernels, zero flash_ops call sites).
 export GLM53_MM_ATTENTION="${GLM53_MM_ATTENTION:-triton_attn}"
 
-# Reasoning + tool-call parsers (mirrors the GLM-5.2 beverin recipe:
-# --reasoning-parser glm45 --tool-call-parser glm47). Verified present in this
-# aarch64 image: Glm45Detector (sglang/srt/parser/reasoning_parser.py:657,
-# delimiters imd/</think>; tool_start_token <arg_key>) and
-# Glm47MoeDetector (sglang/srt/function_call/glm47_moe_detector.py,
-# <tool_call>...</tool_call> XML framing). Gated: set GLM53_ENABLE_PARSERS=0
-# if a future image bump drops them (startup errors 'invalid reasoning
-# parser' / 'invalid tool call parser' first). The /v1/completions probe
-# below is unaffected (no chat template / tools applied), so parsing stays
-# out of the mandatory gate; these flags only affect /v1/chat/completions.
+# Reasoning + tool-call parsers (glm45 / glm47, verified in this image;
+# cookbook convention). Gated: GLM53_ENABLE_PARSERS=0 if an image bump drops
+# them ('invalid ... parser' startup errors first). /v1/completions (the
+# mandatory probe) is unaffected; these flags only affect chat completions.
 export GLM53_REASONING_PARSER="${GLM53_REASONING_PARSER:-glm45}"
 export GLM53_TOOL_CALL_PARSER="${GLM53_TOOL_CALL_PARSER:-glm47}"
 export GLM53_ENABLE_PARSERS="${GLM53_ENABLE_PARSERS:-1}"
 
-# Request-length bound. GLM-5.3-Flash supports max_position_embeddings=
-# 1048576 (1M); the KV pool is sized by MEM_FRAC, not this value. Default
-# 262144 (256K): the 32768 cold-start PROBE (job 3269479) served correctly,
-# but pi's catalog advertises max-out=131072 for GLM-5.3-Flash and sends
-# max_completion_tokens=131072 by default — the OpenTela gateway rejects any
-# max_completion_tokens > advertised max_model_len with a 400, so 32768 broke
-# every default pi request. 262144 gives full input+output headroom above
-# 131072 while staying inside the live-KV budget (verified at CTX_LEN=32768:
-# max_total_num_tokens=287104 at MEM_FRAC=0.88 with 10.68 GiB still free),
-# i.e. a single 256K request fits the ~287K pool at 91%. max_running_requests
-# stays 17 (Mamba ssm_state 2.96 GiB is the real cap, not KV), so raising
-# CTX_LEN costs nothing in concurrency. Raise toward 1M only after widening
-# the live-KV pool (HICACHE_ENABLE=1 to spill evicted prefixes to Grace
-# LPDDR) — a 1M single request does NOT fit the ~287K pool today.
+# 262144 (256K): pi's catalog advertises max-out 131072 and the gateway
+# 400s anything above the advertised max_model_len, so 32768 broke every
+# default pi request. Live-KV 287104 at MEM_FRAC=0.88 (job 3269479) — a
+# 256K request fits at 91%; max_running_requests stays 17 (the Mamba
+# ssm_state cap, not KV). 1M needs HICACHE_ENABLE=1 first.
 export CTX_LEN="${CTX_LEN:-262144}"
 export MEM_FRAC="${MEM_FRAC:-0.88}"
 
-# Slingshot high-speed NIC. Every clariden GH200 node exposes hsn0..hsn3 (one
-# per GPU NUMA domain); hsn0 is used for the NCCL/GLOO socket bootstrap and is
-# where SGLANG_HOST_IP is read from. The ofi plugin handles the data path over
-# CXI independently of this setting.
+# Slingshot NIC: hsn0 for the NCCL/GLOO bootstrap; the ofi plugin owns the
+# CXI data path independently.
 export GLM53_NIC="${GLM53_NIC:-hsn0}"
 
 # --- HiCache: offload evicted radix prefixes to Grace LPDDR ----------------
-# On GH200 the Grace CPU's ~870 GiB LPDDR (RealMemory, verified in the kimi-k3
-# clariden README) is connected to the 4 GPUs over NVLink-C2C at ~900 GB/s —
-# NOT Slingshot (~50 GB/s) and NOT PCIe (~64 GB/s). SGLang's HiCache offloads
-# EVICTED radix-cache prefixes (MLA KV pages + KDA state for the linear-SSM
-# layers) from HBM to that LPDDR, growing the prefix cache, NOT
-# max_total_num_tokens (the live batch KV stays in HBM, sized by --mem-
-# fraction-static). Post-eviction hits on a reused prefix are pulled from
-# LPDDR instead of recomputed — dramatic under concurrent shared-prefix
-# traffic. This is the mechanism that makes a 1-node (TP4 PP1, ~19 GiB HBM
-# headroom after 306 GiB weights) serve viable: the small HBM pool holds the
-# live working set, HiCache extends the cold-prefix tail onto 870 GiB LPDDR.
-#
-# HICACHE_ENABLE=0 by default to match the proven kimi-k3 run (2920471). Enable
-# with HICACHE_ENABLE=1 for the real 1-node serve (and for any 2-node run that
-# wants the extra prefix-cache headroom). Verified on clariden 2026-08-05
-# (kimi-k3 jobs 3008263/3009024/3010201): boots cleanly, no measured throughput
-# cost, ~59 GB/node LPDDR at ratio 1.0.
-#   - HICACHE_WRITE_POLICY=write_back is the ONLY working policy on the
-#     kimi-k3 image: write_through_selective never backs up (hit-count trigger
-#     is dead in the UnifiedRadixCache hybrid-SSM path) — do not use it.
-#     TODO(unverified): confirm the same on the glm-5.3-flash image; if it
-#     differs, override HICACHE_WRITE_POLICY.
-#   - HICACHE_IO_BACKEND=kernel uses sgl_kernel.kvcacheio ops (verified present
-#     in the aarch64 kimi-k3 image; the preflight below checks them on this image).
-# Defaults: ratio 1.0, policy write_back, io kernel.
+# Grace LPDDR (~870 GiB) hangs off NVLink-C2C at ~900 GB/s; HiCache offloads
+# EVICTED prefixes there — grows the prefix cache, not max_total_num_tokens.
+# This is what makes a 1-node TP4 serve viable (~19 GiB HBM headroom after
+# 306 GiB weights). Verified on kimi-k3 (jobs 3008263/3009024/3010201): no
+# throughput cost, ~59 GB/node at ratio 1.0. write_back is the only working
+# policy in the hybrid-SSM path (write_through_selective never backs up);
+# io=kernel uses sgl_kernel.kvcacheio (preflight checks it). README "Site fixes".
 export HICACHE_ENABLE="${HICACHE_ENABLE:-0}"
 export HICACHE_RATIO="${HICACHE_RATIO:-1.0}"
 export HICACHE_WRITE_POLICY="${HICACHE_WRITE_POLICY:-write_back}"
 export HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
 
 # --- Scheduler + NCCL watchdogs (fixes 11/12/13 from kimi-k3 clariden) ------
-# sglang's HARD scheduler watchdog (ServerArgs.watchdog_timeout, default 300 s,
-# soft=False) raises on any forward batch longer than the limit, and that
-# raise KILLS the whole distributed engine. kimi-k3 job 3002366 served healthy
-# 8 h then a PP request-metadata broadcast (broadcast_pyobj) hung >300 s and
-# every stage tripped simultaneously — a >5-min hard kill on a healthy engine.
-# kimi-k3 job 3151383 pinned the same stall to a single 289K-token request
-# (TODO(unverified) — a per-request input cap is a hypothesis, not a fix).
-# FIX (flags verified via `sglang serve --help` on this aarch64 image):
-#   --watchdog-timeout      HARD: raised to 3600 s so a transient distributed
-#                           stall rides out (1 h matches the load-barrier
-#                           precedent); a true permanent hang still dies in
-#                           finite time.
-#   --soft-watchdog-timeout SOFT: dumps a stack trace at 600 s WITHOUT
-#                           crashing, so the next stall is diagnosable even
-#                           when the engine survives it. Keep soft < hard.
-#   --dist-timeout          PyTorch ProcessGroupNCCL watchdog
-#                           (init_process_group timeout). kimi-k3 job 3018155
-#                           proved this is a SEPARATE, lower floor (default
-#                           600 s) that fired ~5.5 h before the scheduler
-#                           watchdog on the same PP SEND stall. Default 3600
-#                           so the NCCL floor matches the scheduler watchdog;
-#                           the SOFT_WATCHDOG_TIMEOUT dump is the first
-#                           diagnostic, not a kill.
+# Three watchdogs can kill a healthy engine on a transient stall (README
+# "Site fixes" has the job trail): HARD scheduler watchdog (300 s default,
+# job 3002366) -> 3600; SOFT watchdog (600 s stack dump, no crash — the
+# diagnostic; keep soft < hard); ProcessGroupNCCL watchdog (--dist-timeout,
+# default 600 s, job 3018155 fired 5.5 h before the scheduler watchdog)
+# -> 3600.
 export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-3600}"
 export SOFT_WATCHDOG_TIMEOUT="${SOFT_WATCHDOG_TIMEOUT:-600}"
 export DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
@@ -363,76 +157,77 @@ export SERVE_PORT="${SERVE_PORT:-30000}"
 # Passthrough for experimental sglang flags without forking this script.
 export SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS:-}"
 
-# --- MTP / nextn prediction ------------------------------------------------
-# GLM-5.3-Flash ships num_nextn_predict_layers=1 (one MTP/draft layer).
-# SGLang only ACTIVATES it with --speculative-algorithm EAGLE. We do NOT pass
-# that by default: the GLM-5.2 recipe documented "the spec-decode draft kernel
-# is not yet validated on gfx950/gfx942; omit the --speculative-* flags and
-# serve without MTP" (AMD finding), and GLM-5.3 has NEVER run on clariden
-# (GH200/sm_90), so a plain (non-speculative) serve is the correct first
-# bring-up. The nextn layer is simply unused without --speculative-*.
-# Set GLM53_SPECULATIVE=1 (TODO(unverified): requires an EAGLE draft config
-# validated for glm5_next on sm_90) to test speculative decoding later.
+# --- /health must NOT do a generation round-trip ---------------------------
+# This fork defaults health-generation TRUE: GET /health fires a real
+# generate gated on the detokenizer heartbeat; a heartbeat stall 503s a
+# healthy engine AND otela withdraws the ad after 3 failed probes -> gateway
+# 503 "No provider found" (clariden job 3419248). =0 returns 200
+# immediately. Same conclusion as beverin's CORRECTNESS_BUG_INVESTIGATION.md.
+export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION="${SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION:-0}"
+# Headroom for the pre-registration /health gate: the engine gates on /health
+# BEFORE GEN_PROBE, and 20 s is too short while 306 GiB of weights stream in.
+export SGLANG_HEALTH_CHECK_TIMEOUT="${SGLANG_HEALTH_CHECK_TIMEOUT:-300}"
+
+# --- MTP / nextn: OFF (draft path unvalidated on this family; the model's
+# one nextn layer is unused without --speculative-algorithm EAGLE).
 export GLM53_SPECULATIVE="${GLM53_SPECULATIVE:-0}"
 
-# --- Load format -----------------------------------------------------------
-# LOAD_FORMAT=auto (default): real weights from $MODEL_PATH on Lustre.
-# LOAD_FORMAT=dummy: serve random weights for a fast forward-path smoke run
-# (pair with GEN_CORRECTNESS_SMOKE=1) — proves the full GLM-5.3 init -> JIT
-# -> forward -> HTTP pipeline without the multi-hour real-weight cold start.
-# This is exactly how the kimi-k3 and GLM-5.2 forward hangs were isolated.
+# --- Load format: auto = real weights; dummy = fast forward-path smoke
+# (pair with GEN_CORRECTNESS_SMOKE=1) — how the kimi-k3/glm-5.2 hangs were
+# isolated.
 export LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
 # ------------------------------------------------------------------- otela ----
-# arm64 build (sai-v0.0.6), statically linked -> runs on the host and inside
-# the container (mounted via /capstor). It is started INSIDE the glm-5.3-flash
-# container on the head so its HOME (set by the EDF to /capstor, not quota
-# /users) is correct for its libp2p identity + badger DB. The x86 binary at
-# the same dir is NOT usable on clariden (Exec format error).
-export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela-arm64}"
-# Shared alternative: /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64
-# Direct-mesh bootstrap (an Alps OpenTela peer; verified reachable from a
-# clariden compute node via `cat < /dev/null > /dev/tcp/140.238.223.116/43905`
-# before this recipe was written). No relay needed — clariden compute has
-# outbound internet (verified: the 306 GiB GLM-5.3-Flash HF download
-# completed on a debug node via the same path).
+# Official OpenTela v0.2.6 arm64 (staged by download_otela.sh), run INSIDE
+# the container on the head. Source-audited CLI/behavior + the v0.2.6
+# differences that matter: README "OpenTela registration" (config-dir, HOME
+# override, withdraw-after-3, account linking, require_signed_binary).
+# sai-v0.0.6 is retired; rollback = OTELA_VERSION=v0.2.5 re-stage.
+# The x86 binary in the same dir is NOT usable on clariden (Exec format error).
+export OTELA_DIR="${OTELA_DIR:-/iopsstor/scratch/cscs/xyao/opentela}"
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-arm64-v0.2.6}"
+# Direct-mesh bootstrap (Alps peer, verified from a compute node). No relay
+# — clariden compute has outbound internet (the 306 GiB HF download proved it).
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 export OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
 export OTELA_UDP_PORT="${OTELA_UDP_PORT:-59820}"
 OTELA_STEP_NAME="${OTELA_STEP_NAME:-otela-worker-$SLURM_JOB_ID}"
-OTELA_SEED="${OTELA_SEED:-21}"
+# Fresh peer id per job (per-job config-dir + $$ seed): a constant seed
+# cannot re-register until its LEFT tombstone expires (euler/dgx-spark
+# stall). Pin only knowingly.
+OTELA_SEED="${OTELA_SEED:-$$}"
 OTELA_API_PORT="${OTELA_API_PORT:-18094}"
+# --- OpenTela Cloud account linking (v0.2.6 deploy keys; best-effort) -----
+# Key resolution: OTELA_DEPLOY_KEY env > OTD_API_KEY parsed out of ~/.zshrc
+# (bash never sources it). Lands in the per-job cfg.yaml (chmod 600);
+# linking NEVER gates registration/serving — failures WARN and continue.
+# Cost: fresh peer id per job = one deploy-key use per renewal (~2/day) —
+# README "OpenTela registration".
+OTELA_DEPLOY_KEY="${OTELA_DEPLOY_KEY:-}"
+if [ -z "$OTELA_DEPLOY_KEY" ] && [ -f "$HOME/.zshrc" ]; then
+  OTELA_DEPLOY_KEY="$(grep -E '^[[:space:]]*(export[[:space:]]+)?OTD_API_KEY=' "$HOME/.zshrc" 2>/dev/null | tail -1 \
+                    | grep -oE 'otd-[A-Za-z0-9_-]+' | head -1)"
+fi
+[ "$OTELA_DEPLOY_KEY" = "none" ] && OTELA_DEPLOY_KEY=""
+case "$OTELA_DEPLOY_KEY" in
+  otd-?*) ;;   # well-formed deploy key
+  "")        ;;   # not configured: linking simply disabled
+  *) echo "[$(date -Is)] WARN: OTELA_DEPLOY_KEY/OTD_API_KEY is not a deploy key (expected otd-...); skipping account linking" >&2
+     OTELA_DEPLOY_KEY="" ;;
+esac
+OTELA_LINK_ARMED=0; [ -n "$OTELA_DEPLOY_KEY" ] && OTELA_LINK_ARMED=1
 
-# Cold start: GLM-5.3-Flash is 62 shards x ~5 GiB = ~306 GiB FP8 on /capstor
-# (single-OST Lustre stripe, like the verified kimi-k3 download pattern). At
-# the kimi-k3 rate (~147 s/shard worst case on a bad Lustre day), cold start
-# is up to ~2.5 h; typically much faster (FP8 weights are 4x smaller per
-# param than kimi-k3's mxfp4, and only 62 shards vs 96). HEALTH_TIMEOUT gates
-# the pre-registration wait only; the UNBALANCED_MODEL_LOADING_TIMEOUT_S
-# patch (below) is what prevents the load barrier from killing slow PP groups.
-# For a dummy-weight smoke run, set LOAD_FORMAT=dummy and HEALTH_TIMEOUT=1200.
+# Cold start: 62 shards x ~5 GiB = ~306 GiB; up to ~2.5 h on a bad Lustre
+# day. HEALTH_TIMEOUT gates the pre-registration wait only (the barrier
+# patch prevents slow-rank kills). Dummy smoke: HEALTH_TIMEOUT=1200.
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-10800}"
 
 # ----------------------------------------------------- mandatory gen probe --
-# GLM-5.3-Flash has NEVER generated a token on clariden (GH200/sm_90) — this
-# is a first-ever forward on this architecture/site combination. /health
-# returning 200 does NOT prove the DSA + linear + KDA hybrid path can run a
-# forward (deepseek-v4 registered on /health and 502'd every request; kimi-k3
-# hung at the forward with /health still up; GLM-5.2 on beverin served /health
-# then the DSA decode hung at 100% GPU). The probe is MANDATORY.
-#
-# gen_correctness.py (sibling, reused from kimi-k3/glm52 — model-agnostic)
-# sends six greedy /v1/completions prompts (temperature 0, max_tokens 64) and
-# checks each answer for its expected factual substring (Paris; the prime
-# sequence; 60 km/1.5 h = 40 km/h; Rayleigh; a fibonacci function body;
-# entropy). With GEN_CORRECTNESS_SMOKE=1 (pair with LOAD_FORMAT=dummy), the
-# gate is non-empty continuation instead — proving the full GLM-5.3
-# (Glm5NextForConditionalGeneration) init -> JIT -> forward -> HTTP pipeline
-# without real weights.
-#
-# Set GEN_PROBE=0 to skip (NOT recommended — registers on /health alone).
+# /health 200 does NOT prove the DSA + linear + KDA hybrid forward works
+# (deepseek-v4 502'd; kimi-k3 hung; glm-5.2 hung at decode). gen_correctness
+# (meta/common) sends six greedy prompts + checks factual substrings;
+# SMOKE=1 gates on non-empty continuation. GEN_PROBE=0: skip (NOT recommended).
 export GEN_PROBE="${GEN_PROBE:-1}"
 export GEN_PROBE_TIMEOUT="${GEN_PROBE_TIMEOUT:-1200}"
 export GEN_CORRECTNESS_MAX_TOKENS="${GEN_CORRECTNESS_MAX_TOKENS:-64}"
@@ -445,80 +240,26 @@ PATCH_DIR="$DEPLOY_DIR/patches"
 mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
          "$PATCH_DIR"
 
-# sitecustomize.py is auto-imported by the Python interpreter at startup
-# (after PYTHONPATH is on sys.path) — BEFORE sglang's own code runs. This
-# lets us patch the module-level UNBALANCED_MODEL_LOADING_TIMEOUT_S in the
-# SAME process as `sglang serve`. $PATCH_DIR is on /capstor (mounted into
-# the container by the EDF). engine.sh prepends it to PYTHONPATH before
-# exec'ing sglang, because the EDF sets PYTHONPATH="" (clearing anything
-# the batch shell exported).
-#
-# kimi-k3 fix 10: sglang's dist_barrier_after_load calls dist.monitored_barrier(
-# group=tp_group, timeout=UNBALANCED_MODEL_LOADING_TIMEOUT_S, wait_all_ranks=
-# True). The constant is HARDCODED at 480 s (8 min) in load_model_utils.py.
-# The barrier is per-TP-group (GLOO, 4 ranks/node); only rank 0 has the
-# timeout — non-zero ranks block indefinitely waiting for rank 0. If the
-# slowest rank in a node happens to be non-zero, rank 0 waits 480 s then
-# raises ValueError, killing the whole job. We monkey-patch the constant to
-# 3600 s (1 h) so even a non-zero slow rank gets up to 1 h to finish loading
-# from Lustre. Verified on kimi-k3 (job 3000965, all 32 ranks reached "Load
-# weight end" with a 29-min spread, zero exceptions).
-#
-# GLM-5.3 clariden fix (kpool-tail backend must respect FA3 availability):
-# Root cause of smoke job 3208291, which crashed during CUDA-graph
-# capture ~6 min in (no 2.5h real-weight load) with:
-#   ImportError: cannot import name 'flash_ops' from 'sgl_kernel'
-#   ImportError: Can not import FA3 in sgl_kernel.
-# DeepseekSparseAttnBackend._resolve_kpool_tail_backend (sglang/srt/layers/attention/
-# dsa_backend.py:887) hard-overrides dsa_impl "flashmla_sparse" -> "fa3"
-# on sm_90 (and -> "trtllm" on sm_100+), ASSUMING FA3/TRT-LLM is
-# installed. GLM-5.3 is MULTIMODAL (topk_indices != None,
-# dsa_index_kpool > 1), so the override fires on GH200 (sm_90) NO MATTER
-# what CLI flag we pass: --dsa-decode-backend flashmla_sparse DID take
-# effect in server_args (verified) but was then clobbered to fa3. The
-# aarch64 lmsysorg/sglang:glm-5.3-flash image ships sgl_kernel.flash_mla
-# (flash_mla_sparse_fwd, flash_mla_with_kvcache — NO FA3 dep) but NOT
-# sgl_kernel.flash_ops (sgl_kernel/flash_attn.py raises ImportError). So
-# _forward_fa3 -> flash_attn_v3._load_fa3_kernels -> ImportError at
-# capture, killing all 4 TP ranks. kimi-k3 (also hybrid linear+DSA) did
-# NOT hit this: its kpool is <= 1, so the override's guard returns early
-# and flashmla wins — which is why the same site served kimi-k3 but
-# crashes GLM-5.3.
-#
-# PRIMARY FIX (above, in the attention-backends block): pin BOTH DSA
-# backends to `tilelang` — the ONLY kpool>1-legal backend (per the
-# _check_kpool_tail_backend hard gate at L869) that is both supported AND
-# present on aarch64 (fa3/trtllm missing; flashmla_sparse doesn't
-# implement the tail-token append and trips the same hard gate).
-#
-# THIS PATCH (below) is a DEFENSIVE guard, not the primary mechanism — it
-# is INERT when the tilelang pins are in effect (the override's third
-# guard, dsa_impl != "flashmla_sparse", returns early). Its job: if a
-# future operator overrides GLM53_DSA_*_BACKEND back to flashmla_sparse on
-# aarch64, this keeps flashmla_sparse past _resolve_kpool_tail_backend so
-# the engine dies with the CLEAR _check_kpool_tail_backend
-# NotImplementedError ("...only supported by the FA3/TileLang/TRTLLM DSA
-# decode backend") instead of the cryptic FA3 ImportError — same root
-# cause, faster diagnosis. Behavior-preserving on arches where fa3/trtllm
-# ARE present (e.g. an x86 GH200 run): _fa3_ok is probed once at patch time
-# and the perf override applies normally when True.
-#
-# === FOURTH FA3 path (job 3209880; the LAST one) ===
-# The DSA layer's FULL-MHA prefill is NOT governed by --dsa-*-backend (those
-# are the SPARSE MLA knobs). forward_extend -> _forward_standard_mha
-# (dsa_backend.py:4131) calls flash_attn_varlen_func with the module-top
-# default ver=3 -> flash_attention_v3 -> _load_fa3_kernels -> ImportError,
-# unconditionally on SM90 (comment "Use FA3 for SM90", L4130; no arch guard,
-# no CLI override). It is the ONLY real flash_attn_varlen_func( call in
-# dsa_backend.py (of 22 'fa3' hits, the rest are imports / fa3_* vars in the
-# sparse _forward_fa3 path, already bypassed by the tilelang pins above).
-# FIX (below, second patch block): reuse the method's EXISTING SM100+
-# (Blackwell) flashinfer branch (L4105-4128 -> flashinfer.prefill.
-# trtllm_ragged_attention_deepseek, verified present) by (1) allocating the
-# dsa_trtllm_workspace buffer the branch needs (L727 sets it None on SM90+
-# non-trtllm decode) and (2) wrapping _forward_standard_mha to force
-# device_sm_major=10 around the call. On aarch64-without-FA3, SM90 is
-# functionally Blackwell for this method. Behavior-preserving when _fa3_ok.
+# sitecustomize.py: auto-imported at interpreter startup (PATCH_DIR first on
+# PYTHONPATH via engine.sh) — patches sglang in the serve process itself.
+#   1. kimi-k3 fix 10: UNBALANCED_MODEL_LOADING_TIMEOUT_S 480 -> 3600 (the
+#      post-load monitored_barrier hardcodes 480 s on rank 0; a 29-min rank
+#      spread was observed on kimi-k3 job 3000965).
+#   2. kpool-tail FA3-safe (job 3208291): _resolve_kpool_tail_backend
+#      hard-overrides flashmla_sparse -> fa3 on sm_90 assuming FA3 exists;
+#      this patch keeps flashmla_sparse when fa3 is absent so the engine
+#      dies with the CLEAR _check_kpool_tail_backend NotImplementedError
+#      instead of the cryptic ImportError. INERT while the tilelang pins are
+#      in effect (defensive); behavior-preserving when fa3/trtllm exist.
+#   3. FOURTH FA3 path (jobs 3209880/3210211; the LAST one): the DSA
+#      FULL-MHA prefill (_forward_standard_mha, dsa_backend.py:4131) calls
+#      flash_attn_varlen_func ver=3 unconditionally on SM90 — no arch
+#      guard, no CLI override. The SM100+ flashinfer branch is
+#      Blackwell-only ("Unsupported architecture", job 3210211 — the
+#      device_sm_major=10 trick was wrong). FIX below: replace the method
+#      with a PyTorch SDPA ragged loop (correct, slower; fires ONLY on
+#      not-_fa3_ok SM90).
+# Patch details + histories: README "Site fixes" + clariden/glm53 diag docs.
 cat > "$PATCH_DIR/sitecustomize.py" <<'PYEOF'
 import os
 
@@ -699,30 +440,45 @@ fi
 [ "$PP_SIZE" = "$NNODES" ] || echo "WARN: PP_SIZE=$PP_SIZE != NNODES=$NNODES (intended?)" >&2
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage an arm64 build on a login node, e.g.:" >&2
-  echo "         mkdir -p $OTELA_DIR && cp /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64 $OTELA_BIN && chmod +x $OTELA_BIN" >&2
+  echo "       Stage the official release on a login node (sibling script):" >&2
+  echo "         bash $SCRIPT_DIR/download_otela.sh" >&2
+  echo "       (or from the repo root: scripts/renew_glm_5_3_flash.sh --update-otela)" >&2
+  echo "       Rollback: OTELA_VERSION=v0.2.5 bash download_otela.sh && OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5" >&2
   exit 1
 }
 # gen_correctness.py sibling (mandatory probe — see above).
 [ -f "$SCRIPT_DIR/gen_correctness.py" ] || {
   echo "FATAL: gen_correctness.py not found next to this sbatch: $SCRIPT_DIR/gen_correctness.py" >&2
-  echo "       The recipe is a bundle (sbatch + glm-53-flash-clariden.toml +" >&2
-  echo "       build_glm_5_3_flash_image.sbatch + gen_correctness.py)." >&2
   echo "       Submit with: cd \"$(cd "$SCRIPT_DIR" && pwd)\" && sbatch $0" >&2
   exit 1
 }
 
+# --- deep_gemm JIT cache self-heal (jobs 3632183/3632230, 2026-10-10) ---
+# deep_gemm hard-fails at the FIRST cached kernel missing kernel.cu or
+# kernel.cubin ("Corrupted JIT cache directory"), lazily — one bad entry =
+# one dead job. The shared EDF-HOME cache is validated up front: any
+# incomplete entry quarantines the whole cache (~minutes re-JIT vs a dead
+# 12 h job). README "Site fixes".
+_DG_CACHE="$DEPLOY_DIR/home/.cache/sglang/deep_gemm/cache"
+if [ -d "$_DG_CACHE" ]; then
+  _nbad=0; _ntot=0
+  for _d in "$_DG_CACHE"/kernel.*; do
+    [ -d "$_d" ] || continue
+    _ntot=$((_ntot+1))
+    { [ -f "$_d/kernel.cu" ] && [ -f "$_d/kernel.cubin" ]; } || _nbad=$((_nbad+1))
+  done
+  if [ "$_nbad" -gt 0 ]; then
+    _q="${_DG_CACHE}.corrupt-$(date +%Y%m%dT%H%M%S)"
+    echo "[$(date -Is)] WARN: deep_gemm JIT cache has ${_nbad}/${_ntot} incomplete entries (missing kernel.cu/kernel.cubin) — quarantining to $_q; engine will re-JIT" >&2
+    mv "$_DG_CACHE" "$_q" \
+      || echo "[$(date -Is)] WARN: quarantine mv failed; deep_gemm may crash at capture" >&2
+  fi
+fi
+unset _d _nbad _ntot _q _DG_CACHE
+
 # --- container preflight (1 node, no GPUs, ~20 s) -----------------------
-# Validates the EDF actually loads + the aarch64 image has the modules this
-# recipe depends on, BEFORE launching N nodes. The glm-5.3-flash image is
-# purpose-built, so we check for the GLM-5.3 model class resolution (the
-# image's transformers must ship Glm5NextForConditionalGeneration /
-# glm5_next_text) and the sgl_kernel native ops the hybrid attention path
-# needs. Runs via --overlap --gres=none so it doesn't consume the job's GPU
-# allocation. TODO(unverified): the exact import names below are inferred
-# from config.json (model_type=glm5_next, architectures=[Glm5NextForCausal
-# LM...]); the purpose-built image should resolve them — if not, this
-# preflight is the place to catch it before N nodes launch.
+# Validates the EDF + the GLM-5.3 model class + sgl_kernel ops BEFORE
+# launching N nodes (--overlap --gres=none: no GPU consumption).
 echo "[$(date -Is)] container preflight (EDF=$OTELA_EDF_NAME) ..."
 if ! srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --environment="$OTELA_EDF_NAME" python3 -c '
@@ -782,22 +538,17 @@ cat > "$RUNDIR/engine.sh" <<'ENGINE'
 set -uo pipefail
 RANK="${SLURM_PROCID:-0}"
 IFACE="${GLM53_NIC:-hsn0}"
-# Pin NCCL/GLOO socket bootstrap to the high-speed NIC. The ofi plugin (loaded
-# by the EDF's com.hooks.aws_ofi_nccl hook) carries the data path over CXI
-# independently of this; this is only for the TCP bootstrap path.
+# Pin NCCL/GLOO socket bootstrap to the high-speed NIC (ofi plugin owns the
+# CXI data path independently).
 export NCCL_SOCKET_IFNAME="$IFACE" GLOO_SOCKET_IFNAME="$IFACE"
 SGLANG_HOST_IP="$(ip -o -4 addr show "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
 [ -z "$SGLANG_HOST_IP" ] && SGLANG_HOST_IP="$(hostname -I | awk '{print $1}')"
 export SGLANG_HOST_IP
 
 # --- Slingshot NCCL tunables (reconciled with CSCS netstack hook) -----------
-# The EDF's com.hooks.aws_ofi_nccl hook (Clariden netstack source=artifact) sets
-# CXI/NCCL env at container start "to help prevent application stalls" (per
-# resource-hook docs). engine.sh runs INSIDE the container after the hook, so an
-# unconditional export would clobber those curated values. Use := so the hook's
-# values win when present; our values (tuned on clariden for kimi-k3 multi-node,
-# 2026-08) are only the fallback when the hook sets nothing. FI_MR_CACHE_MONITOR=
-# userfaultfd avoids the default monitor that mishandles CXI-registered memory.
+# The EDF's aws_ofi_nccl hook curates CXI/NCCL env at container start, so
+# these are := fallbacks (hook values win). userfaultfd avoids the CXI
+# registration-monitor bug. Tuned on clariden for kimi-k3 multi-node, 2026-08.
 : "${NCCL_NET:=AWS Libfabric}" "${NCCL_CROSS_NIC:=1}" \
   "${FI_CXI_DISABLE_HOST_REGISTER:=1}" "${FI_CXI_DEFAULT_CQ_SIZE:=131072}" \
   "${FI_CXI_RDZV_THRESHOLD:=0}" "${FI_CXI_RDZV_GET_MIN:=0}" \
@@ -807,8 +558,7 @@ export NCCL_NET NCCL_CROSS_NIC FI_CXI_DISABLE_HOST_REGISTER \
   FI_MR_CACHE_MONITOR
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 echo "[rank $RANK] netstack: NCCL_NET=$NCCL_NET NCCL_CROSS_NIC=$NCCL_CROSS_NIC FI_CXI_DCQ=$FI_CXI_DEFAULT_CQ_SIZE FI_MR_CACHE_MONITOR=$FI_MR_CACHE_MONITOR"
-# Force IPv4 for bootstrap sockets (carried from kimi-k3; clariden hsn
-# interfaces are IPv4 so this is a safe no-op there).
+# Force IPv4 bootstrap sockets (carried from kimi-k3; no-op on hsn).
 export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-IPv4}" GLOO_SOCKET_FAMILY="${GLOO_SOCKET_FAMILY:-IPv4}"
 
 echo "[rank $RANK] $(hostname) ip=$SGLANG_HOST_IP iface=$IFACE head=$HEAD_IP:$DIST_PORT"
@@ -817,41 +567,22 @@ echo "[rank $RANK] shape: tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE moe=$MOE_BACKEND c
 # sitecustomize.py (in $PATCH_DIR, on /capstor) patches
 # UNBALANCED_MODEL_LOADING_TIMEOUT_S at Python startup, BEFORE sglang runs.
 # The EDF sets PYTHONPATH="" so we must re-add it here, before exec sglang.
-export PYTHONPATH="${PATCH_DIR:-/capstor/scratch/cscs/xyao/glm-53-flash/patches}:${PYTHONPATH:-}"
+export PYTHONPATH="${PATCH_DIR:-/iopsstor/scratch/cscs/xyao/glm-53-flash/patches}:${PYTHONPATH:-}"
 
 # Verify the monkey-patch will take effect in this process tree.
 python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_utils as m; print('[rank '$RANK'] UNBALANCED_MODEL_LOADING_TIMEOUT_S =', m.UNBALANCED_MODEL_LOADING_TIMEOUT_S)" 2>/dev/null || true
 
 # --- build the SGLang serve args -------------------------------------------
-# `python -m sglang.launch_server` (not `sglang serve`): the entry point the
-# kimi-k3 clariden recipe is validated against, and the one the multinode
-# reference runs. The checkpoint's own config.json (still read from
-# --model-path) supplies the architecture (Glm5NextForConditionalGeneration,
-# model_type=glm5_next, 45 layers, 288 experts top-8, DSA+linear+KDA hybrid,
-# MTP, FP8 e4m3 dynamic quant — read directly from disk, NOT hardcoded here).
+# python -m sglang.launch_server: the kimi-k3-validated entry point; the
+# architecture comes from the checkpoint's own config.json (not hardcoded).
 #
-# CRITICAL DIFFERENCE vs kimi-k3 clariden: we do NOT pass the GENERAL
-# knobs (--prefill-attention-backend / --decode-attention-backend /
-# --mamba-ssm-dtype). Those target non-DSA models and would break GLM-5.3's
-# 34 linear-attention layers (mamba_backend=triton, no flash dependency).
-# We DO pin the DSA-SPECIFIC backends (--dsa-prefill-backend /
-# --dsa-decode-backend) to tilelang — the ONLY kpool>1-legal DSA backend
-# (per _check_kpool_tail_backend's hard gate, L869) that is both supported
-# AND present on aarch64 (fa3: sgl_kernel.flash_ops MISSING; trtllm:
-# tensorrt_llm MISSING; flashmla_sparse: doesn't implement the tail-token
-# append and trips the same hard gate). See the attention-backends block
-# above for the full jobs-3208159/3208291/3209156 trail and the
-# availability table. Set BOTH DSA knobs together: forward_extend (L3080)
-# AND forward_decode (L3409) each hit the hard gate, so the prefill
-# backend must be tilelang too.
+# CRITICAL DIFFERENCE vs kimi-k3: NO general attention knobs (they'd break
+# the 34 linear layers); DSA-specific backends pinned to tilelang (BOTH:
+# forward_extend AND forward_decode hit the hard gate).
 #
-# CRITICAL DIFFERENCE vs GLM-5.2 on beverin: we do NOT pass --disable-cuda-graph
-# or --skip-server-warmup. Those were MI300A (gfx942) workarounds for the
-# GLM-5.2 MTP/nextn layer crashing capture/warmup. GLM-5.3-Flash on GH200
-# (sm_90) should support CUDA graphs (kimi-k3 on clariden runs CG_DECODE=full).
-# If the first cold start crashes during capture/warmup, set
-# DISABLE_CUDA_GRAPH=1 + SKIP_SERVER_WARMUP=1 (the GLM-5.2 workaround) and
-# re-test — that would be a TODO(unverified) finding to log.
+# CRITICAL DIFFERENCE vs GLM-5.2 beverin: NO --disable-cuda-graph /
+# --skip-server-warmup (MI300A workarounds; GH200 runs CG_DECODE=full). If
+# capture/warmup crashes: set both =1 and re-test (TODO(unverified) finding).
 ENGINE_CMD=(python -m sglang.launch_server
   --trust-remote-code
   --model-path "$MODEL_PATH"
@@ -871,12 +602,10 @@ ENGINE_CMD=(python -m sglang.launch_server
   --host 0.0.0.0 --port "$SERVE_PORT")
 
 # --- capture/diagnostic knobs (capture runs ONLY; see header TODO note) -----
-# DISABLE_CUDA_GRAPH=1: forward hooks must see REAL kernel output — during
-#   decode-graph capture the module outputs are placeholder tensors never
-#   written (the bisect_layers_v1/beverin lesson; jobs 617522/619846).
-# SKIP_SERVER_WARMUP=1: sglang's warmup generation would otherwise be the
-#   first >=MIN_TOKENS forward on clariden while beverin (which always skips
-#   warmup) never sees it — the cross-machine capture must land on the SAME
+# DISABLE_CUDA_GRAPH=1: hooks must see REAL kernel output — captured graphs
+#   emit placeholders (beverin bisect lesson; jobs 617522/619846).
+# SKIP_SERVER_WARMUP=1: sglang's warmup would be the first >=MIN_TOKENS
+#   forward on clariden while beverin never sees it — the cross-machine
 #   gen_correctness request on BOTH machines.
 if [ "${DISABLE_CUDA_GRAPH:-0}" = "1" ]; then
   ENGINE_CMD+=(--disable-cuda-graph)
@@ -942,39 +671,28 @@ ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
 # ============================================================ otela worker ====
-# Runs INSIDE the glm-5.3-flash container on the HEAD node only (one peer:
-# the single distributed engine has one head HTTP endpoint, and launching on
-# every node would over-register it). The container shares the host netns
-# (verified on clariden for kimi-k3: a 2nd container on the head reaches the
-# engine on localhost:$SERVE_PORT, and the host's `ss` sees the container's
-# listening socket), so otela on the head reaches sglang on
-# localhost:$SERVE_PORT. HOME is the EDF's $DEPLOY_DIR/home (not quota
-# /users), so its libp2p identity + badger DB are KEPT ON /capstor across
-# jobs. NOTE (observed, run 3219525 + 4 prior): the identity is NOT pinned
-# by the shared HOME — $HOME/.config/opentela/id and a fresh
-# $HOME/.ocfcore/ocfcore.Qm*.db are REGENERATED on every start, so each of
-# the last 5 runs minted a different peer id (QmcrhK7z, QmPnaDQD, QmRAdK3p,
-# QmQLa2Bu, QmdV1...) with seed=$OTELA_SEED unchanged. See the "stale row"
-# note by stop_otela below.
-OTELA_CFG_DIR="$DEPLOY_DIR/otela"
-OTELA_CFG="$OTELA_CFG_DIR/cfg.yaml"
-mkdir -p "$OTELA_CFG_DIR"
-# otela is sai-v0.0.6 (arm64). Its CLI differs from the x86 opentela-v0.2.2
-# the Beverin scripts use:
-#   - a multiaddr goes to --bootstrap.static (NOT --bootstrap.addr, which
-#     expects an HTTP bootstraps-list URL — the default is an http:// URL)
-#   - --label is supported
-#   - there is NO --subprocess flag (we use the JSC/kimi-k3 separate-worker
-#     topology: one engine srun in the foreground + one otela srun on the head).
-#
-# CRITICAL: otela requires a proper cfg.yaml with `loglevel: debug`,
-# `reachability: private`, `role: worker`, and `seed`. Without these it
-# appears to "hang" after "AXIOM_DATASET not set, tracing disabled" — but it
-# is actually working, just at INFO level which stops logging during CRDT
-# sync. The JSC recipe (v0.2.3, x86) writes the same config file; verified on
-# clariden job 3000965 (kimi-k3): with the config file, otela registered the
-# LLM service and synced 2000+ peers within 45 s. Without it, 90 s of silence.
-cat > "$OTELA_CFG" <<CFG
+# INSIDE the container on the HEAD only (one peer per engine; the container
+# shares the host netns, so otela reaches sglang on localhost:$SERVE_PORT).
+# Identity + BadgerDB per-job by design (fresh peer id; sai-v0.0.6 minted
+# fresh ids too — runs 3219525 + 4 prior). "Stale row" note by stop_otela.
+OTELA_CFG_DIR="$RUNDIR/otela"
+OTELA_DATA_HOME="$RUNDIR/otela-home"
+mkdir -p "$OTELA_CFG_DIR" "$OTELA_DATA_HOME"
+# CRITICAL: cfg.yaml must carry loglevel: debug / reachability: private /
+# role: worker / seed — without them otela looks "hung" after the AXIOM
+# line (INFO stops logging during CRDT sync; kimi-k3 job 3000965: with the
+# config, LLM registered + 2000+ peers synced in 45 s; without, 90 s of
+# silence). CLI facts + registration markers: README.
+OTELA_INSTANCE_CFG=""
+if [ "$OTELA_LINK_ARMED" = 1 ]; then
+  # v0.2.6: instance.deploy_key feeds BOTH `otela instance link` and the
+  # boot-time re-confirm; instance.label is read by `otela instance link`
+  # (boot's re-confirm passes an empty label and preserves the stored one).
+  OTELA_INSTANCE_CFG="instance:
+  deploy_key: \"$OTELA_DEPLOY_KEY\"
+  label: clariden-glm53-$SLURM_JOB_ID"
+fi
+cat > "$OTELA_CFG_DIR/cfg.yaml" <<CFG
 name: clariden-worker-$SLURM_JOB_ID
 seed: "$OTELA_SEED"
 port: "$OTELA_API_PORT"
@@ -984,21 +702,39 @@ mode: node
 role: worker
 loglevel: debug
 reachability: private
-cleanslate: false
+cleanslate: true
 security:
   require_signed_binary: false
 solana:
   skip_verification: true
+$OTELA_INSTANCE_CFG
 CFG
+# cfg.yaml carries the deploy key when linking is armed -> keep it private
+# (0600; the container reads it as the same user). The key never appears in
+# otela.sh, the sbatch log, or any echo.
+chmod 600 "$OTELA_CFG_DIR/cfg.yaml"
 cat > "$RUNDIR/otela.sh" <<OTELA
 #!/bin/bash
 set -uo pipefail
 # Config file is written by the batch shell (above). It carries loglevel,
 # reachability, role, seed, ports, solana.skip_verification — everything that
 # must be set before CRDT sync begins. CLI flags below are per-job overrides.
-echo "[otela] start head=$HEAD_IP service=$OTELA_SERVICE_NAME:$SERVE_PORT bootstrap=$OTELA_RELAY_ADDR"
+# HOME override: v0.2.6 puts the BadgerDB/CRDT store at \$HOME/.ocfcore
+# (go-homedir honors \$HOME first), so this confines the store to the per-job
+# run dir — no ocfcore.Qm*.db pile-up on the persistent tree.
+export HOME="$OTELA_DATA_HOME"
+echo "[otela] start head=$HEAD_IP service=$OTELA_SERVICE_NAME:$SERVE_PORT bootstrap=$OTELA_RELAY_ADDR seed=$OTELA_SEED home=$OTELA_DATA_HOME"
+if [ "$OTELA_LINK_ARMED" = 1 ]; then
+  # Link BEFORE start, with a label (boot's auto-link passes no label):
+  # challenge-response signed with this config-dir's identity key, so the
+  # linked peer id == the serving peer id. Best-effort -- on failure start
+  # still boots and retries the link itself (also best-effort).
+  echo "[otela] linking instance to OpenTela Cloud (label clariden-glm53-$SLURM_JOB_ID)"
+  "$OTELA_BIN" instance link --config-dir "$OTELA_CFG_DIR" 2>&1 || \
+    echo "[otela] WARN: instance link failed (key revoked/exhausted? control plane reachable?); continuing -- start retries best-effort"
+fi
 exec "$OTELA_BIN" start \\
-  --config "$OTELA_CFG" \\
+  --config-dir "$OTELA_CFG_DIR" \\
   --bootstrap.static "$OTELA_RELAY_ADDR" \\
   --service.name "$OTELA_SERVICE_NAME" \\
   --service.port "$SERVE_PORT" \\
@@ -1025,8 +761,8 @@ stop_otela() {
     echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
     echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
     echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    echo "[$(date -Is)]       The next run mints a FRESH peer id (seed=$OTELA_SEED does" >&2
-    echo "[$(date -Is)]       NOT pin the libp2p identity — see the header note), so it" >&2
+    echo "[$(date -Is)]       The next run mints a FRESH peer id (per-job" >&2
+    echo "[$(date -Is)]       config-dir + randomized seed — see the OTELA_SEED note), so it" >&2
     echo "[$(date -Is)]       cannot overwrite this stale row; the head accumulates one" >&2
     echo "[$(date -Is)]       dead connected=true peer per run. Non-fatal: registration" >&2
     echo "[$(date -Is)]       and serving still succeed; it shows as ~5.5-min dial-then-" >&2
@@ -1108,11 +844,13 @@ trap 'stop_otela' EXIT TERM INT
     fi
   fi
 
-  # --- stale CRDT hygiene (manual; NOT auto-run) -------------------------
-  # Each job mints a fresh peer id, so $HOME/.ocfcore/ocfcore.Qm*.db dirs
-  # pile up (5 observed across Aug 28 -> Sep 1). When no other glm-53 job is
-  # on $HEAD, prune on the head inside the container (single-quoted so $HOME
-  # resolves in the container, not the batch shell):
+  # --- stale CRDT hygiene (historical; largely obsolete in v0.2.6) -------
+  # The v0.2.6 worker overrides HOME to the per-job $RUNDIR/otela-home, so
+  # its BadgerDB dies with the job — no more ocfcore.Qm*.db pile-up in a
+  # persistent HOME (the sai-v0.0.6 era accumulated 5 across Aug 28 -> Sep 1
+  # in $DEPLOY_DIR/home/.ocfcore). One cleanup remains useful after the
+  # version switch, to clear the OLD pile (run inside the container,
+  # single-quoted so $HOME resolves there):
   #   srun --jobid=$SLURM_JOB_ID --overlap --gres=none -w "$HEAD" \
   #        --environment="$OTELA_EDF_NAME" \
   #        bash -c 'rm -rf "$HOME/.ocfcore/"ocfcore.Qm*.db 2>/dev/null || true'
@@ -1120,6 +858,11 @@ trap 'stop_otela' EXIT TERM INT
   # dial-mismatch loop, whose stale rows live in the bootstrap head's CRDT
   # ($OTELA_RELAY_ADDR, which this recipe does not run).
   echo "[$(date -Is)] starting otela worker on $HEAD (inside container, EDF=$OTELA_EDF_NAME)"
+  if [ "$OTELA_LINK_ARMED" = 1 ]; then
+    echo "[$(date -Is)] otela account-link: armed (deploy key resolved; label clariden-glm53-$SLURM_JOB_ID)"
+  else
+    echo "[$(date -Is)] otela account-link: disabled (no OTELA_DEPLOY_KEY / OTD_API_KEY in ~/.zshrc)"
+  fi
   # Redirect INSIDE the container (not via srun's pipe) to avoid srun
   # output buffering that hides otela log lines until the buffer fills.
   # The log file is on /capstor (mounted in both host and container).

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# One-shot bring-up: build the overlay image if missing → start the engine →
+# register the otela sidecar. Skips steps whose output already exists.
+# Knobs, prerequisites and troubleshooting: README.md
+set -euo pipefail
+cd "$(dirname "$0")"
+
+IMAGE="${IMAGE:-s3er-qwen36-dgx-spark}"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || bash build_image.sh
+
+bash serve_qwen36_dgx_spark.sh        # waits for READY, writes run/last_service.env
+bash register_qwen36_otela.sh daemon

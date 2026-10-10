@@ -30,7 +30,7 @@ failures behind each non-obvious choice. The companion
 
 ### Verified benchmarks (TP4/PP8, 8 nodes, 1024-in / 1716-tok-actual prompt / 256-out)
 
-The numbers below were taken with the legacy vendored `bench.py`: warmup
+The numbers below were taken with the legacy throughput harness (then vendored here as `bench.py`, now consolidated at [`meta/bench/bench.py`](../../../meta/bench/bench.py)): warmup
 `4:8` discarded, then the sweep, 256 max output tokens, `ignore_eos`,
 deterministic. Run inside the container on the head (nid007464) against
 `127.0.0.1:30000` of job 3000965 (2026-08-04); HiCache OFF. Raw output:
@@ -300,10 +300,11 @@ on a `debug` node reports 4× `NVIDIA GH200 120GB`, 97871 MiB each.
 
 | File | Purpose |
 |------|---------|
+| `up.sh` | One-shot submit through `rcc --profile clariden` (runs sbatch with the repo-root EDF search handled). Real 8-node run by default; `--sbatch-args` for node counts. |
 | `serve_kimi_k3_otela_clariden.sbatch` | One self-contained sbatch: distributed SGLang engine (enroot, TP4×PP8; `servekit launch --overlap` wrapping is opt-in via `PRESHARDED_ENABLE=1`, default 0 = direct Lustre load) + pre-registration servekit verification bench + one otela worker on the head + lifecycle trap. Defaults: 8 nodes, TP4×PP8. |
 | `kimi-k3-clariden.toml` | EDF: image (local .sqsh), mounts, caches, `com.hooks.aws_ofi_nccl` (cuda13) for Slingshot NCCL. |
 | `build_kimi_k3_image.sbatch` | One-time: import `docker://lmsysorg/sglang:kimi-k3` to the local arm64 .sqsh (on a `debug` node, with /dev/shm enroot scratch). |
-| `bench.py` | Legacy vendored throughput harness (`--input-len` counts tokens here, unlike servekit's words). New default: `meta/bench/cbench.sh` + `cbench_report.py` (servekit bench); the 3000965 numbers still come from this script. |
+| `meta/bench/bench.py` | Legacy throughput harness (`--input-len` counts tokens here, unlike servekit's words). New default: `meta/bench/cbench.sh` + `cbench_report.py` (servekit bench); the 3000965 numbers still come from this script. (The byte-identical copy that used to sit in this recipe was consolidated into `meta/bench/`.) |
 | `bench_3000965.jsonl` | Raw verified benchmark output (job 3000965, 2026-08-04) backing the table above. |
 | `hicache_bench.py` | HiCache functional + latency test (probe → HBM hit → evict → host-tier hit; prints T1/T2/T3 + `/metrics` evidence). Stdlib, runs from the login node. Uses `/v1/completions` — the chat template breaks prefix equality (see *HiCache*). |
 | `README.md` | This file. |
@@ -334,7 +335,26 @@ submits through the `clariden` SSH alias (configured in `~/.ssh/config`).
 ```bash
 # one-time: sync local code and this recipe to Clariden
 rcc --profile clariden push
+```
 
+**Submit-style note (the EDF search):** `rcc job submit` runs sbatch from the
+repo root, while a manual `cd <recipe-dir> && sbatch …` runs it from there —
+the sbatch searches both `SLURM_SUBMIT_DIR` locations (plus the spooled
+`BASH_SOURCE` dir as last resort) for `kimi-k3-clariden.toml`. Submitting from
+the root used to fail preflight with "failed to find a readable environment
+file" (jobs 3032795/3034577, 2026-08-08) before that search existed; both
+styles now work.
+
+**Pre-sharded checkpoint (currently disabled by default):**
+`PRESHARDED_ENABLE=0` loads directly from `$MODEL_PATH` on Lustre (~57 min).
+The pre-sharded dump at `$PRESHARDED_ROOT` is **unreadable by xyao** — the
+`.safetensors` carry `ACL mask::---` (owner yboughizane only) — so servekit's
+dd staging fails with "Permission denied" and the engine's cache-MISS re-dump
+crashes. Once the ACLs are fixed
+(`setfacl -R -m m::r $PRESHARDED_ROOT`), set `PRESHARDED_ENABLE=1` to get the
+servekit launch (staged /dev/shm load + cold-start profile + auto-bench).
+
+```bash
 # build the arm64 image (debug partition, ~15-25 min)
 rcc --profile clariden job submit deployments/llm/clariden/kimi-k3/build_kimi_k3_image.sbatch
 
@@ -433,7 +453,7 @@ startup timeline (weight-load/compile/CG phases, `ready_wait_s`); with the
 default 0 the startup timeline is in the job log instead.
 Set `SERVEKIT_BENCH=0` to skip the automatic bench.
 
-Historical: the legacy `bench.py` invocation that produced the verified table
+Historical: the legacy `bench.py` (now [`meta/bench/bench.py`](../../../meta/bench/bench.py)) invocation that produced the verified table
 is preserved in the git history of this file; its protocol is 1024 token-in,
 not words.
 

@@ -11,6 +11,25 @@ like the JSC recipe. The RTX PRO 6000 is the only FP8-capable GPU type
 accessible on Euler; the RTX 3090 (sm_86), Quadro RTX 6000 (sm_75), and A100
 (sm_80) have no FP8 hardware.
 
+## Start here
+
+On a login node (or prefix each command with `rcc --profile euler run --` from
+a workstation):
+
+```bash
+bash start_relay_euler.sh              # once: relay in tmux, writes relay.multiaddr
+sbatch serve_qwen36_otela_euler.sbatch # per job: sglang + otela worker on one RTX PRO 6000
+# or both in one shot (skips what already exists):  bash up.sh
+
+JOB=<jobid>; D=/cluster/scratch/$USER/otela-qwen36
+tail -f $D/logs/qwen36-$JOB.out        # "engine healthy — starting otela worker"
+tail -f $D/run-$JOB/otela.log          # "Connected to peer", no LEFT line
+
+curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \
+  -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.6-35B-A3B-FP8","messages":[{"role":"user","content":"hi"}]}'
+```
+
 ## Why `--gpus=nvidia_rtx_pro_6000:1` (no `--partition`)
 
 The FP8 model needs FP8-capable hardware for native FP8 blockwise GEMM. On
@@ -109,6 +128,7 @@ client ─https─▶ api.opentela.ai ──P2P──▶ ocf head
 |------|---------|
 | `serve_qwen36_otela_euler.sbatch` | The recipe — serves sglang + registers otela worker, one self-contained sbatch |
 | `start_relay_euler.sh` | Login-node relay (tmux, writes `relay.multiaddr`); run once before submitting |
+| `up.sh` | One-shot bring-up: relay if not running → sbatch |
 | `README.md` | This file |
 
 ## Prerequisites (one-time, on a login node)

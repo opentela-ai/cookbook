@@ -32,6 +32,20 @@ overrideable fallback), so each rank runs `otela start --mode node --subprocess
 > shared knobs are set to the **opposite** value here, so do not copy settings
 > between the two recipes without reading fix #2 and #3 below.
 
+## Start here
+
+On the Beverin login node — note the ⛔ banner above: this is a bring-up log,
+not a working deployment yet. The probe is always the first step on a new
+image:
+
+```bash
+sbatch probe_sglang.sbatch              # 1-node bring-up gate (real /generate)
+sbatch serve_deepseek_v4_flash.sbatch   # the recipe — or: bash up.sh
+# scale out: sbatch --nodes=4 serve_deepseek_v4_flash.sbatch
+
+tail -f /capstor/scratch/cscs/xyao/deepseek-v4-flash-sglang/logs/opentela-<JOB>-0.log
+```
+
 ## What makes this model different
 
 DeepSeek-V4-Flash is a ~283 B-parameter sparse MoE (43 layers, 256 routed
@@ -75,7 +89,7 @@ its KV pool against memory that does not exist, and a rank gets SIGKILLed by
 the cgroup OOM killer (exit `-9`) shortly after `Load weight end` with no
 Python traceback.
 
-**Fix:** `sglang_launcher_mi300a.py` proxies
+**Fix:** the MI300A launcher ([`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py)) proxies
 `torch.cuda.get_device_properties()` to report `is_integrated=False`.
 Verified — with it, every rank logs `Load weight begin. avail mem=119.15 GB`
 instead of ~477 GB.
@@ -383,6 +397,15 @@ Both as in the GLM recipe, and both still required:
   quota-limited and sglang's tempfile cleanup there raises
   `OSError [Errno 39] Directory not empty`.
 
+### 9. Per-rank libp2p ports, staggered joins, stdin (inherited)
+
+- `TCP_PORT=$((43905 + SLURM_PROCID))`, `UDP_PORT=$((59820 + SLURM_PROCID))` —
+  peers on a fixed port behind one NAT egress collided on a single external
+  mapping and only ~half registered.
+- `sleep $((SLURM_PROCID * 10))` before `otela start` — simultaneous hits on
+  the single bootstrap correlated with failed registrations.
+- otela is backgrounded with `< /dev/zero` — it exits on stdin EOF.
+
 ## Files
 
 | File | Purpose |
@@ -390,8 +413,9 @@ Both as in the GLM recipe, and both still required:
 | `deepseek-v4-rocm.toml` | EDF: image (by digest), mounts, ROCm env |
 | `probe_sglang.sbatch` | 1-node bring-up gate: starts SGLang alone, waits for readiness, then issues a **real `/generate`** (the only way to catch fix #3) |
 | `serve_deepseek_v4_flash.sbatch` | The recipe: per-rank SGLang wrapper + otela worker + optional vmagent |
-| `sglang_launcher_mi300a.py` | Standalone copy of the MI300A `is_integrated=False` launcher (also generated inline by the sbatch) |
+| [`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py) | The MI300A `is_integrated=False` launcher, canonical shared copy (also generated inline by the sbatch) |
 | `sync_aiter_kernels.sh` | Login-node helper: share the compiled aiter kernels through a Hugging Face bucket (see below) |
+| `up.sh` | One-shot: probe gate → serve sbatch (forwards extra sbatch args, e.g. `bash up.sh --nodes=4`) |
 
 ## Sharing the compiled kernels (`sync_aiter_kernels.sh`)
 

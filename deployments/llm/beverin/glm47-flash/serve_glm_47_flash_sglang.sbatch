@@ -37,19 +37,11 @@
 #   SBATCH --export=ALL,MAX_MODEL_LEN=65536,MEM_FRACTION_STATIC=0.92 \
 #          serve_glm_47_flash_sglang.sbatch
 #
-# HOW IT WORKS (why no relay, unlike the JSC recipe):
-#   Beverin compute nodes have full outbound internet and can reach the
-#   public OpenTela bootstrap /ip4/140.238.223.116/... directly (verified
-#   2026-08-07; the previous Alps peer /ip4/148.187.108.178/... is kept as
-#   an overrideable fallback). So each rank runs
-#   one `otela start --mode node --subprocess <sglang-wrapper>` that
-#     1. starts SGLang on 0.0.0.0:${SGLANG_PORT},
-#     2. bootstraps to the given peer, and
-#     3. registers the `llm` service with label `model=zai-org/GLM-4.7-Flash`.
-#   The OpenTela head then routes /v1/service/llm/... requests to these peers.
-#
-# CONTAINER ENGINE: the image is supplied by ./sglang-rocm.toml (EDF), found via
-#   EDF_PATH below. `srun --environment=sglang-rocm` runs everything inside it.
+# HOW IT WORKS: no relay (unlike JSC) — compute has full outbound internet;
+# each rank runs `otela start --mode node --subprocess <sglang-wrapper>`.
+# Per-rank port offsets + staggered joins + teardown: README fixes #6–#8.
+# CONTAINER ENGINE: image from ./sglang-rocm.toml (EDF) via EDF_PATH below;
+# `srun --environment=sglang-rocm` runs everything inside it.
 set -euo pipefail
 
 # ---------------------------------------------------------------- deployment --
@@ -73,11 +65,8 @@ DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-${SGLANG_SKIP_SERVER_WARMUP:-1}}"
 LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
-# GLM-4.7-Flash (model_type glm4_moe_lite, with nextn_predict_layers) is newer
-# than the transformers pinned in some SGLang images. The v0.5.16 ROCm image
-# already ships 5.12.1, so this guard is normally a no-op; it only installs if
-# the image is older. system mode keeps the upgraded package on the container
-# filesystem (target mode would isolate it on /capstor).
+# transformers >= 5.12.1 guard for glm4_moe_lite (no-op on images that already
+# ship it; system mode = container fs, target mode = /capstor).
 TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-5.12.1}"
 TRANSFORMERS_INSTALL_MODE="${TRANSFORMERS_INSTALL_MODE:-system}"
 TRANSFORMERS_TARGET_DIR="${TRANSFORMERS_TARGET_DIR:-${DEPLOY_DIR}/cache/pydeps/transformers-${TRANSFORMERS_VERSION}}"
@@ -144,16 +133,8 @@ echo "started=$(date --iso-8601=seconds)"
 # init, no torchrun, no --nnodes/--dist-init-addr.
 SGLANG_SUBPROCESS="${DEPLOY_DIR}/sglang_subprocess-${SLURM_JOB_ID}.sh"
 
-# MI300A APU memory-accounting fix. PyTorch reports is_integrated=True for
-# every MI300A GPU, but each GPU has its OWN dedicated 137 GB HBM3 (not
-# shared sysmem like a laptop iGPU). sglang's get_available_gpu_memory()
-# then uses psutil.virtual_memory().available (whole-node ~428 GB) per TP
-# rank instead of per-GPU mem_get_info (137 GB), so with mem_fraction_static
-# =0.85 each of 4 ranks computes a ~301 GB KV budget and 4*301 >> 365 GB
-# physically free -> cgroup OOM (SIGKILL, exit -9) ~35 s after Load weight
-# end, with no Python traceback. This launcher wraps
-# torch.cuda.get_device_properties to report is_integrated=False, restoring
-# correct per-GPU accounting (same as a discrete GPU).
+# MI300A memory-accounting fix (why the OOM, what is_integrated=False does):
+# README fix #5. Canonical copy: meta/common/sglang_launcher_mi300a.py.
 SGLANG_LAUNCHER="${DEPLOY_DIR}/sglang_launcher_mi300a.py"
 cat > "${SGLANG_LAUNCHER}" <<'SGLANG_LAUNCHER_PY'
 #!/usr/bin/env python3
@@ -210,15 +191,12 @@ set -euo pipefail
 
 echo "sglang_subprocess_started rank=\${SLURM_PROCID} host=\$(hostname) \$(date --iso-8601=seconds)"
 
-# tempfile on /capstor, NOT the Slurm default /users/<u>/.tmp (home is
-# quota-limited; sglang's tempfile cleanup on a quota dir raises
-# OSError [Errno 39] Directory not empty). Belt-and-suspenders alongside the
-# EDF [env] TMPDIR= so this holds even if a parent login shell re-exported it.
+# tempfile on /capstor, NOT Slurm's default (home quota → OSError [Errno 39]);
+# README fix #2. Belt-and-suspenders with the EDF [env] TMPDIR=
 export TMPDIR="${DEPLOY_DIR}/cache/tmp"
 mkdir -p "${TMPDIR}"
-# Override the image's /etc/environment SGLANG_USE_AITER=1: aiter's RoPE
-# crashes on GLM-4.7-Flash (no original_max_position_embeddings in
-# rope_scaling). sglang's own get_rope handles it. See sglang-rocm.toml.
+# Override the image's SGLANG_USE_AITER=1: aiter RoPE crashes on this model
+# (README fix #3).
 export SGLANG_USE_AITER=0
 
 SGLANG_ARGS=(
@@ -351,10 +329,8 @@ set -euo pipefail
 RANK="\${SLURM_PROCID}"
 NODE="\$(hostname)"
 LOCALHOST_IP="\$(hostname -i | awk '{print \$1}')"
-# Per-rank libp2p ports. Every peer used to bind the same fixed tcp/udp port,
-# so multiple peers sharing one NAT egress collided on a single external port
-# mapping to the bootstrap and only ~half registered. Offsetting by
-# SLURM_PROCID gives each peer a distinct port.
+# Per-rank libp2p ports: fixed ports collided behind one NAT egress (only
+# ~half the peers registered); offset by rank. README fix #6.
 TCP_PORT=\$(( ${OPENTELA_TCP_PORT} + \${RANK} ))
 UDP_PORT=\$(( ${OPENTELA_UDP_PORT} + \${RANK} ))
 OPENTELA_HOME="${DEPLOY_DIR}/home/opentela-${SLURM_JOB_ID}-\${RANK}"
@@ -372,13 +348,12 @@ sed "s/LOCALHOST_IP/\${LOCALHOST_IP}/g" "${SCRAPE_CONFIG_TEMPLATE}" > "\${SCRAPE
 
 echo "opentela_launcher_started rank=\${RANK} node=\${NODE} ip=\${LOCALHOST_IP} tcp=\${TCP_PORT} udp=\${UDP_PORT} home=\${OPENTELA_HOME} \$(date --iso-8601=seconds)"
 
-# Stagger peer joins so all N ranks do not hit the single bootstrap in the same
-# instant (the thundering herd was correlated with failed registrations).
+# Stagger joins: simultaneous hits on the single bootstrap correlated with
+# failed registrations. README fix #7.
 sleep \$(( \${RANK} * 10 ))
 
-# OpenTela is backgrounded with stdin from /dev/zero because it exits when run
-# as a foreground process with EOF on stdin. It will start SGLang as its
-# subprocess.
+# Backgrounded with < /dev/zero: otela exits on stdin EOF (README fix #8).
+# It starts SGLang as its subprocess.
 nohup "${OPENTELA_BIN}" start \\
   --config "\${OPENTELA_CONFIG}" \\
   --bootstrap.addr "${OPENTELA_BOOTSTRAP}" \\
@@ -398,11 +373,8 @@ nohup "${OPENTELA_BIN}" start \\
 OPENTELA_PID=\$!
 echo "opentela_started rank=\${RANK} pid=\${OPENTELA_PID} log=\${OPENTELA_LOG}"
 
-# Stop the peer with SIGTERM (never SIGKILL) so it leaves the mesh gracefully:
-# a killed peer stays connected:true in the registry and the head keeps
-# round-robining traffic into a dead endpoint. Mirrors the deepseek-v4 recipe.
-# Previously this recipe had no teardown at all — otela was left to be reaped by
-# SLURM, so it depended entirely on winning an unguaranteed race against KillWait.
+# SIGTERM (never SIGKILL) so otela publishes LEFT: a killed peer stays
+# connected:true and keeps receiving traffic (README, Knobs --signal note).
 cleanup() {
   # The trap fires for both TERM and EXIT, and bash runs the EXIT trap after the
   # TERM handler returns, so guard against running the teardown twice.

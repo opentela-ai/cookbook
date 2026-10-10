@@ -99,12 +99,25 @@ The probe is designed to surface exactly that.
 
 ## Files in this recipe
 
+> **Start here** — from the login node:
+>
+> ```bash
+> bash up.sh --export=ALL,LOAD_FORMAT=dummy,GEN_CORRECTNESS_SMOKE=1   # fast smoke (~10 min)
+> bash up.sh --export=ALL,GEN_CORRECTNESS_SMOKE=0                     # real weights (~4 h cold start)
+> tail -f /capstor/scratch/cscs/xyao/glm52-sglang-beverin/logs/<job>.out
+> ```
+>
+> Or from your local machine via rcc (see Submission below). The sbatch expects
+> to be launched with `rcc run --cwd <ABSOLUTE recipe dir>` so sibling files
+> resolve (note in the sbatch header).
+
 | File | Purpose |
 |---|---|
 | `serve_glm_52_sglang.sbatch` | Self-contained sbatch: preflights EDF/image/weights/otela, sruns one SGLang engine rank per node inside the sglang-rocm container (enroot/EDF), runs a mandatory generation probe before registration, and starts one otela worker on the head. |
 | `sglang-rocm.toml` | EDF (Enroot Definition File) for the `sglang-rocm` environment. Pins the image by digest, sets `/capstor` cache dirs (Triton, tilelang, HF, pip, TMPDIR), and the MI300A env vars (`HSA_NO_SCRATCH_RECLAIM=1`, `SGLANG_USE_AITER`, `LD_LIBRARY_PATH`, `NCCL_SOCKET_IFNAME=hsn`). |
-| `sglang_launcher_mi300a.py` | Python launcher that monkey-patches `torch.cuda.get_device_properties` to report `is_integrated=False` (each MI300A GPU has its own 137 GiB HBM3, not shared sysmem) and `_patched_get_device_properties(device=None)` (aiter DSA decode calls it with no args). |
-| `gen_correctness.py` | Model-agnostic generation probe (reused from the kimi-k3 recipe). Sends six greedy `/v1/completions` prompts (temperature 0, max_tokens 64) and checks each answer for its expected factual substring (Paris; primes; 40 km/h; Rayleigh; fibonacci; entropy). With `GEN_CORRECTNESS_SMOKE=1`, checks for non-empty continuation instead. |
+| [`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py) | Python launcher that monkey-patches `torch.cuda.get_device_properties` to report `is_integrated=False` (each MI300A GPU has its own 137 GiB HBM3, not shared sysmem) and `_patched_get_device_properties(device=None)` (aiter DSA decode calls it with no args). |
+| [`meta/common/gen_correctness.py`](../../../../meta/common/gen_correctness.py) | Model-agnostic generation probe (shared canonical copy). Sends six greedy `/v1/completions` prompts (temperature 0, max_tokens 64) and checks each answer for its expected factual substring (Paris; primes; 40 km/h; Rayleigh; fibonacci; entropy). With `GEN_CORRECTNESS_SMOKE=1`, checks for non-empty continuation instead. |
+| `up.sh` | One-shot: smoke-probe submit → real-weights submit (forwards extra sbatch args). Submitting from a *local* machine runs it via `rcc`; on the login node it is plain sbatch. |
 
 ---
 
@@ -216,8 +229,8 @@ def _patched_get_device_properties(device=None):  # NOT: def ...(device):
 Without `device=None`, the scheduler crashes with
 `TypeError: _patched_get_device_properties() missing 1 required positional argument: 'device'`
 (job 594459, before the fix). Fixed in all three copies:
-- `glm52/sglang_launcher_mi300a.py` L69
-- `glm47-flash/sglang_launcher_mi300a.py` L64
+- `glm52/sglang_launcher_mi300a.py` L69 (now [`meta/common/sglang_launcher_mi300a.py`](../../../../meta/common/sglang_launcher_mi300a.py); the per-recipe copies were consolidated there)
+- `glm47-flash/sglang_launcher_mi300a.py` L64 (same consolidation)
 - `glm47-flash/serve_glm_47_flash_sglang.sbatch` L182 (inline heredoc)
 
 ---
@@ -406,7 +419,7 @@ rcc --profile beverin run --cwd "$PWD" -- sbatch \
 
 > **`--cwd` is mandatory.** `rcc job submit` runs sbatch from the
 > `remote_dir` root (not this directory), so sibling files
-> (`gen_correctness.py`, `sglang-rocm.toml`) are not found. Use
+> (`gen_correctness.py`, `sglang-rocm.toml`) are not found — the first two live in `meta/common/`, the EDF must sit next to the sbatch. Use
 > `rcc run --cwd <ABSOLUTE recipe dir> -- sbatch <script>`.
 
 ---

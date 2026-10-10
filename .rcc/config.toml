@@ -24,7 +24,7 @@ TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/cache/triton"
 
 [profiles.clariden]
 host = "clariden"
-remote_dir = "/capstor/scratch/cscs/xyao/opentela-cookbook"
+remote_dir = "/iopsstor/scratch/cscs/xyao/opentela-cookbook"
 keep_remote = [
   "logs/",
   "*.safetensors",
@@ -33,8 +33,8 @@ keep_remote = [
 ]
 
 [profiles.clariden.env]
-HF_HOME = "/capstor/scratch/cscs/xyao/models"
-TRITON_CACHE_DIR = "/capstor/scratch/cscs/xyao/cache/triton"
+HF_HOME = "/iopsstor/scratch/cscs/xyao/models"
+TRITON_CACHE_DIR = "/iopsstor/scratch/cscs/xyao/cache/triton"
 
 [profiles.euler]
 host = "euler"

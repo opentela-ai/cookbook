@@ -37,20 +37,11 @@
 #   sbatch --export=ALL,MAX_MODEL_LEN=131072,MEM_FRACTION_STATIC=0.90 \
 #          serve_deepseek_v4_flash.sbatch
 #
-# HOW IT WORKS (why no relay, unlike the JSC recipe):
-#   beverin compute nodes have full outbound internet and reach the public
-#   OpenTela bootstrap /ip4/140.238.223.116/... directly (the old Alps peer
-#   /ip4/148.187.108.178/... is kept as an overrideable fallback). So each rank
-#   runs one `otela start --mode node --subprocess <sglang-wrapper>` that
-#     1. starts SGLang on 0.0.0.0:${SGLANG_PORT},
-#     2. bootstraps to the given peer, and
-#     3. registers the `llm` service with label
-#        `model=deepseek-ai/DeepSeek-V4-Flash`.
-#   The OpenTela head then routes /v1/service/llm/... requests to these peers.
-#
-# CONTAINER ENGINE: the image comes from ./deepseek-v4-rocm.toml (EDF), found
-#   via EDF_PATH below. `srun --environment=deepseek-v4-rocm` runs everything
-#   inside it.
+# HOW IT WORKS: no relay (unlike JSC) — compute reaches the bootstrap directly;
+# each rank runs `otela start --mode node --subprocess <sglang-wrapper>`.
+# Per-rank ports / staggered joins / stdin: README fix #9.
+# CONTAINER ENGINE: image from ./deepseek-v4-rocm.toml (EDF) via EDF_PATH;
+# `srun --environment=deepseek-v4-rocm` runs everything inside it.
 set -euo pipefail
 
 # ---------------------------------------------------------------- deployment --
@@ -60,10 +51,8 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
 SGLANG_PORT="${SGLANG_PORT:-8080}"
 TP_SIZE="${TP_SIZE:-4}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
-# The config advertises max_position_embeddings=1048576 (1 M, YaRN factor 16
-# over a 65536 base). Serving the full 1 M by default would size the KV pool
-# and the per-request metadata for a context nobody asks for; 65536 is the
-# un-scaled native window. Raise it explicitly when you want long context.
+# 65536 = the un-scaled native window (config advertises 1 M via YaRN factor
+# 16); raising it re-sizes the KV pool and per-request metadata for it.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 SGLANG_REASONING_PARSER="${SGLANG_REASONING_PARSER:-deepseek-v4}"
@@ -71,68 +60,34 @@ SGLANG_TOOL_CALL_PARSER="${SGLANG_TOOL_CALL_PARSER:-deepseekv4}"
 LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
 # --- routed-expert numerics on gfx942 (the DSV4-specific decision) ------------
-# DeepSeek-V4-Flash ships its 256 routed experts mxfp4-packed: I8 weight
-# tensors (2 fp4 values per byte) + F8_E8M0 block scales, 132 GiB of the
-# 149 GiB checkpoint. gfx942 has NO native MX compute — sglang's
-# mxfp_supported() is gfx95-only (MI350), so the generic Mxfp4Config path
-# would raise "Current platform gfx942 not support mxfp4 computation".
-#
-# sglang instead routes DSV4 through Fp8Config with is_fp4_experts=True
-# (auto-detected from the safetensors header) and offers two ways out:
-#
-#   SGLANG_USE_AITER=1 (default here) -> aiter's native MXFP4 MoE kernels.
-#       Weights stay fp4 (~132 GiB experts, ~37 GiB/GPU at TP=4), leaving the
-#       most room for KV cache. NOTE this is the OPPOSITE of the GLM-4.7-Flash
-#       beverin recipe, which must set SGLANG_USE_AITER=0 because aiter's
-#       get_rope KeyErrors on a config with no original_max_position_embeddings.
-#       DeepSeek-V4-Flash's rope_scaling IS a full YaRN block with that key, so
-#       the crash does not apply and aiter can be left on.
-#
-#   DSV4_FP4_DEQUANT=1 -> cast_e2m1fn_to_e4m3fn every expert at load time.
-#       Weights DOUBLE to fp8 (~264 GiB experts, ~70 GiB/GPU at TP=4) and the
-#       ordinary blockwise-fp8 MoE runs them. Slower to load and far less KV
-#       headroom, but it is the fallback if an aiter kernel misbehaves. It
-#       asserts moe_runner_backend=auto, so do not combine it with an explicit
-#       --moe-runner-backend.
+# Experts ship mxfp4-packed (132 of 149 GiB); gfx942 has no native MX compute,
+# so sglang routes through Fp8Config/is_fp4_experts with two ways out:
+#   SGLANG_USE_AITER=1 (default) -> native MXFP4 MoE kernels (opposite of the
+#       GLM recipe — its aiter RoPE KeyError does not apply here: README #2);
+#   DSV4_FP4_DEQUANT=1 -> dequant experts to fp8 at load (~2x weights, less
+#       KV headroom; requires moe_runner_backend=auto). Full story: README #2.
 SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
 DSV4_FP4_DEQUANT="${DSV4_FP4_DEQUANT:-0}"
 
-# DSA sparse-attention kernel. On HIP the backend is ALWAYS read from this env
-# var — hip_flash_mla.flash_mla_with_kvcache_entrypoint() overrides whatever
-# --dsa-prefill-backend/--dsa-decode-backend say — and the upstream default
-# "tilelang" does NOT compile on gfx942: the first forward dies in TVM's
-# InjectSoftwarePipeline pass with
-#   ValueError: Check failed: src_info.order < dst_info.order (6 vs. 4) :
-#   two statements with buffer access dependency in the same stage of the
-#   software pipeline cannot be reordered
-# which SIGQUITs every scheduler rank. "triton" is the ROCm alternative
-# sglang's own hisparse hook points at; "unified_kv_triton" is the other HIP
-# path (incompatible with --enable-hisparse).
+# DSA sparse-attention kernel: on HIP the backend is ALWAYS read from this env
+# var (overrides the CLI flags) and the upstream default "tilelang" does not
+# compile on gfx942 — README #3 for the TVM error and the alternatives.
 FLASHMLA_BACKEND="${FLASHMLA_BACKEND:-triton}"
 
-# Persistent aiter JIT cache. The native MXFP4 MoE kernel
-# (module_moe_ck2stages_b16_fp4x2_preshuffle_off_b16_silu_per_1x32_mulWeightStage2)
-# is Composable-Kernel C++ that aiter hipcc-compiles on the FIRST request, not
-# at load — ~20 hipcc + ~20 clang processes, and the other 3 TP ranks block on
-# aiter's baton lock meanwhile. aiter's get_user_jit_dir() defaults to the
-# in-image /sgl-workspace/aiter/aiter/jit (writable, so it wins over the $HOME
-# fallback), which is a squashfs overlay that dies with the container — so
-# every job re-pays the compile.
-#
-# Pointing AITER_JIT_DIR at /capstor keeps it. It must be SEEDED from the
-# image's jit dir, not left empty: the image ships prebuilt .so modules
-# (module_aiter_core.so and friends) next to the build tree, and an empty
-# AITER_JIT_DIR would force aiter to rebuild those from scratch too. The srun
-# step below seeds it on first use.
+# Persistent aiter JIT cache: the CK MXFP4 MoE kernel is hipcc-compiled on the
+# FIRST request (~20 hipcc + ~20 clang, other ranks blocked on the baton lock);
+# the in-image default jit dir is a squashfs overlay that dies with the
+# container. Pointing AITER_JIT_DIR at /capstor keeps it — but it must be
+# SEEDED from the image's jit dir (prebuilt .so modules ship there too).
+# Seeding: the wrapper below. README #4 + sync_aiter_kernels.sh.
 AITER_JIT_DIR="${AITER_JIT_DIR:-${DEPLOY_DIR}/cache/aiter-jit}"
 # Digest of the image in deepseek-v4-rocm.toml. Not derivable from inside the
 # container, so it is threaded through for the provenance file that keys the
 # shared kernel bucket (see sync_aiter_kernels.sh). Keep in sync with the EDF.
 IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:80d04638deb64fac000fa565cb46e5d2f692173dc125a32a956014a6383ecaee}"
 
-# CUDA-graph capture is left ON (unlike the GLM-4.7-Flash beverin recipe, whose
-# MTP/nextn layers SIGKILL during capture). Set DISABLE_CUDA_GRAPH=1 to fall
-# back to eager decode if capture regresses on a future image.
+# CUDA graphs stay ON (the GLM recipe's MTP-capture SIGKILL does not apply
+# here); set DISABLE_CUDA_GRAPH=1 if capture regresses on a future image.
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}"
 SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-0}"
 
@@ -191,17 +146,9 @@ echo "started=$(date --iso-8601=seconds)"
 }
 
 # --- sweep stale aiter baton locks -------------------------------------------
-# aiter guards each module build with a baton that only the BUILDING process
-# removes, and it uses TWO of them at different depths:
-#   <jit>/build/lock_module_<name>            (outer, one per module)
-#   <jit>/build/module_<name>/build/lock      (inner, the ninja build)
-# scancel a job mid-compile and both survive on /capstor. The next job then
-# acquires the outer lock, starts the ninja build, and blocks forever on the
-# DEAD job's inner lock — 0% CPU, no compiler running, no error, just a hang.
-# (Cleaning only the outer one is not enough; that is exactly how job 574156
-# stalled.) Anything predating this job's start cannot belong to it, so sweep
-# it here — in the sbatch body, before srun, so it runs exactly once and cannot
-# race a rank that is legitimately building.
+# scancel mid-compile leaves BOTH baton locks on /capstor; the next job then
+# hangs forever on the dead job's inner lock (job 574156). Sweep anything
+# predating this job, once, here in the sbatch body — README #7.
 if [ -d "${AITER_JIT_DIR}/build" ]; then
   STALE=0
   while IFS= read -r stale_lock; do
@@ -222,14 +169,9 @@ if [ -d "${AITER_JIT_DIR}/build" ]; then
 fi
 
 # ================================================================ engine ======
-# MI300A APU memory-accounting fix. PyTorch reports is_integrated=True for
-# every MI300A GPU, so sglang's get_available_gpu_memory() substitutes
-# psutil.virtual_memory().available (whole-node, 477 GiB measured) for the
-# per-GPU mem_get_info() value (128 GiB) on EVERY rank. Each rank then sizes
-# its KV pool against memory that does not exist and a rank gets SIGKILLed by
-# the cgroup OOM killer (exit -9) shortly after "Load weight end", with no
-# Python traceback. The launcher proxies get_device_properties to report
-# is_integrated=False. Verified: ranks report "avail mem=119.15 GB" with it.
+# MI300A memory-accounting fix (whole-node psutil value → cgroup OOM after
+# weight load; is_integrated=False restores per-GPU accounting): README #1.
+# Canonical copy: meta/common/sglang_launcher_mi300a.py.
 SGLANG_LAUNCHER="${DEPLOY_DIR}/run/sglang_launcher_mi300a.py"
 cat > "${SGLANG_LAUNCHER}" <<'SGLANG_LAUNCHER_PY'
 #!/usr/bin/env python3
@@ -298,10 +240,8 @@ set -euo pipefail
 
 echo "sglang_subprocess_started rank=\${SLURM_PROCID} host=\$(hostname) \$(date --iso-8601=seconds)"
 
-# tempfile on /capstor, NOT the Slurm default /users/<u>/.tmp (home is
-# quota-limited; sglang's tempfile cleanup on a quota dir raises
-# OSError [Errno 39] Directory not empty). Belt-and-suspenders alongside the
-# EDF [env] TMPDIR so this holds even if a parent shell re-exported it.
+# tempfile on /capstor, NOT the Slurm default (home quota → OSError [Errno 39]);
+# README #8. Belt-and-suspenders with the EDF [env] TMPDIR.
 export TMPDIR="${DEPLOY_DIR}/cache/tmp"
 mkdir -p "\${TMPDIR}"
 
@@ -431,10 +371,8 @@ set -euo pipefail
 RANK="\${SLURM_PROCID}"
 NODE="\$(hostname)"
 LOCALHOST_IP="\$(hostname -i | awk '{print \$1}')"
-# Per-rank libp2p ports. Every peer used to bind the same fixed tcp/udp port,
-# so multiple peers behind one NAT egress collided on a single external port
-# mapping and only ~half registered. Offsetting by SLURM_PROCID gives each peer
-# a distinct port.
+# Per-rank libp2p ports: fixed ports collided behind one NAT egress (only
+# ~half the peers registered). README #9.
 TCP_PORT=\$(( ${OPENTELA_TCP_PORT} + \${RANK} ))
 UDP_PORT=\$(( ${OPENTELA_UDP_PORT} + \${RANK} ))
 OPENTELA_HOME="${DEPLOY_DIR}/home/opentela-${SLURM_JOB_ID}-\${RANK}"
@@ -452,12 +390,12 @@ sed "s/LOCALHOST_IP/\${LOCALHOST_IP}/g" "${SCRAPE_CONFIG_TEMPLATE}" > "\${SCRAPE
 
 echo "opentela_launcher_started rank=\${RANK} node=\${NODE} ip=\${LOCALHOST_IP} tcp=\${TCP_PORT} udp=\${UDP_PORT} \$(date --iso-8601=seconds)"
 
-# Stagger peer joins so all N ranks do not hit the single bootstrap at once
-# (the thundering herd was correlated with failed registrations).
+# Stagger joins: simultaneous hits on the single bootstrap correlated with
+# failed registrations. README #9.
 sleep \$(( \${RANK} * 10 ))
 
-# otela is backgrounded with stdin from /dev/zero because it exits when run in
-# the foreground with EOF on stdin. It starts SGLang as its subprocess.
+# Backgrounded with < /dev/zero: otela exits on stdin EOF (README #9).
+# It starts SGLang as its subprocess.
 nohup "${OPENTELA_BIN}" start \\
   --config "\${OPENTELA_CONFIG}" \\
   --bootstrap.addr "${OPENTELA_BOOTSTRAP}" \\
@@ -477,9 +415,8 @@ nohup "${OPENTELA_BIN}" start \\
 OPENTELA_PID=\$!
 echo "opentela_started rank=\${RANK} pid=\${OPENTELA_PID} log=\${OPENTELA_LOG}"
 
-# Stop the peer with SIGTERM (never SIGKILL) so it leaves the mesh gracefully:
-# a killed peer stays connected:true in the registry and the head keeps
-# round-robining traffic into a dead endpoint.
+# SIGTERM (never SIGKILL) so otela publishes LEFT: a killed peer stays
+# connected:true and keeps receiving traffic.
 cleanup() {
   echo "otela_stopping rank=\${RANK} \$(date --iso-8601=seconds)"
   kill -TERM "\${OPENTELA_PID}" 2>/dev/null || true
@@ -499,9 +436,8 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT
 
-# Wait for SGLang before starting vmagent: vmagent's Go HTTP client can wedge
-# if it scrapes before the target listens. /get_model_info returns 200 only
-# once weights are loaded.
+# Wait for SGLang first: vmagent's Go client can wedge if it scrapes before
+# the target listens (/get_model_info 200 == weights loaded).
 echo "waiting_for_sglang rank=\${RANK} url=http://\${LOCALHOST_IP}:${SGLANG_PORT}/get_model_info \$(date --iso-8601=seconds)"
 while true; do
   if ! kill -0 "\${OPENTELA_PID}" 2>/dev/null; then

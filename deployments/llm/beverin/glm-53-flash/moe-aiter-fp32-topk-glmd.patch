@@ -1,0 +1,37 @@
+--- a/sgl-workspace/sglang/python/sglang/srt/layers/moe/topk.py
++++ b/sgl-workspace/sglang/python/sglang/srt/layers/moe/topk.py
+@@ -1619,6 +1619,34 @@
+         bias = correction_bias.to(dtype=gating_output.dtype)
+         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+ 
++        # [CORRECTNESS] GLM-5.3 / DeepSeek-V3 noaux_tc on MI300A: the aiter
++        # `biased_grouped_topk` kernel runs the router sigmoid + the LARGE
++        # e_score_correction_bias (rms ~7.8) add + top-k in bf16 (gate kept
++        # native bf16, bias cast to gating_output.dtype). That ±0.4% rounding
++        # flips ~22% of top-8 selections vs the fp32 reference (flashinfer on
++        # CUDA casts gate->fp32), corrupting every MoE layer (cos 0.582).
++        # For the n_group==1 case (GLM-5.3: 288 experts, top-8) route through
++        # the fp32 torch reference `biased_grouped_topk_impl`, folding the
++        # scaling factor into the routed weights (matching aiter and the
++        # downstream guard, which skips the post-MoE `*= routed_scaling_factor`
++        # for _use_aiter). Trivial overhead; bit-exact parity with the CUDA
++        # reference. Revert with SGLANG_AITER_FP32_TOPK=0.
++        if num_expert_group == 1 and get_bool_env_var(
++            "SGLANG_AITER_FP32_TOPK", "True"
++        ):
++            return biased_grouped_topk_impl(
++                hidden_states=hidden_states,
++                gating_output=gating_output.to(dtype=torch.float32),
++                correction_bias=correction_bias.to(dtype=torch.float32),
++                topk=topk,
++                renormalize=renormalize,
++                num_expert_group=num_expert_group,
++                topk_group=topk_group,
++                num_fused_shared_experts=num_fused_shared_experts,
++                routed_scaling_factor=routed_scaling_factor,
++                apply_routed_scaling_factor_on_output=True,
++            )
++
+         if envs.SGLANG_K3_RADIX4_TOPK.get():
+             from sglang.kernels.ops.moe import moe_route_radix4
+ 

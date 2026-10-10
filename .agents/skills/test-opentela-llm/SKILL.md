@@ -60,6 +60,7 @@ log (= real requests being routed in from the mesh — the decisive proof).
 | Symptom | Cause | Source of truth |
 |---|---|---|
 | Public API returns 503 "No provider found" | relay data dir on NFS went stale (ESTALE) -> badger value log unwritable -> CRDT frozen; fix: symlink relay's `~/.ocfcore` to scratch | `deployments/llm/jsc/kimi-k3/serve_llm_otela_jsc.sbatch` header |
+| Healthy engine silently **deregisters** after a load burst; gateway `503 "No provider found"` (no crash, log keeps saying `Health check passed`) | this fork defaults `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=True`, so `/health` runs a generate gated on the **detokenizer**; a heartbeat stall logs `Health check failed. Server couldn't get a response from detokenizer for last 20 seconds`, sets `server_status=UnHealthy` (503) and otela withdraws the advertisement after 3 failed probes. Fix: `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` (+ `SGLANG_HEALTH_CHECK_TIMEOUT=300` for cold start) | clariden `serve_glm_5_3_flash_otela_clariden.sbatch`; beverin `glm-53-flash/CORRECTNESS_BUG_INVESTIGATION.md` ("CRITICAL") |
 | Job registers but never serves a request | relay predates the P2PForwardHandler fix (needs official >= v0.2.3) | jsc sbatch header |
 | Self-built otela relays/serves but never registers | peers discard records from unattested ("dev") binaries; use a signed release | jsc sbatch, `OTELA_REQUIRE_SIGNED` |
 | Peer stuck `connected: true` after job ended | otela was SIGKILLed; always TERM the srun **step** and wait for the leave announcement | jsc sbatch, `stop_otela()` |

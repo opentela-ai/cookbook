@@ -22,8 +22,8 @@
 #                                                       stage_sharp_plugin.sh, then submit the
 #                                                       sbatch with TP_SIZE=32 EP_SIZE=32 PP_SIZE=1
 #                                                       SHARP_PLUGIN_DIR=.../sharp-plugin-only.
-#                                                       Same recipe otherwise. See the sbatch
-#                                                       "WHY TP4/PP8" block for the full story.
+#                                                       Same recipe otherwise. See the recipe
+#                                                       README §2/§3 for the full story.
 #   IMAGE=/e/scratch/.../sglang-kimi-k3.sif             output path (matches the sbatch $IMAGE)
 #
 # ~20 GiB image: expect 10-25 min depending on the link. The .sif lands at the

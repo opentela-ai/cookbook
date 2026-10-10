@@ -5,23 +5,17 @@
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-# Full node (288 logical CPUs): the sglang kimi-k3 image pins TP ranks to GPU
-# NUMA domains using host CPU ids; a shrunken cpuset raises "CPU number N is
-# not eligible" and kills ranks. 1 task/node x 288 cpus = whole node.
+# Whole node (288 logical CPUs): the image pins TP ranks to GPU NUMA domains
+# via host CPU ids; a shrunken cpuset raises "CPU number N is not eligible".
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
-# No --mem/--exclusive: clariden normal has OverSubscribe=EXCLUSIVE
-# (jobs get dedicated whole nodes via 288 cpus + 4 gpus/node), and /dev/shm
-# is a fixed 334 GiB tmpfs per node — enough for servekit's ~190 GiB/rank
-# presharded staging with headroom. (Reserving 850 GiB/node was too close
-# to the 870 GiB RealMemory for the scheduler to place reliably.)
-# B:TERM@120 signals the BATCH SHELL (B:) 120 s before wall-time, giving the
-# stop_otela trap below a window to scancel the otela step with TERM. Without
-# B: the signal goes to the job steps, the batch-shell trap never runs, and the
-# only grace is KillWait (30 s) — less than otela's ~10 s graceful leave
-# (AnnounceLeave -> 5 s CRDT drain -> srv.Shutdown), so no LEFT is published and
-# the head keeps a `connected: true` row round-robining traffic into a dead
-# endpoint.
+# No --mem/--exclusive: normal partition is OverSubscribe=EXCLUSIVE (whole
+# nodes via 288 cpus + 4 gpus); /dev/shm is a fixed 334 GiB tmpfs — enough
+# for servekit's ~190 GiB/rank presharded staging. (Requesting 850 GiB was
+# too close to 870 GiB RealMemory for reliable placement.)
+# B:TERM@120 signals the BATCH SHELL so the stop_otela trap can TERM the otela
+# step before KillWait — without B: the trap never runs, no LEFT is published,
+# and the head keeps round-robining into a dead endpoint.
 #SBATCH --signal=B:TERM@120
 #SBATCH --output=/capstor/scratch/cscs/xyao/kimi-k3/logs/k3-clariden-%j.out
 #SBATCH --error=/capstor/scratch/cscs/xyao/kimi-k3/logs/k3-clariden-%j.out
@@ -36,95 +30,31 @@
 #   sbatch --nodes=4 --export=ALL,NNODES=4,PP_SIZE=4 \
 #          serve_kimi_k3_otela_clariden.sbatch                       # 4 nodes, TP4 x PP4
 #
-# What it does, in order:
-#   1. preflights the image, weights, and otela binary (prints exact staging
-#      commands on failure)
-#   2. srun's one sglang engine rank per node INSIDE the kimi-k3-clariden
-#      container (enroot/EDF), forming a single distributed TP4 x PP<NNODES>
-#      engine. Only rank 0 (head) serves HTTP.
-#   3. once the head's /health answers, runs the servekit verification bench
-#      (pre-registration, so mesh traffic can't pollute it; SERVEKIT_BENCH=0
-#      skips), then starts ONE otela WORKER — also inside the container, on
-#      the head node via srun --overlap --gres=none — which registers the
-#      `llm` service with the OpenTela mesh
-#   4. on job end / scancel, SIGTERM (never KILL) the otela step so it
-#      announces LEFT cleanly
+# Flow: preflight (image/weights/otela, exact staging commands on failure) →
+# one sglang rank/node in the kimi-k3-clariden container (TP4 x PP<NNODES>,
+# only the head serves HTTP) → servekit verification bench PRE-registration
+# (mesh traffic must not pollute; SERVEKIT_BENCH=0 skips) → ONE otela worker
+# on the head → SIGTERM on end (LEFT).
 #
-# -----------------------------------------------------------------------------
-# THE TOPOLOGY: JSC engine shape, Beverin network, Clariden fabric
-# -----------------------------------------------------------------------------
-# Kimi-K3 is ~1.5 TB mxfp4 — it does NOT fit on one 4x96 GB GH200 node, so this
-# is NOT the Beverin per-node-independent-replicas pattern. It is the JSC
-# pattern: ONE distributed sglang engine across all nodes, ONE otela worker on
-# the head registering the single head HTTP endpoint.
-#
-#   clariden compute (host netns; enroot container shares it)
-#     rank 0 (HEAD)  -> sglang launch_server (HTTP on 0.0.0.0:$SERVE_PORT) + otela
-#     rank 1..N      -> sglang workers (no HTTP; pipeline P2P to neighbours)
-#
-# TP4 keeps tensor-parallel all-reduce INSIDE one node's 4-GH200 NVLink domain.
-# PP<NNODES> puts one pipeline stage per node, so the only traffic that crosses
-# the Slingshot fabric is pipeline send/recv (point-to-point) — bandwidth-
-# tolerant and CUDA-graph-safe. Cross-node allreduce (TP32 flat) boots but is
-# ~1-5 tok/s and cannot be captured in a CUDA graph on Slingshot/CXI
-# (cudaErrorStreamCaptureInvalidated; OFI logs "GIN only supports RDMA
-# transport protocol"). See the README's fix 2 for the details.
-#
-# Verified performance (job 3000965, 2026-08-04, 8 nodes TP4xPP8; measured
-# with the legacy meta/bench/bench.py — the cookbook harness is now
-# meta/bench/cbench.sh (servekit bench), same protocol: 1024-in / 256-out,
-# warmup discarded, HiCache OFF):
-#   C=1  -> 34.7 tok/s   (single-request decode)
-#   C=16 -> 374.9 tok/s  aggregate
-#   C=32 -> 561.4 tok/s  aggregate  <- operating point; curve flattens here
-#   C=64 -> 559.3 tok/s  aggregate  (per-req drops 17.6 -> 11.7 tok/s)
-# Cold start ~105 min (weight load from /capstor dominates). Raw results:
-# bench_3000965.jsonl. Full protocol + table: README "Verified benchmarks".
-#
-# -----------------------------------------------------------------------------
-# NO RELAY (direct mesh, like Beverin)
-# -----------------------------------------------------------------------------
-# Clariden compute nodes reach the public OpenTela bootstrap
-# /ip4/140.238.223.116/... directly. (The previous Alps peer
-# /ip4/148.187.108.178/... was verified reachable from a compute node via
-# `cat < /dev/null > /dev/tcp/148.187.108.178/43905`; re-verify egress to
-# 140.238.223.116:43905 the same way before the first run.) So the worker
-# dials the bootstrap directly — no us-managed login-node relay (unlike JSC,
-# whose compute nodes have no outbound internet).
-#
-# -----------------------------------------------------------------------------
-# CONTAINER + NCCL ON SLINGSHOT (the clariden-specific part)
-# -----------------------------------------------------------------------------
-# Image is docker://lmsysorg/sglang:kimi-k3 (CUDA 13) imported to a local
-# .sqsh (build_kimi_k3_image.sbatch). The EDF (kimi-k3-clariden.toml, found via
-# EDF_PATH below) carries com.hooks.aws_ofi_nccl.enabled=true. Clariden defaults
-# to netstack source=artifact, so the hook bind-mounts the dynamically-linked
-# (+dl) aws-ofi-ccl plugin + libfabric CXI provider at container start (the
-# com.hooks.aws_ofi_nccl.variant annotation is ignored on artifact source).
-# That gives NCCL the native Slingshot transport — clariden has NO InfiniBand
-# verbs, so NCCL's built-in IB transport is unused. The per-rank engine.sh
-# below adds FI_CXI_* / NCCL_* tunables as := fallbacks that yield to whatever
-# the hook sets (reconciled with CSCS resource-hook docs, 2026-08).
+# TOPOLOGY: ~1.5 TB mxfp4 does not fit one node — the JSC pattern (ONE
+# distributed engine, ONE otela worker on the head), not Beverin's per-node
+# replicas. TP4 keeps allreduce on NVLink; PP<NNODES> means only pipeline
+# send/recv crosses Slingshot (flat TP32: ~1-5 tok/s, no CUDA-graph capture —
+# README fix 2). Verified job 3000965: C=1 34.7 / C=16 374.9 / C=32 561.4 /
+# C=64 559.3 tok/s; cold start ~105 min — README "Verified benchmarks".
+# NO RELAY: compute reaches the public bootstrap directly (unlike JSC).
+# CONTAINER + NCCL: EDF hooks aws_ofi_nccl (netstack source=artifact bind-
+# mounts the +dl plugin + CXI provider; no IB verbs on clariden); engine.sh's
+# FI_CXI_*/NCCL_* tunables are := fallbacks that yield to the hook.
 # =============================================================================
 
 set -uo pipefail
 
 # ----------------------------------------------------- script + deploy dirs --
-# Locate the EDF ($OTELA_EDF_NAME.toml) regardless of the submit working
-# directory, so both submit styles work:
-#   - manual:  `cd <deploy-dir> && sbatch serve_*.sbatch`  (SLURM_SUBMIT_DIR
-#     is the deploy dir, so the EDF is a sibling there)
-#   - rcc:     `rcc job submit deployments/.../serve_*.sbatch` runs sbatch from
-#     the repo root (remote_dir), so SLURM_SUBMIT_DIR is the ROOT and the EDF
-#     lives in the deployments/llm/clariden/kimi-k3 subdirectory.
-# Without this search pyxis fails at the preflight srun with "failed to find a
-# readable environment file" (observed 2026-08-08 on jobs 3032795/3034577,
-# submitted from the root; the prior successful runs were submitted manually
-# from the subdir). Slurm copies the sbatch to /var/spool/slurmd/job<id>/ and
-# runs it from there, so ${BASH_SOURCE[0]} is the SPOOL copy and is NOT the
-# EDF dir — BASH_SOURCE is only a last-resort fallback for non-Slurm runs.
-# Keep ~/.edf on EDF_PATH so the pre-existing ~/.edf/kimi-k3.toml remains
-# usable (override with OTELA_EDF_NAME=kimi-k3).
+# Locate the EDF for both submit styles (manual from the recipe dir; rcc from
+# the repo root — the two jobs-3032795/3034577 failures are why this search
+# exists; README "Submit-style note"). BASH_SOURCE is the spool copy, not the
+# EDF dir — last resort only. ~/.edf kept for the legacy kimi-k3.toml.
 OTELA_EDF_NAME="${OTELA_EDF_NAME:-kimi-k3-clariden}"
 _edf_dir=""
 for _cand in \
@@ -150,14 +80,9 @@ export MODEL_PATH="${MODEL_PATH:-/capstor/store/cscs/swissai/infra01/hf_models/m
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3}"
 
 # ------------------------------------------------------------------- shape ----
-# WHY TP4 x PP<NNODES> is the default (verified on clariden):
-# TP4 keeps collectives on the intra-node 4-GH200 NVLink domain. PP<NNODES>
-# stages one pipeline layer per node, so only point-to-point send/recv crosses
-# Slingshot — stable and CUDA-graph-safe. The flat TP32 alternative (8 nodes x
-# 4 GPUs = 32) boots but every MoE allreduce goes cross-node over CXI without
-# graph capture (~1-5 tok/s measured; CG_DECODE must be `disabled`). See README
-# §2. Default PP_SIZE = NNODES (one stage/node); EP_SIZE = TP_SIZE (K3 requires
-# ep_size * moe_dp_size == tp_size).
+# TP4 x PP<NNODES>: allreduce stays on NVLink, only pipeline send/recv crosses
+# Slingshot (TP32 flat: ~1-5 tok/s, no graph capture — README §2).
+# PP_SIZE=NNODES (one stage/node); EP_SIZE=TP_SIZE (ep*moe_dp == tp).
 export NNODES="${NNODES:-$SLURM_JOB_NUM_NODES}"
 export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-$NNODES}"
@@ -170,17 +95,9 @@ export EP_SIZE="${EP_SIZE:-$TP_SIZE}"
 # /capstor/.../kimi-k3-presharded-tp4pp8/TP-4-sig-<hash>/.
 export PRESHARDED_ROOT_BASE="${PRESHARDED_ROOT_BASE:-/capstor/store/cscs/swissai/infra01/cold-start-experiments/kimi-k3-presharded}"
 export PRESHARDED_ROOT="${PRESHARDED_ROOT:-${PRESHARDED_ROOT_BASE}-tp${TP_SIZE}pp${PP_SIZE}}"
-# PRESHARDED_ENABLE=0 (default): load directly from $MODEL_PATH on Lustre via
-# the engine.sh fallback path (exec ENGINE_CMD, no servekit launch). The
-# presharded dump at $PRESHARDED_ROOT is currently UNREADABLE by xyao — the
-# .safetensors carry ACL mask::--- (owner yboughizane only; group infra01 /
-# csstaff / infra01adm all effective ---), so servekit's dd staging fails
-# with "Permission denied" and the engine's cache-MISS re-dump crashes
-# (FileNotFoundError in _tmp_presharding). Set PRESHARDED_ENABLE=1 once
-# yboughizane fixes the ACLs: setfacl -R -m m::r $PRESHARDED_ROOT
-# (or setfacl -R -m u:xyao:r ...). Without staging the full 1.5 TB model
-# cannot be copied to /dev/shm (334 GiB/node), so the fallback (Lustre load,
-# ~57 min) is the only working path until then.
+# PRESHARDED_ENABLE=0 (default): direct Lustre load — the presharded dump is
+# unreadable by xyao (ACL mask::---, owner yboughizane); README "Pre-sharded
+# checkpoint" has the setfacl fix. ~57 min Lustre load is the working path.
 export PRESHARDED_ENABLE="${PRESHARDED_ENABLE:-0}"
 # CUDA graph for DECODE only. TP4 x PP8 keeps every captured collective
 # intra-node on NVLink, so `full` works. If you switch to TP32 flat you MUST
@@ -190,14 +107,8 @@ export CG_DECODE="${CG_DECODE:-full}"
 # (W4A16). `auto` would pick Triton-Kernels, whose upcast_from_mxfp4() dequantizes
 # to bf16 and OOMs a 4-bit model on 96 GiB. (Same finding as the JSC recipe.)
 export MOE_BACKEND="${MOE_BACKEND:-marlin}"
-# Start modest; raise once the boot log reports the KV pool size. Bounds request
-# length, not the KV pool (KV pages are allocated on demand).
-# Request-length bound. Kimi-K3 supports up to max_position_embeddings=
-# 1048576 (1M). The KV pool is sized by MEM_FRAC, not this value: at 0.90 it
-# holds 3,732,608 tokens (8.01 GB/GPU, job 3000965) — hybrid model (mostly
-# linear/KDA attention, MLA-compressed full-attn layers), so even ~3
-# concurrent 1M-token requests fit. --context-length cannot be changed on a
-# running server; it only gates request admission.
+# Bounds request admission, not the KV pool (sized by MEM_FRAC: 3,732,608
+# tokens at 0.90 = 8.01 GB/GPU, job 3000965). Cannot change on a running server.
 export CTX_LEN="${CTX_LEN:-1048576}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
 # Slingshot high-speed NIC. Every clariden GH200 node exposes hsn0..hsn3 (one
@@ -205,85 +116,31 @@ export MEM_FRAC="${MEM_FRAC:-0.90}"
 # where SGLANG_HOST_IP is read from. The ofi plugin handles the data path over
 # CXI independently of this setting.
 export K3_NIC="${K3_NIC:-hsn0}"
-# PyTorch distributed init + Store.wait() timeout (seconds), AND — via
-# sglang's --dist-timeout -> init_process_group(timeout=...) -> the default
-# for every ProcessGroupNCCL collective — the NCCL operation-watchdog floor.
-# That floor is what killed clariden job 3018155 (fix 12): a PP pipeline
-# SEND (SeqNum=3678376, NumelIn=3584) stalled at 16:08:43 after 5h20m of
-# healthy serving, and the ProcessGroupNCCL watchdog tripped at 600 s
-# (sglang's DEFAULT dist-timeout, which this recipe used to NOT pass) and
-# aborted every rank ~5.5 h before the sglang scheduler watchdog (fix 11,
-# 3600 s) could ride it out. Default now 3600 so the NCCL floor matches the
-# scheduler watchdog; the SOFT_WATCHDOG_TIMEOUT dump (600 s, no crash) is
-# the first diagnostic. SGLANG_EXTRA_ARGS="--dist-timeout N" (which comes
-# later on the cmdline) overrides this for a shorter collective failure.
+# NCCL operation-watchdog floor (via init_process_group timeout): the 600 s
+# default killed job 3018155 ~5.5 h before the scheduler watchdog could ride
+# out a transient PP SEND stall (README fix 12). 3600 matches the scheduler
+# watchdog; SGLANG_EXTRA_ARGS="--dist-timeout N" overrides.
 export DIST_TIMEOUT="${DIST_TIMEOUT:-3600}"
 
 # --- Scheduler watchdog: survive transient PP-broadcast stalls ------------
-# sglang's HARD scheduler watchdog (ServerArgs.watchdog_timeout, default 300 s,
-# soft=False) raises on any forward batch that runs longer than the limit, and
-# that raise KILLS the whole distributed engine. Verified the hard way on
-# clariden job 3002366 (1M, TP4xPP8): the engine served healthy 04:20->12:24
-# (steady decode ~100 tok/s, cuda graph True, POST /v1 200 OK through 12:23:53),
-# then at 12:29:35 EVERY PP stage tripped simultaneously:
-#     [2026-08-05 12:29:35 PP2 TP3 EP3] Scheduler watchdog timeout
-#        (self.watchdog_timeout=300, self.soft=False)
-#     ... (PP2 TP1, PP7 TP2, PP7 TP3, ...) -> 16 tracebacks total.
-# The blocked scheduler thread was in torch.distributed.broadcast_pyobj ->
-# _broadcast_reqs_across_ranks (scheduler_components/request_receiver.py) ->
-# recv_requests -> event_loop_pp, i.e. the per-iteration PP request-metadata
-# broadcast hung >300 s. The raise tore the engine down; otela could not
-# announce LEFT ("WARN: otela did not announce LEFT") -> stale registry row.
-# Root cause of THAT particular stall is TODO(unverified) (Slingshot/CXI
-# hiccup after 8 h? a specific request?), but a >5-min hard kill on a
-# healthy 8 h-serving engine is the same anti-pattern this recipe already
-# rejects for weight loading (see the UNBALANCED_MODEL_LOADING_TIMEOUT_S
-# 480->3600 patch + README op-notes: "transient pauses are normal — check
-# before killing").
-#
-# FIX (flags verified via `sglang serve --help` in this aarch64 image):
-#   --watchdog-timeout      HARD: "the server will crash to prevent hanging".
-#                           Raised to 3600 s so a transient distributed
-#                           stall rides out (1 h matches the load-barrier
-#                           precedent); a true permanent hang still dies in
-#                           finite time instead of leaving a zombie serving.
-#   --soft-watchdog-timeout SOFT: "the server will dump information for
-#                           debugging". At 600 s it dumps a stack trace (like
-#                           the one that diagnosed 3002366) WITHOUT crashing,
-#                           so the next stall is diagnosable even when the
-#                           engine survives it. Keep soft < hard.
+# The HARD scheduler watchdog (default 300 s) tore down job 3002366 after 8 h
+# of healthy serving when one PP metadata broadcast stalled >300 s — a >5-min
+# hard kill on a healthy engine is the anti-pattern the load-barrier patch
+# already rejects (README fix 11 + op-notes). 3600 s hard / 600 s soft:
+# soft dumps a stack (diagnosed 3002366) without crashing; keep soft < hard.
 export WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-3600}"
 export SOFT_WATCHDOG_TIMEOUT="${SOFT_WATCHDOG_TIMEOUT:-600}"
 
 # --- NCCL process-group watchdog (fix 12: clariden job 3018155) ------------
-# Fix 11 raised only sglang's SCHEDULER watchdog. 3018155 proved that is NOT
-# the only watchdog that can tear the engine down on the same transient PP
-# stall: PyTorch's ProcessGroupNCCL::Watchdog has its own timeout, taken
-# from init_process_group(timeout=...) == sglang --dist-timeout (default
-# 600 s). With the recipe not passing --dist-timeout, the NCCL floor sat at
-# 600 s and fired ~5.5 h before the scheduler watchdog (3600 s) would have.
-# Symptom: "Watchdog caught collective operation timeout: WorkNCALL(...,
-# OpType=SEND, NumelIn=3584, Timeout(ms)=600000) ran for 600003 milliseconds"
-# -> "Fatal Python error: Aborted" on every rank -> "Connection closed by
-# peer [172.28.46.x]" cascade -> "WARN: otela did not announce LEFT". The
-# DuplicateTimeseries/OSError lines that follow are red herrings (a sglang
-# HTTP restart dying on the already-registered prometheus registry + the
-# quota-/users tmpdir cleanup of fix 8). Fix: pass --dist-timeout
-# $DIST_TIMEOUT (default 3600 above) so the NCCL floor matches the
-# scheduler watchdog; a transient send/recv stall now rides out at 10 min
-# and the SOFT_WATCHDOG_TIMEOUT dump is the first signal, not a kill.
+# The NCCL watchdog (init_process_group timeout == --dist-timeout) is a
+# SECOND killer on the same transient PP stall; it fired ~5.5 h before the
+# scheduler watchdog (README fix 12 has the full symptom chain). Passing
+# --dist-timeout aligns the floors; the soft dump is the first signal.
 
 # --- Weight-loading barrier tolerance (fixes clariden job 2999818) --------
-# sglang's dist_barrier_after_load calls dist.monitored_barrier(group=
-# tp_group, timeout=UNBALANCED_MODEL_LOADING_TIMEOUT_S, wait_all_ranks=True).
-# The constant is HARDCODED at 480 s (8 min) in load_model_utils.py. The
-# barrier is per-TP-group (GLOO, 4 ranks/node); only rank 0 has the timeout
-# — non-zero ranks block indefinitely waiting for rank 0. If the slowest
-# rank in a node happens to be non-zero, rank 0 waits 480 s then raises
-# ValueError, killing the whole job. The proven run (2920471) survived a
-# 1555 s within-PP1 spread ONLY because the slowest rank was rank 0 (no
-# wait). We monkey-patch the constant to 3600 s (1 h) via sitecustomize.py
-# so even a non-zero slow rank gets up to 1 h to finish loading from Lustre.
+# sglang hardcodes a 480 s post-load monitored_barrier (rank 0 only); Lustre
+# load spread up to 1555 s was observed (2920471 survived only because rank 0
+# was slowest). sitecustomize.py monkey-patches it to 3600 s (README).
 export UNBALANCED_MODEL_LOADING_TIMEOUT_S="${UNBALANCED_MODEL_LOADING_TIMEOUT_S:-3600}"
 # Distributed torchrun store (rank discovery) and the sglang HTTP port. Both
 # are EXPORTED here so srun carries them into the container, where engine.sh
@@ -340,30 +197,15 @@ export OTELA_UDP_PORT="${OTELA_UDP_PORT:-59820}"
 OTELA_STEP_NAME="${OTELA_STEP_NAME:-otela-worker-$SLURM_JOB_ID}"
 OTELA_SEED="${OTELA_SEED:-21}"
 OTELA_API_PORT="${OTELA_API_PORT:-18094}"
-# Cold start is ~105 min on a bad Lustre day (job 3000965: 17:29→19:14).
-# Weight loading from /capstor dominates (~80–132 s/shard × 96 shards).
-# 9000 s (150 min) gives 45 min margin; the distributed-load-barrier
-# monkey-patch (UNBALANCED_MODEL_LOADING_TIMEOUT_S=3600) is what actually
-# prevents the load barrier from killing slow PP groups, but the health
-# check must also wait long enough for the server to answer.
+# Cold start ~105 min on a bad Lustre day (~80-132 s/shard x 96); 9000 s
+# gives 45 min margin beyond the barrier patch.
 export HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-9000}"
 
 # ------------------------------------------------------------- servekit -----
-# servekit (github.com/eth-easl/servekit, BRANCH multinode-pp) provides:
-#   1. presharded launch: engine.sh wraps `python -m sglang.launch_server`
-#      with `servekit launch --overlap`, which stages this rank's pre-cut
-#      shard set (read out of the dump's own checksum.json, not a glob — PP
-#      stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to
-#      /dev/shm, rewrites --model-loader-extra-config to the staged copy,
-#      profiles each cold-start phase, and writes $RUNDIR/run.node<RANK>.json
-#      when the node reports ready (the head's row lands at full readiness).
-#   2. verification bench: after /health answers and BEFORE otela
-#      registration (so mesh traffic can't pollute the numbers), a fixed
-#      servekit bench runs inside the container on the head and is merged
-#      into the head's report. Protocol: meta/bench/README.md.
-# Pure stdlib -> run module-style from this checkout (PYTHONPATH); no pip
-# install inside the image. Missing checkout: run unwrapped from $MODEL_PATH
-# (no preshard, no profile, slower cold start).
+# servekit (eth-easl/servekit, branch multinode-pp): presharded launch
+# (per-rank /dev/shm staging + cold-start profile + run.node<R>.json ready
+# rows) and the pre-registration verification bench. Pure stdlib, module-style
+# from the checkout. Missing checkout: unwrapped run, slower cold start.
 export SERVEKIT_DIR="${SERVEKIT_DIR:-$DEPLOY_DIR/servekit}"
 export SERVEKIT_BENCH="${SERVEKIT_BENCH:-1}"              # 0 skips the auto-bench
 export SERVEKIT_BENCH_REQUESTS="${SERVEKIT_BENCH_REQUESTS:-64}"
@@ -377,13 +219,9 @@ PATCH_DIR="$DEPLOY_DIR/patches"
 mkdir -p "$DEPLOY_DIR/logs" "$RUNDIR" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/home" \
          "$PATCH_DIR"
 
-# sitecustomize.py is auto-imported by the Python interpreter at startup
-# (after PYTHONPATH is on sys.path) — BEFORE sglang's own code runs. This
-# lets us patch the module-level UNBALANCED_MODEL_LOADING_TIMEOUT_S in the
-# SAME process as `sglang serve`. $PATCH_DIR is on /capstor (mounted into
-# the container by the EDF). engine.sh prepends it to PYTHONPATH before
-# exec'ing sglang, because the EDF sets PYTHONPATH="" (clearing anything
-# the batch shell exported).
+# sitecustomize.py: auto-imported at interpreter startup (before sglang code)
+# — patches UNBALANCED_MODEL_LOADING_TIMEOUT_S in the serve process. $PATCH_DIR
+# is on /capstor; engine.sh re-adds it to PYTHONPATH (the EDF clears it).
 cat > "$PATCH_DIR/sitecustomize.py" <<'PYEOF'
 import os
 try:
@@ -433,13 +271,9 @@ echo "[$(date -Is)] hicache: enable=$HICACHE_ENABLE ratio=$HICACHE_RATIO policy=
 }
 
 # --- container preflight (1 node, no GPUs, ~20 s) -----------------------
-# Validates the EDF actually loads + the aarch64 image has the two modules
-# this recipe depends on, BEFORE launching 8 nodes. Both failures are real:
-#   - flash_mla missing -> prefill/decode fall back to FA3 -> ImportError on
-#     this image (job 2914289)
-#   - sgl_kernel.kvcacheio missing -> HiCache with --hicache-io-backend kernel
-#     would crash at first eviction
-# Runs via --overlap --gres=none so it doesn't consume the job's GPU allocation.
+# Validates the EDF + image modules BEFORE launching 8 nodes (flash_mla
+# missing -> FA3 ImportError, job 2914289; kvcacheio missing -> HiCache
+# crash at first eviction). --overlap --gres=none: no GPU consumption.
 echo "[$(date -Is)] container preflight (EDF=$OTELA_EDF_NAME) ..."
 if ! srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --environment="$OTELA_EDF_NAME" python3 -c '
@@ -481,13 +315,9 @@ SGLANG_HOST_IP="$(ip -o -4 addr show "$IFACE" 2>/dev/null | awk '{print $4}' | c
 [ -z "$SGLANG_HOST_IP" ] && SGLANG_HOST_IP="$(hostname -I | awk '{print $1}')"
 export SGLANG_HOST_IP
 # --- Slingshot NCCL tunables (reconciled with CSCS netstack hook) -----------
-# The EDF's com.hooks.aws_ofi_nccl hook (Clariden netstack source=artifact) sets
-# CXI/NCCL env at container start "to help prevent application stalls" (per
-# resource-hook docs). engine.sh runs INSIDE the container after the hook, so an
-# unconditional export would clobber those curated values. Use := so the hook's
-# values win when present; our values (tuned on clariden for K3 multi-node,
-# 2026-08) are only the fallback when the hook sets nothing. FI_MR_CACHE_MONITOR=
-# userfaultfd avoids the default monitor that mishandles CXI-registered memory.
+# The EDF's aws_ofi_nccl hook sets curated CXI/NCCL env at container start;
+# := lets the hook win, ours only fill gaps (K3-tuned, 2026-08).
+# FI_MR_CACHE_MONITOR=userfaultfd avoids mishandled CXI-registered memory.
 : "${NCCL_NET:=AWS Libfabric}" "${NCCL_CROSS_NIC:=1}" \
   "${FI_CXI_DISABLE_HOST_REGISTER:=1}" "${FI_CXI_DEFAULT_CQ_SIZE:=131072}" \
   "${FI_CXI_RDZV_THRESHOLD:=0}" "${FI_CXI_RDZV_GET_MIN:=0}" \
@@ -504,34 +334,24 @@ export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-IPv4}" GLOO_SOCKET_FAMILY="${GL
 echo "[rank $RANK] $(hostname) ip=$SGLANG_HOST_IP iface=$IFACE head=$HEAD_IP:$DIST_PORT"
 echo "[rank $RANK] shape: tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE cuda_graph_decode=$CG_DECODE"
 
-# sitecustomize.py (in $PATCH_DIR, on /capstor) patches
-# UNBALANCED_MODEL_LOADING_TIMEOUT_S at Python startup, BEFORE sglang runs.
-# The EDF sets PYTHONPATH="" so we must re-add it here, before exec sglang.
+# sitecustomize.py ($PATCH_DIR on /capstor) patches the load-barrier constant
+# at Python startup; PYTHONPATH is re-added here (the EDF clears it).
 export PYTHONPATH="${PATCH_DIR:-/capstor/scratch/cscs/xyao/kimi-k3/patches}:${PYTHONPATH:-}"
 
 # Verify the monkey-patch will take effect in this process tree
 python3 -c "import sglang.srt.model_executor.model_runner_components.load_model_utils as m; print('[rank '$RANK'] UNBALANCED_MODEL_LOADING_TIMEOUT_S =', m.UNBALANCED_MODEL_LOADING_TIMEOUT_S)" 2>/dev/null || true
 
-# servekit launch wraps the engine: it stages this rank's pre-sharded slice
-# (read out of the dump's own checksum.json — a glob can't express that PP
-# stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to /dev/shm,
-# rewrites --model-loader-extra-config to the staged copy, profiles each
-# cold-start phase, and writes $RUNDIR/run.node<RANK>.json when this node
-# reports ready (head: "The server is fired up..."; workers: sglang's
-# multi-node "Dummy health check server started" line — if a future image
-# stops printing it, workers stay unprofiled and the profiler would
-# terminate them at --timeout; check run.node<R>.json after image bumps).
-# --overlap is SAFE for presharded (unlike sharded_state): the loader will
-# not touch a dump without its READY sentinel, written last and only on a
-# clean stage — an engine that looks too early takes a cache MISS (a full
-# source load + re-dump into /dev/shm), not zeros; check overlap_gate in
-# run.node<R>.json before trusting a timing. servekit forwards SIGTERM to
-# the engine child and exits on child exit, so the batch shell's
-# --signal=B:TERM@120 + stop_otela trap still fire unchanged. --timeout
-# KILLS the engine on expiry, so it must track $HEALTH_TIMEOUT — never less.
-# ulimit -c 0 + unset BASH_ENV: the stager forks subshells; BASH_ENV would
-# run an nvidia-smi init in every one (16.89 -> 0.41 GB/s) and a 1.5 TB core
-# dump is never useful.
+# servekit launch: stages this rank's slice (from the dump's own checksum.json
+# — PP stages hold DIFFERENT files, a glob can't express that) to /dev/shm,
+# rewrites --model-loader-extra-config, profiles cold start, writes
+# run.node<RANK>.json at ready (workers keyed on sglang's "Dummy health check
+# server started" line — recheck run.node<R>.json after image bumps).
+# --overlap is SAFE for presharded: the READY sentinel is written last on a
+# clean stage (early readers take a cache MISS, not zeros; check overlap_gate).
+# servekit forwards SIGTERM and exits on child exit — the trap still fires.
+# --timeout KILLS the engine on expiry: must track $HEALTH_TIMEOUT.
+# ulimit -c 0 + unset BASH_ENV: BASH_ENV would nvidia-smi-init every stager
+# subshell (16.89 -> 0.41 GB/s); a 1.5 TB core dump is never useful.
 ulimit -c 0
 unset BASH_ENV
 
@@ -543,17 +363,11 @@ if [ "${HICACHE_ENABLE:-0}" = "1" ]; then
                  --hicache-io-backend "${HICACHE_IO_BACKEND:-kernel}")
 fi
 
-# NOTE: prefill AND decode must BOTH be flashmla. This aarch64 sgl_kernel ships
-# no FA3 (`flash_ops` absent, only `flash_mla`), and setting only one of the
-# three attention knobs cancels auto-resolution for the others -> prefill
-# silently falls back to FA3 and dies at ImportError (clariden job 2914289).
-# FlashMLABackend imports only sgl_kernel.flash_mla and inherits prefill from
-# FlashInferMLAAttnBackend. Do NOT apply --mamba-ssm-dtype bfloat16: SM90 uses
-# float32 KDA state (FlashInfer GDN bf16 is SM100+ only).
-# `python -m sglang.launch_server` (not `sglang serve`): the entry point
-# servekit's detect_framework + the presharded loader are validated against,
-# and the one the multinode-pp reference runs. The checkpoint's own
-# config.json (still read from --model-path) supplies the architecture.
+# Prefill AND decode must BOTH be flashmla: this aarch64 sgl_kernel ships no
+# FA3, and setting only one knob cancels auto-resolution for the others ->
+# silent FA3 fallback -> ImportError (job 2914289). No --mamba-ssm-dtype
+# bfloat16: SM90 KDA state is float32 (GDN bf16 is SM100+ only).
+# `python -m sglang.launch_server`: the entry point servekit validates.
 ENGINE_CMD=(python -m sglang.launch_server
   --trust-remote-code
   --model-path "$MODEL_PATH"
@@ -573,31 +387,10 @@ ENGINE_CMD=(python -m sglang.launch_server
 ENGINE_CMD+=(${HICACHE_ARGS[@]+"${HICACHE_ARGS[@]}"})
 ENGINE_CMD+=($SGLANG_EXTRA_ARGS)
 
-# servekit launch (PRESHARDED_ENABLE=1): stages this rank's pre-sharded slice
-# (read out of the dump's own checksum.json — a glob can't express that PP
-# stages hold DIFFERENT files) from $PRESHARDED_ROOT (Lustre) to /dev/shm,
-# rewrites --model-loader-extra-config to the staged copy, profiles each
-# cold-start phase, and writes $RUNDIR/run.node<RANK>.json when this node
-# reports ready (head: "The server is fired up..."; workers: sglang's
-# multi-node "Dummy health check server started" line — if a future image
-# stops printing it, workers stay unprofiled and the profiler would
-# terminate them at --timeout; check run.node<R>.json after image bumps).
-# --overlap is SAFE for presharded (unlike sharded_state): the loader will
-# not touch a dump without its READY sentinel, written last and only on a
-# clean stage — an engine that looks too early takes a cache MISS (a full
-# source load + re-dump into /dev/shm), not zeros; check overlap_gate in
-# run.node<R>.json before trusting a timing. servekit forwards SIGTERM to
-# the engine child and exits on child exit, so the batch shell's
-# --signal=B:TERM@120 + stop_otela trap still fire unchanged. --timeout
-# KILLS the engine on expiry, so it must track $HEALTH_TIMEOUT — never less.
-#
-# PRESHARDED_ENABLE=0 (default): skip servekit launch entirely and exec the
-# engine directly. The presharded dump is currently UNREADABLE by xyao (ACL
-# mask::---), so servekit staging fails and the re-dump crashes (see
-# PRESHARDED_ENABLE above). Loading directly from $MODEL_PATH on Lustre is
-# the proven path (jobs 3000965/3002366/3018155/3035026 each served ~970
-# requests before the PP-pipeline stall). srun forwards SIGTERM to the
-# engine child, so the --signal=B:TERM@120 + stop_otela trap still fire.
+# PRESHARDED_ENABLE=0 (default): skip servekit launch and exec the engine
+# directly — the proven path (jobs 3000965/3002366/3018155/3035026 each served
+# ~970 requests before the PP-pipeline stall; dump ACLs broken, README).
+# srun forwards SIGTERM to the engine child — the trap still fires.
 if [ -d "${SERVEKIT_DIR:-}/src/servekit" ] && [ "${PRESHARDED_ENABLE:-0}" = "1" ]; then
   export PYTHONPATH="${SERVEKIT_DIR}/src:${PYTHONPATH:-}"
   ENGINE_CMD+=(--load-format presharded
@@ -619,35 +412,19 @@ ENGINE
 chmod +x "$RUNDIR/engine.sh"
 
 # ============================================================ otela worker ====
-# Runs INSIDE the kimi-k3 container on the HEAD node (via srun --overlap
-# --environment). Why inside the container, not the host: the enroot
-# container SHARES the host netns (verified: a 2nd container on the head
-# reaches the engine on localhost:$SERVE_PORT, and the host's `ss` sees the
-# container's listening socket — job 2999317), so otela COULD reach sglang
-# from the host too. But the EDF sets HOME=/capstor/.../home (on /capstor,
-# not the quota-limited /users/xyao NFS home), and otela (sai-v0.0.6)
-# resolves its libp2p identity + badger DB via os/user.Current() HOME. A
-# host otela would inherit /users/xyao and, per the JSC recipe, freeze on
-# stale NFS handles. One peer only: the DNT lists one row per peer, and
-# launching on every node would over-register the same single endpoint.
+# Runs INSIDE the container on the HEAD (netns is shared, so it could run on
+# the host — job 2999317 — but the EDF's HOME is on /capstor; a host otela
+# inherits the quota-limited /users/xyao NFS home and freezes on stale
+# handles, per the JSC recipe). One worker only — one endpoint to register.
 OTELA_CFG_DIR="$DEPLOY_DIR/otela"
 OTELA_CFG="$OTELA_CFG_DIR/cfg.yaml"
 mkdir -p "$OTELA_CFG_DIR"
-# otela is sai-v0.0.6 (arm64). Its CLI differs from the x86 opentela-v0.2.2
-# the Beverin scripts use:
-#   - a multiaddr goes to --bootstrap.static (NOT --bootstrap.addr, which
-#     expects an HTTP bootstraps-list URL — the default is an http:// URL)
-#   - --label is supported
-#   - there is NO --subprocess flag (we use the JSC separate-worker topology:
-#     one engine srun in the foreground + one otela srun on the head).
-#
-# CRITICAL: otela requires a proper cfg.yaml with `loglevel: debug`,
-# `reachability: private`, `role: worker`, and `seed`. Without these it
-# appears to "hang" after "AXIOM_DATASET not set, tracing disabled" — but it
-# is actually working, just at INFO level which stops logging during CRDT
-# sync. The JSC recipe (v0.2.3, x86) writes the same config file; verified on
-# clariden job 3000965: with the config file, otela registered the LLM service
-# and synced 2000+ peers within 45 s. Without it, 90 s of silence.
+# otela is sai-v0.0.6 (arm64); CLI differs from Beverin's x86 v0.2.2: the
+# multiaddr goes to --bootstrap.static (--bootstrap.addr expects an HTTP
+# bootstraps-list URL), no --subprocess (JSC separate-worker topology).
+# The cfg.yaml (loglevel debug / reachability private / role worker / seed)
+# is CRITICAL — without it otela silently does nothing during CRDT sync
+# (verified job 3000965: with it, registered + 2000 peers in 45 s).
 cat > "$OTELA_CFG" <<CFG
 name: clariden-worker-$SLURM_JOB_ID
 seed: "$OTELA_SEED"
@@ -683,11 +460,8 @@ OTELA
 chmod +x "$RUNDIR/otela.sh"
 
 # ------------------------------------------------------------- lifecycle -----
-# otela only leaves the registry cleanly on SIGINT/SIGTERM (AnnounceLeave). If
-# it is SIGKILLed the head keeps a `connected: true` row (the staleness sweep
-# skips peers that registered a service) and round-robins real traffic into a
-# dead endpoint. Signal the STEP (srun does not reliably relay signals to the
-# task) and wait for it to actually exit.
+# otela publishes LEFT only on SIGTERM/INT; SIGKILL leaves a stale
+# connected:true row in the head's round-robin. Signal the STEP and wait.
 _OTELA_STOPPED=0
 stop_otela() {
   [ "$_OTELA_STOPPED" = 1 ] && return 0   # trap fires for both TERM and EXIT

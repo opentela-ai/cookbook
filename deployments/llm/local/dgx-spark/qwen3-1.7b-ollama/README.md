@@ -7,6 +7,21 @@ v13 libs that include sm_121), and registers it on OpenTela as a standalone
 `otela` sidecar. There is no scheduler and no container: the binary and the
 pulled model blobs live under `./run/` next to the scripts.
 
+## Start here
+
+On the DGX Spark host:
+
+```bash
+bash download_ollama.sh               # once: ollama arm64 binary → ./run/ollama/
+bash download_otela.sh                # once: otela v0.2.3 arm64 → ./run/otela/
+bash serve_qwen3_ollama.sh            # starts ollama, pulls the model, prints READY
+bash register_qwen3_otela.sh daemon   # otela sidecar → mesh
+# or all four in one shot (skips what already exists):  bash up.sh
+
+curl -s http://localhost:11434/v1/models | python3 -m json.tool   # engine up
+tail -f ./run/otela/otela.log                                     # sidecar: look for "connected: true"
+```
+
 ## Why this site / this stack
 
 A single GB10 in a workstation is the whole point — no cluster, no Slurm, no
@@ -77,6 +92,7 @@ no tuning is required. Ollama's vram-based default context is 262,144 tokens
 | `download_otela.sh` | Fetch the OpenTela `opentela-arm64` v0.2.3 binary into `./run/otela/otela` |
 | `serve_qwen3_ollama.sh` | Start/stop Ollama, pull `qwen3:1.7b`, create the `ollama/qwen3:1.7b` alias, wait for `/v1/models`, write `last_service.env` |
 | `register_qwen3_otela.sh` | Start/stop/status the standalone `otela` sidecar that publishes the `llm` service |
+| `up.sh` | One-shot bring-up: download binaries if missing → serve → register (skips steps whose output exists) |
 
 ## Run
 
