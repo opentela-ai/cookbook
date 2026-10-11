@@ -290,8 +290,9 @@ rcc --profile bristen job tail <JOBID> -f
 
 Once the engine is healthy, register it on the public OpenTela bootstrap.
 The sbatch already defaults to `SMOKE=1` (no otela); set `SMOKE=0` to register.
-The sbatch's otela invocation uses the **v0.2.4** form
-(`$OTELA_DIR/opentela-v0.2.4`); the older manual snippet that used
+The sbatch's otela invocation uses the **official-release flag form**
+(`$OTELA_DIR/opentela-amd64-latest`, staged by `up.sh` via
+`meta/common/download_otela.sh`); the older manual snippet that used
 sai-v0.0.6-style flags (`--service.type`, `--service.llm.endpoint`,
 `--api-port`, `--tcp-port`) is gone — **those flags never existed**, and
 `--subprocess` starts a new LLM instead of registering a running one. The

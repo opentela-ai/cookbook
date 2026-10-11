@@ -84,10 +84,10 @@ engine itself runs unsupervised in the container; a standalone `otela` process
 on the DGX Spark host advertises its `llm` service). Same topology and same
 otela binary/version as the qwen36 recipe:
 
-- **Binary:** `./run/otela/otela` — OpenTela `otela`, v0.2.3 (arm64). On this
-  host, copy from the sibling recipe:
-  `cp ../qwen36-35b-a3b/run/otela/otela run/otela/otela`
-  (or `OTELA_BIN=../qwen36-35b-a3b/run/otela/otela`).
+- **Binary:** `./run/otela/opentela-arm64-latest` — latest official OpenTela
+  `opentela-arm64` release (arm64), staged by `up.sh` via the shared
+  `meta/common/download_otela.sh`; or copy from the sibling recipe
+  (`OTELA_BIN=../qwen36-35b-a3b/run/otela/opentela-arm64-latest`).
 - **Bootstrap:** `/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7`
 - **Gateway:** `http://140.238.223.116:8092`
 - **Peer (this bring-up):** `QmRxxqovNmQiHxaB6fM1DA57J1fk3LumeAxBsGaPuwkjkU`,
@@ -111,8 +111,8 @@ otela binary/version as the qwen36 recipe:
 ## Run
 
 ```bash
-# 0. (once) stage the otela binary next to this recipe
-mkdir -p run/otela && cp ../qwen36-35b-a3b/run/otela/otela run/otela/otela
+# 0. (once) stage the otela binary next to this recipe (latest official release)
+mkdir -p run/otela && OTELA_DIR="$PWD/run/otela" bash ../../../../../meta/common/download_otela.sh
 
 # 1. start the engine (waits for readiness, ~7 min for a cold FP8 load)
 bash serve_qwen38_dgx_spark.sh
@@ -237,7 +237,7 @@ verified), `REASONING_PARSER` (`qwen3`), `TOOL_CALL_PARSER`
 
 ### `register_qwen38_otela.sh`
 `DEPLOY_DIR` (default `./run`), `OTELA_DIR` (default `$DEPLOY_DIR/otela`),
-`OTELA_BIN` (default `$OTELA_DIR/otela`), `OPENTELA_CFG_DIR`, `PIDFILE`,
+`OTELA_BIN` (default `$OTELA_DIR/opentela-arm64-latest`), `OPENTELA_CFG_DIR`, `PIDFILE`,
 `LOGFILE`, `OPENTELA_BOOTSTRAP`, `SERVE_PORT` (30000), `SERVED_MODEL_ID`
 (`Qwen/Qwen3.8-27B-FP8`), `OPENTELA_SERVICE_NAME` (`llm`), `OPENTELA_SEED`
 (`0`; vestigial in v0.2.3 — peer ID comes from `$CFG_DIR/keys/id`, not

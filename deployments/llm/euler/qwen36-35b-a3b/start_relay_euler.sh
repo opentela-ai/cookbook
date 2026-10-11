@@ -19,14 +19,17 @@
 set -euo pipefail
 
 DEPLOY_DIR="${DEPLOY_DIR:-/cluster/scratch/$USER/otela-qwen36}"
-BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/otela-v0.2.3}"
+BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/opentela-amd64-latest}"
 CFG="${RELAY_CFG:-$HOME/opentela/relay.cfg.yaml}"
 SESSION="opentela-relay"
 LOGFILE="$DEPLOY_DIR/logs/relay-$(date +%s).log"
 LATEST_LOG="$DEPLOY_DIR/logs/relay-latest.log"
 
 mkdir -p "$DEPLOY_DIR/logs"
-[ -x "$BINARY" ] || { echo "FATAL: otela binary not found: $BINARY" >&2; exit 1; }
+[ -x "$BINARY" ] || { echo "FATAL: otela binary not found: $BINARY" >&2
+  echo "       Stage the latest official OpenTela (amd64) — from the repo checkout:" >&2
+  echo "         bash deployments/llm/euler/qwen36-35b-a3b/up.sh   # runs meta/common/download_otela.sh" >&2
+  exit 1; }
 [ -f "$CFG" ]   || { echo "FATAL: relay config not found: $CFG" >&2
   echo "       A relay cfg.yaml (role: relay, tcpport, udpport, bootstrap)" >&2
   echo "       must exist. See the README for the expected shape." >&2

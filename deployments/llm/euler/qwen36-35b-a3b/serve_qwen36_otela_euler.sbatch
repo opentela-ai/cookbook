@@ -27,6 +27,23 @@
 
 set -uo pipefail
 
+# --------------------------------------------------------------------- lib ---
+# Shared helpers from the repo's meta/common/ — lib.sh (stop_otela),
+# download_otela.sh; per-recipe copies were removed. Walk up from the submit
+# dir (BASH_SOURCE is the spool copy — last resort only).
+COMMON_DIR=""
+for _root in "${SLURM_SUBMIT_DIR:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+  [ -n "$_root" ] || continue
+  _d="$_root"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$_d/meta/common/lib.sh" ] && { COMMON_DIR="$_d/meta/common"; break 2; }
+    _d="$(dirname "$_d")"
+  done
+done
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above ${SLURM_SUBMIT_DIR:-<unset>} — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+unset _root _d
+
 # ---------------------------------------------------------------- deployment --
 # All runtime state lives under /cluster/scratch (home is over quota).
 # /cluster/scratch/$USER/otela-qwen36 is pre-created by the operator before
@@ -37,9 +54,10 @@ export MODEL="${MODEL:-$DEPLOY_DIR/model/Qwen3.6-35B-A3B-FP8}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.6-35B-A3B-FP8}"
 
 # ------------------------------------------------------------------- otela ----
-# OpenTela v0.2.3 (commit e9d1696) — the old sai-v0.0.6 entry is NOT used.
-# Download + relay config: README.md → Prerequisites.
-OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/bin/otela-v0.2.3}"
+# Official OpenTela release (amd64), staged by up.sh via
+# meta/common/download_otela.sh (latest release; OTELA_VERSION pins a tag).
+# Relay config: README.md → Prerequisites.
+OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/bin/opentela-amd64-latest}"
 # The shared login-node relay (started by start_relay_euler.sh). An explicit
 # $OTELA_RELAY_ADDR or a non-empty $RELAY_ADDR_FILE overrides this default.
 # Verified: /ip4/129.132.93.77/tcp/18905/p2p/QmPAfjhRSrnRJn526V4QEHmoVASYMCAxCuVxgrQtmEM8n
@@ -98,8 +116,9 @@ echo "[$(date -Is)] model=$MODEL  served_as=$SERVED_MODEL_NAME"
   echo "       config.json, chat_template.jinja, …) to $MODEL, or set MODEL." >&2
   exit 1; }
 [ -x "$OTELA_BIN" ] || { echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Obtain the OpenTela 'otela' binary and place it at $OTELA_BIN," >&2
-  echo "       or set OTELA_BIN to an existing path." >&2
+  echo "       bash up.sh stages the latest official OpenTela (amd64) automatically:" >&2
+  echo "         OTELA_DIR=$DEPLOY_DIR/bin OTELA_ARCH=amd64 bash ../../../../meta/common/download_otela.sh" >&2
+  echo "       (or set OTELA_BIN to an existing path)." >&2
   exit 1; }
 
 # ----------------------------------------------------------- resolve relay ----
@@ -201,26 +220,10 @@ chmod +x "$RUNDIR/otela.sh"
 # SIGKILLed peer stays `connected: true` in the registry and the head
 # round-robins traffic into a dead endpoint. Signal the child and wait for it
 # to actually exit.
+# stop_otela comes from meta/common/lib.sh (sourced above) — PID mode here:
+# the worker runs as a background child, so _OTELA_PID gets kill -TERM and a
+# 20 s grace (AnnounceLeave -> CRDT drain ~10 s; KillWait is the outer bound).
 _OTELA_PID=""
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0
-  _OTELA_STOPPED=1
-  if [ -n "$_OTELA_PID" ] && kill -0 "$_OTELA_PID" 2>/dev/null; then
-    echo "[$(date -Is)] stopping otela worker (pid $_OTELA_PID)"
-    kill -TERM "$_OTELA_PID" 2>/dev/null
-    # Wait up to 20 s for graceful leave (AnnounceLeave -> CRDT drain ~10 s).
-    # --signal=B:TERM@120 covers wall-time expiry; on scancel the only grace
-    # is KillWait (default 30 s), so 20 s leaves margin before SIGKILL.
-    for _ in $(seq 1 20); do
-      kill -0 "$_OTELA_PID" 2>/dev/null || break
-      sleep 1
-    done
-    grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-      && echo "[$(date -Is)] otela: graceful leave confirmed" \
-      || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-  fi
-}
 trap 'stop_otela' EXIT TERM INT
 
 # Start the engine in the foreground (job lifetime == engine lifetime).
@@ -241,6 +244,7 @@ ENGINE_PID=$!
   echo "[$(date -Is)] engine healthy — starting otela worker"
   bash "$RUNDIR/otela.sh" >"$RUNDIR/otela.log" 2>&1 &
   _OTELA_PID=$!
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
   echo "[$(date -Is)] otela worker started (pid $_OTELA_PID)"
   # Wait for the worker; if it exits, the trap will handle cleanup.
   wait "$_OTELA_PID"

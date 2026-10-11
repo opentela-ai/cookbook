@@ -66,10 +66,29 @@ export K3_NIC="${K3_NIC:-ib0}"                              # confirmed present 
 # collective timeout -> DuplicateTimeseries -> server crash (§8).
 export ENABLE_METRICS="${ENABLE_METRICS:-}"
 
-# -------------------------------------------------------------------- otela ---
-# Worker only receives hops; official v0.2.4 carries the P2PForwardHandler fix (§6).
+# --------------------------------------------------------------------- lib ---
+# Shared helpers from the repo's meta/common/ — lib.sh (stop_otela),
+# download_otela.sh; per-recipe copies were removed. Walk up from the submit
+# dir (BASH_SOURCE is the spool copy — last resort only).
+COMMON_DIR=""
+for _root in "${SLURM_SUBMIT_DIR:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+  [ -n "$_root" ] || continue
+  _d="$_root"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$_d/meta/common/lib.sh" ] && { COMMON_DIR="$_d/meta/common"; break 2; }
+    _d="$(dirname "$_d")"
+  done
+done
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above ${SLURM_SUBMIT_DIR:-<unset>} — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+unset _root _d
+# --------------------------------------------------------------------- otela ---
+# Official OpenTela release (arm64), staged on the login node by up.sh via
+# meta/common/download_otela.sh (latest release; rollback = OTELA_VERSION pin).
+# OTELA_VERSION/OTELA_URL below only back the emergency in-sbatch curl
+# fallback (compute nodes have no egress — usually prints staging commands).
 OTELA_VERSION="${OTELA_VERSION:-v0.2.4}"
-OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/opentela-arm64}"
+OTELA_BIN="${OTELA_BIN:-$DEPLOY_DIR/opentela-arm64-latest}"
 OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/$OTELA_VERSION/opentela-arm64}"
 OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 OTELA_SEED="${OTELA_SEED:-21}"
@@ -253,29 +272,7 @@ chmod +x "$RUNDIR/otela.sh"
 # otela announces LEFT only on SIGTERM/INT; SIGKILL leaves a stale
 # connected:true row that round-robins traffic into a dead endpoint (§7).
 # The worker is an srun STEP because srun does not reliably relay signals to
-# tasks — scancel the step instead.
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0        # bash runs EXIT after TERM: fire once
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it (no LEFT will be published)." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  for _ in $(seq 1 20); do                     # 20 s fuse < KillWait 30 s (§7)
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# tasks — scancel the step instead. stop_otela comes from meta/common/lib.sh.
 trap 'stop_otela' EXIT TERM INT
 
 # ------------------------------------------------------------- registration ---
@@ -306,6 +303,7 @@ trap 'stop_otela' EXIT TERM INT
   echo "[$(date -Is)] engine healthy — starting otela worker on $HEAD"
   srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$HEAD" \
        -J "$OTELA_STEP_NAME" bash "$RUNDIR/otela.sh" >"$RUNDIR/otela.log" 2>&1
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
 ) &
 
 # ------------------------------------------------------------- JIT pre-warm ---

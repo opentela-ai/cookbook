@@ -161,7 +161,7 @@ fi
 # container on the head so its HOME (EDF -> /capstor, not quota /users) is
 # correct for its libp2p identity + badger DB.
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela}"
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-amd64-latest}"   # official release; up.sh stages via meta/common/download_otela.sh
 # Direct-mesh bootstrap (an Alps OpenTela peer). No relay needed.
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJkCfotDzbFE5uoTsXD4GRyPHjzZC1f2yAGLoeBMn9}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
@@ -247,8 +247,9 @@ echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
 [ -d "$MODEL_PATH" ] || { echo "FATAL: weights not found: $MODEL_PATH" >&2; exit 1; }
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage the verified sai-dialect x86_64 build, e.g.:" >&2
-  echo "         mkdir -p $OTELA_DIR && cp <x86_64 otela> $OTELA_BIN && chmod +x $OTELA_BIN" >&2
+  echo "       bash up.sh stages the latest official OpenTela (amd64) automatically" >&2
+  echo "         OTELA_DIR=$OTELA_DIR OTELA_ARCH=amd64 bash ../../../../meta/common/download_otela.sh" >&2
+  echo "       (Override with OTELA_BIN=<path>; /bin/true for a pure benchmark)" >&2
   exit 1
 }
 [ -f "$SCRIPT_DIR/k3_patch.py" ] || {
@@ -263,19 +264,22 @@ echo "[$(date -Is)] started=$(date --iso-8601=seconds)"
   echo "       The recipe bundle (sbatch + kimi-k3-vllm.toml + k3_patch.py + sitecustomize.py + gen_correctness.py)." >&2
   exit 1
 }
-# gen_correctness.py resolves via directory walk-up to the shared canonical
-# copy in meta/common/ (like the other recipes) — no per-recipe copy.
-GEN_CORRECTNESS=""
+# gen_correctness.py + stop_otela resolve via the shared meta/common/ lib —
+# no per-recipe copies. Walk up from the recipe dir to find it.
+COMMON_DIR=""
 _d="$SCRIPT_DIR"
 while [ "$_d" != "/" ]; do
-  if [ -f "$_d/gen_correctness.py" ]; then GEN_CORRECTNESS="$_d/gen_correctness.py"; break; fi
+  if [ -f "$_d/meta/common/lib.sh" ]; then COMMON_DIR="$_d/meta/common"; break; fi
   _d="$(dirname "$_d")"
 done
-[ -n "$GEN_CORRECTNESS" ] || {
-  echo "FATAL: gen_correctness.py not found walking up from $SCRIPT_DIR." >&2
-  echo "       The canonical copy lives in meta/common/ in the repo root." >&2
+[ -n "$COMMON_DIR" ] || {
+  echo "FATAL: meta/common/lib.sh not found walking up from $SCRIPT_DIR." >&2
+  echo "       The canonical copies live in meta/common/ in the repo root." >&2
   exit 1
 }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+GEN_CORRECTNESS="$COMMON_DIR/gen_correctness.py"
+[ -f "$GEN_CORRECTNESS" ] || { echo "FATAL: $GEN_CORRECTNESS missing" >&2; exit 1; }
 [ -f "$SCRIPT_DIR/kimi-k3-vllm.toml" ] || {
   echo "FATAL: EDF not found next to this sbatch: $SCRIPT_DIR/kimi-k3-vllm.toml" >&2
   exit 1;
@@ -653,35 +657,7 @@ chmod +x "$RUNDIR/otela.sh"
 # otela leaves the registry cleanly only on SIGTERM (AnnounceLeave); SIGKILL
 # leaves a stale connected:true row round-robining traffic into a dead
 # endpoint. --signal=B:TERM@120 lets this trap scancel the otela STEP with
-# TERM and wait for it to exit.
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0   # trap fires for both TERM and EXIT
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
-    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
-    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  # 20 s: --signal=B:TERM@120 covers wall-time expiry, but on the `scancel`
-  # path the only grace is KillWait (default 30 s). otela needs ~10 s to shut
-  # down (AnnounceLeave -> 5 s CRDT drain -> srv.Shutdown), so 20 s leaves
-  # margin and still finishes before SIGKILL.
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# TERM and wait for it to exit. stop_otela comes from meta/common/lib.sh.
 trap 'stop_otela' EXIT TERM INT
 
 # Registration gate: wait for /health AND a real token. The wait + probe run
@@ -784,6 +760,7 @@ trap 'stop_otela' EXIT TERM INT
   srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
        -w "$HEAD" --environment="$OTELA_EDF_NAME" -J "$OTELA_STEP_NAME" \
        bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
 ) &
 
 # Record endpoints for all nodes before srun starts so the metadata is

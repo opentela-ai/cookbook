@@ -44,16 +44,17 @@ set -euo pipefail
 # independent relay with its own peer ID).
 PROJECT="${PROJECT:-reformo}"
 DEPLOY_DIR="${DEPLOY_DIR:-/e/scratch/$PROJECT/$USER/otela-relay}"
-BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/opentela}"
-# v0.2.4 (latest release, 2026-08-25) contains the libp2p self-dial fix
-# (commit 7f421838c5, merged before v0.2.3), so the official arm64 binary
-# works as a relay out of the box — no locally-patched build needed (the
-# older two-hop recipe here predated the fix and pinned v0.2.2 + relayfix).
-# NB the v0.2.x asset is named `opentela-arm64`, NOT `otela-arm64` (which
-# 404s) or `ocf-arm64` (<= v0.1.11); `releases/latest` drifts, so this pins
-# an explicit tag. Stage once on /e/scratch (login nodes have egress;
-# compute nodes do not).
-OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/v0.2.4/opentela-arm64}"
+BINARY="${OTELA_BIN:-$DEPLOY_DIR/bin/opentela-arm64-latest}"
+# The official arm64 binary works as a relay out of the box (the libp2p
+# self-dial fix landed in v0.2.4; the older two-hop recipe here predated it
+# and pinned v0.2.2 + relayfix). NB the v0.2.x asset is named
+# `opentela-arm64`, NOT `otela-arm64` (404s) or `ocf-arm64` (<= v0.1.11).
+# `releases/latest/download/<asset>` always serves the newest release — the
+# fetched file lands at $BINARY and every future re-fetch (delete $BINARY, or
+# override \$OTELA_URL with a release/tag URL to pin) picks up that newest
+# release. Stage once on /e/scratch (login nodes have egress; compute nodes
+# do not).
+OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/latest/download/opentela-arm64}"
 # The tmux session is per-UID by name too. tmux sockets are already
 # per-uid (one user cannot see or kill another's session), but a distinct
 # name keeps `tmux ls` and the stop logic unambiguous when several relays

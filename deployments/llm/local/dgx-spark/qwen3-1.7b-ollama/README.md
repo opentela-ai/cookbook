@@ -13,9 +13,11 @@ On the DGX Spark host:
 
 ```bash
 bash download_ollama.sh               # once: ollama arm64 binary → ./run/ollama/
-bash download_otela.sh                # once: otela v0.2.3 arm64 → ./run/otela/
 bash serve_qwen3_ollama.sh            # starts ollama, pulls the model, prints READY
 bash register_qwen3_otela.sh daemon   # otela sidecar → mesh
+
+# or everything at once (also stages the latest official OpenTela arm64):
+bash up.sh
 # or all four in one shot (skips what already exists):  bash up.sh
 
 curl -s http://localhost:11434/v1/models | python3 -m json.tool   # engine up
@@ -60,7 +62,7 @@ All relative to the recipe directory; every one is overridable via env.
 | What | Default | How it is obtained |
 |------|---------|--------------------|
 | Ollama binary | `./run/ollama/bin/ollama` | `bash download_ollama.sh` fetches the v0.32.5 arm64 release (1.5 GB `.tar.zst`, bundles CUDA v12 + v13 libs). Or set `OLLAMA_BIN` to an existing install. |
-| `otela` binary | `./run/otela/otela` | OpenTela `opentela-arm64` v0.2.3 (commit e9d1696, official release). `bash download_otela.sh` fetches it; or set `OTELA_BIN`. |
+| `otela` binary | `./run/otela/opentela-arm64-latest` | Latest official OpenTela `opentela-arm64` release, staged by `up.sh` via the shared `meta/common/download_otela.sh` (`OTELA_VERSION=<tag>` pins one); or set `OTELA_BIN`. |
 | Model | pulled automatically | `qwen3:1.7b` (1.4 GB) is pulled from ollama.com by `serve_qwen3_ollama.sh` on first run. |
 
 ## Architecture
@@ -89,7 +91,6 @@ no tuning is required. Ollama's vram-based default context is 262,144 tokens
 | File | Purpose |
 |------|---------|
 | `download_ollama.sh` | Fetch + extract the Ollama arm64 binary (with bundled CUDA libs) into `./run/ollama/` |
-| `download_otela.sh` | Fetch the OpenTela `opentela-arm64` v0.2.3 binary into `./run/otela/otela` |
 | `serve_qwen3_ollama.sh` | Start/stop Ollama, pull `qwen3:1.7b`, create the `ollama/qwen3:1.7b` alias, wait for `/v1/models`, write `last_service.env` |
 | `register_qwen3_otela.sh` | Start/stop/status the standalone `otela` sidecar that publishes the `llm` service |
 | `up.sh` | One-shot bring-up: download binaries if missing → serve → register (skips steps whose output exists) |
@@ -99,7 +100,7 @@ no tuning is required. Ollama's vram-based default context is 262,144 tokens
 ```bash
 # 1. one-time: fetch the two binaries
 bash download_ollama.sh
-bash download_otela.sh
+OTELA_DIR="$PWD/run/otela" bash ../../../../../meta/common/download_otela.sh
 
 # 2. start Ollama + pull model + create alias (waits for readiness)
 bash serve_qwen3_ollama.sh

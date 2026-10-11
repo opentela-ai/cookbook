@@ -13,4 +13,9 @@ IMAGE_DEFAULT="/e/scratch/$PROJECT/$USER/glm-53-flash/images/glm-5.3-flash.sif"
 # deployments/llm/jsc/kimi-k3/start_relay_jsc.sh); idempotent.
 RELAY="${RELAY:-/e/scratch/$PROJECT/$USER/otela-relay/start_relay_jsc.sh}"
 if [ -f "$RELAY" ]; then bash "$RELAY"; else echo "NOTE: relay script not found at $RELAY (already running?); continuing" >&2; fi
+# Stage the latest official OpenTela (arm64) on /e/scratch — best effort: a
+# stale staged binary still serves; a missing one FATALs in the sbatch preflight.
+OTELA_DIR="${OTELA_DIR:-/e/scratch/$PROJECT/$USER/otela-llm}" OTELA_ARCH=arm64 \
+  bash ../../../../meta/common/download_otela.sh \
+  || echo "[up.sh] WARN: OpenTela latest-check failed (no egress?); submitting with the staged binary"
 sbatch "$@" serve_glm_53_flash_otela_jsc.sbatch

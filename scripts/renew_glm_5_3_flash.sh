@@ -24,15 +24,15 @@
 #   --handover       like --watch, but once the new job is confirmed live it
 #                    scancels the expiring running job for a zero-gap swap
 #   --force          submit even when a job already covers the window
-#   --update-otela   push download_otela.sh to clariden and run it there to
-#                    stage the pinned official OpenTela release (v0.2.6 by
-#                    default — the first release with OpenTela Cloud account
-#                    linking via deploy keys; OTELA_VERSION=latest for the
-#                    newest tag), then exit — does NOT submit. The recipe
-#                    pins $OTELA_DIR/opentela-arm64-v0.2.6; rollback = the
-#                    previous official release (OTELA_VERSION=v0.2.5, then
-#                    OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5). The
-#                    legacy sai-v0.0.6 fork is retired and unreferenced.
+#   --update-otela   push meta/common/download_otela.sh to clariden and run it
+#                    there to stage the LATEST official OpenTela release
+#                    (OTELA_VERSION=<tag> pins one), then exit — does NOT
+#                    submit. The recipe pins
+#                    $OTELA_DIR/opentela-arm64-latest (repointed by the
+#                    stager); rollback = the previous official release
+#                    (OTELA_VERSION=v0.2.5, or pin OTELA_BIN to the old
+#                    versioned file). The legacy sai-v0.0.6 fork is retired
+#                    and unreferenced.
 #
 # Submit overrides (use the supported `cd remote_dir && sbatch` style, which
 # is equivalent to `rcc job submit` for this self-contained recipe):
@@ -65,7 +65,7 @@ SERVED_MODEL="${SERVED_MODEL:-zai-org/GLM-5.3-Flash}"
 # specific id.
 RELAY_PEER="QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7"
 OTELA_BIN_NAME="opentela-arm64"                              # for worker-alive pgrep (matches the versioned opentela-arm64-v0.2.6 too)
-OTELA_DL_REL="deployments/llm/clariden/glm-53-flash/download_otela.sh"  # --update-otela payload
+OTELA_DL_REL="meta/common/download_otela.sh"  # --update-otela payload (shared stager)
 GATEWAY_MODELS="https://api.opentela.ai/v1/service/llm/v1/models"
 
 PROFILE="clariden"
@@ -363,15 +363,12 @@ do_submit() {
 }
 
 # ------------------------------------------------------------ otela binary --
-# Push the sibling download_otela.sh to clariden and run it there (needs a
-# login node with GitHub egress + /iopsstor; ~66 MB download). Stages the
-# pinned official release (default v0.2.6) at
-#   $OTELA_DIR/opentela-arm64-<tag>
-# which is what the recipe's OTELA_BIN default points at. Versioned filename
-# => every release stays on disk, so rollback = the PREVIOUS official
-# release (OTELA_VERSION=v0.2.5 + OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5
-# on submit); the legacy sai-v0.0.6 fork is retired and unreferenced.
-# After a NEW tag is staged, bump the OTELA_BIN default in the recipe.
+# Run the shared stager (meta/common/download_otela.sh) on clariden (needs a
+# login node with GitHub egress + /iopsstor; ~66 MB download). Default stages
+# the LATEST official release and repoints the opentela-arm64-latest symlink,
+# which is what the recipe's OTELA_BIN default pins — no recipe bump needed.
+# Versioned files ($OTELA_DIR/opentela-arm64-<tag>) stay on disk, so rollback
+# is OTELA_VERSION=v0.2.5 (or pinning OTELA_BIN to the old versioned file).
 update_otela() {
   [ -f "$REPO/$OTELA_DL_REL" ] || die "download script not found: $REPO/$OTELA_DL_REL"
   log "pushing $OTELA_DL_REL to clariden (idempotent)"
@@ -380,10 +377,10 @@ update_otela() {
   local remote_dir
   remote_dir="$(rcc --profile "$PROFILE" config 2>/dev/null | sed -n "s/^remote_dir = '\(.*\)'/\1/p" | head -1)"
   [ -n "$remote_dir" ] || remote_dir="/iopsstor/scratch/cscs/xyao/opentela-cookbook"
-  log "running download_otela.sh on $HOST (OTELA_VERSION=${OTELA_VERSION:-v0.2.6}; ~66 MB)"
-  ssh_run "bash '$remote_dir/$OTELA_DL_REL'" 900 \
+  log "running download_otela.sh on $HOST (OTELA_VERSION=${OTELA_VERSION:-latest}; ~66 MB)"
+  ssh_run "OTELA_DIR=/iopsstor/scratch/cscs/xyao/opentela OTELA_ARCH=arm64 OTELA_VERSION='${OTELA_VERSION:-latest}' bash '$remote_dir/$OTELA_DL_REL'" 900 \
     || die "download_otela.sh failed on $HOST (egress to github.com OK? /iopsstor writable?)"
-  note "next: the recipe pins OTELA_BIN=\$OTELA_DIR/opentela-arm64-v0.2.6; a new tag needs a recipe bump"
+  note "next: nothing — the recipe pins \$OTELA_DIR/opentela-arm64-latest (repointed by the stager)"
   note "v0.2.6 adds OpenTela Cloud account linking: set OTD_API_KEY (otd-...) in"
   note "~/.zshrc on the cluster, or OTELA_DEPLOY_KEY at submit, and each job's peer"
   note "id is bound to your account (best-effort; one deploy-key use per job)."

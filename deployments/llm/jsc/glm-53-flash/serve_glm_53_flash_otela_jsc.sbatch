@@ -52,6 +52,23 @@ if [ -z "$SCRIPT_DIR" ]; then
 fi
 unset _cand
 
+# --------------------------------------------------------------------- lib ---
+# Shared helpers from the repo's meta/common/ — lib.sh (stop_otela) and
+# gen_correctness.py live there. SCRIPT_DIR may already BE the meta/common
+# dir (submit-dir candidate); otherwise walk up from it.
+COMMON_DIR=""
+[ -f "$SCRIPT_DIR/lib.sh" ] && [ -f "$SCRIPT_DIR/gen_correctness.py" ] && COMMON_DIR="$SCRIPT_DIR"
+if [ -z "$COMMON_DIR" ]; then
+  _d="$SCRIPT_DIR"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$_d/meta/common/lib.sh" ] && { COMMON_DIR="$_d/meta/common"; break; }
+    _d="$(dirname "$_d")"
+  done
+fi
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found from $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+unset _d
+
 # ---------------------------------------------------------------- deployment --
 # Reuses the /e/scratch tree (image, weights, caches — no re-pull/re-JIT).
 # /e/scratch and /e/data1 are the compute-mounted filesystems; /p/scratch is
@@ -155,10 +172,12 @@ export LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 export ENABLE_METRICS="${ENABLE_METRICS:-}"
 
 # ------------------------------------------------------------------- otela ----
-# Official OpenTela v0.2.4 arm64, staged by the kimi-k3 recipe (same binary
-# the relay runs). Compute has no egress — preflight prints the staging cmd.
+# Official OpenTela release (arm64), staged on the login node by up.sh via
+# meta/common/download_otela.sh (latest release; OTELA_VERSION pins a tag).
+# Compute has no egress — preflight prints the staging command.
+OTELA_DIR="${OTELA_DIR:-/e/scratch/${PROJECT:-reformo}/${USER}/otela-llm}"
 OTELA_VERSION="${OTELA_VERSION:-v0.2.4}"
-OTELA_BIN="${OTELA_BIN:-/e/scratch/reformo/yao4/otela-llm/opentela-arm64}"
+OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-arm64-latest}"
 OTELA_URL="${OTELA_URL:-https://github.com/eth-easl/OpenTela/releases/download/$OTELA_VERSION/opentela-arm64}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 OTELA_TCP_PORT="${OTELA_TCP_PORT:-43920}"
@@ -356,10 +375,10 @@ if [ "$LOAD_FORMAT" != "dummy" ] && [ ! -f "$MODEL_PATH/config.json" ]; then
 fi
 if ! srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 test -x "$OTELA_BIN"; then
   ok=0; echo "FATAL: otela binary missing: $OTELA_BIN" >&2
-  echo "  On a JSC LOGIN node run (compute has no egress):" >&2
-  echo "    mkdir -p '$(dirname "$OTELA_BIN")'" >&2
-  echo "    curl -L --fail -o '$OTELA_BIN' '$OTELA_URL'" >&2
-  echo "    chmod +x '$OTELA_BIN'" >&2
+  echo "  On a JSC LOGIN node run (compute has no egress) — bash up.sh stages the latest" >&2
+  echo "  official OpenTela automatically via meta/common/download_otela.sh, or manually:" >&2
+  echo "    OTELA_DIR='$OTELA_DIR' OTELA_ARCH=arm64 bash ../../../../meta/common/download_otela.sh" >&2
+  echo "    curl -L --fail -o '$OTELA_BIN' '$OTELA_URL' && chmod +x '$OTELA_BIN'   # pinned fallback" >&2
 fi
 if [ "$GEN_PROBE" = "1" ] && [ ! -f "$SCRIPT_DIR/gen_correctness.py" ]; then
   ok=0; echo "FATAL: gen_correctness.py not found next to this sbatch ($SCRIPT_DIR)" >&2
@@ -606,35 +625,8 @@ chmod +x "$RUNDIR/otela.sh"
 echo "otela worker: $OTELA_BIN ($OTELA_VERSION) via relay $RELAY_ADDR"
 
 # ================================================= registration + lifecycle ==
-_OTELA_STOPPED=0
-stop_otela() {
-  # TERM then EXIT both fire the trap — guard against a double teardown.
-  [ "$_OTELA_STOPPED" = 1 ] && return 0
-  _OTELA_STOPPED=1
-
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    # Not a clean state — say so loudly instead of returning silently.
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
-    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
-    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  # 20 s: on the scancel path the only grace is KillWait (30 s); otela's
-  # graceful leave is ~10 s — margin without hitting SIGKILL.
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# stop_otela comes from meta/common/lib.sh (sourced above); _OTELA_LAUNCHED is
+# set below right after the worker step starts.
 trap 'stop_otela' EXIT TERM INT
 
 # Registration gate: /health -> MANDATORY gen probe -> servekit bench ->
@@ -720,7 +712,9 @@ trap 'stop_otela' EXIT TERM INT
   srun --jobid="$SLURM_JOB_ID" --overlap --nodes=1 --ntasks=1 -w "$HEAD" \
        -J "$OTELA_STEP_NAME" \
        bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
-  echo "[$(date -Is)] otela worker exited rc=$?"
+  rc=$?
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
+  echo "[$(date -Is)] otela worker exited rc=$rc"
 ) &
 REG_PID=$!
 echo "registration subshell pid $REG_PID; run dir $RUNDIR"

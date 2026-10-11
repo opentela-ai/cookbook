@@ -56,7 +56,7 @@ All relative to the recipe directory; every one is overridable via env.
 | Vendored sglang source | `./sglang-src` | A local-only checkout (release/v0.5.16 + latest cherry-picks, **no git remote** on the bring-up host). Must contain `python/pyproject.toml`. Point `SGLANG_SRC` at an existing checkout to reuse it. |
 | s3er entrypoint source | `./entrypoint-src` | A checkout with `pyproject.toml` + `s3er/`. Point `ENTRYPOINT_SRC` at an existing checkout to reuse it. |
 | Model weights | `$HOME/models/Qwen3.6-35B-A3B-FP8` | FP8 shard tree (`layers-N.safetensors`, `config.json`, `chat_template.jinja`, …). Override `MODEL`. |
-| `otela` binary | `./run/otela/otela` | OpenTela `otela`, **v0.2.3** (commit e9d1696, official `opentela-arm64` release), **arm64**. `register_qwen36_otela.sh` prints the path if missing; set `OTELA_BIN` to use one elsewhere. |
+| `otela` binary | `./run/otela/opentela-arm64-latest` | Latest official OpenTela `opentela-arm64` release, **arm64**, staged by `up.sh` via the shared `meta/common/download_otela.sh` (`OTELA_VERSION=<tag>` pins one). `register_qwen36_otela.sh` prints the path if missing; set `OTELA_BIN` to use one elsewhere. |
 
 ## Architecture
 
@@ -194,7 +194,7 @@ curl -s http://140.238.223.116:8092/v1/service/llm/v1/chat/completions \
 
 ### `register_qwen36_otela.sh`
 `DEPLOY_DIR` (default `./run`), `OTELA_DIR` (default `$DEPLOY_DIR/otela`),
-`OTELA_BIN` (default `$OTELA_DIR/otela`), `OPENTELA_CFG_DIR`, `PIDFILE`,
+`OTELA_BIN` (default `$OTELA_DIR/opentela-arm64-latest`), `OPENTELA_CFG_DIR`, `PIDFILE`,
 `LOGFILE`, `OPENTELA_BOOTSTRAP`, `SERVE_PORT` (30000), `SERVED_MODEL_ID`
   (`Qwen/Qwen3.6-35B-A3B-FP8`), `OPENTELA_SERVICE_NAME` (`llm`), `OPENTELA_SEED`
   (default `0`; vestigial in v0.2.3 — peer ID comes from `$CFG_DIR/keys/id`,
@@ -227,7 +227,9 @@ The service is registered on the OpenTela network as a sidecar peer (the
 engine itself runs unsupervised in the container; a standalone `otela` process
 on the DGX Spark host advertises its `llm` service).
 
-- **Binary:** `./run/otela/otela` — OpenTela `otela`, v0.2.3 (arm64)
+- **Binary:** `./run/otela/opentela-arm64-latest` — latest official OpenTela
+  `opentela-arm64` release (arm64), staged by `up.sh` via the shared
+  `meta/common/download_otela.sh`
 - **Local peer:** stable across restarts (peer ID from `run/otela/keys/id`;
   see [Site-specific fixes](#site-specific-fixes)). Observed during validation:
   `QmfXLJZRsMJq1BT9ZeHq5S2Ea8gbhH7NT9SEDeCxLcwcof`, libp2p :43905.

@@ -114,11 +114,12 @@ export SMOKE="${SMOKE:-1}"
 
 # --- OpenTela ---------------------------------------------------------------
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-# Official release v0.2.4 (commit 6c8574d, built 2026-08-25) — has --role,
-# service-policy-v2, TLS, and a default --bootstrap.source that already
-# includes http://140.238.223.116:8092/v1/dnt/bootstraps (this head).
-# The pre-existing $OTELA_DIR/otela is a custom sai-v0.0.6 build kept as fallback.
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-v0.2.4}"
+# Official OpenTela release (amd64), staged on the login node by up.sh via
+# meta/common/download_otela.sh — always the LATEST release (the
+# opentela-amd64-latest symlink is repointed on every stage). v0.2.4 notes
+# (--role, service-policy-v2, TLS, default --bootstrap.source) all carry into
+# v0.2.6; the sai-v0.0.6 fork and its $OTELA_DIR/otela fallback are retired.
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-amd64-latest}"
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 export OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
@@ -264,7 +265,7 @@ chmod +x "$RUNDIR/engine.sh"
   else
     # OpenTela worker runs on the head inside the same container / host netns.
     # It proxies the local SGLang HTTP endpoint onto the mesh.
-    [ -x "$OTELA_BIN" ] || { echo "[$(date -Is)] FATAL: otela binary missing: $OTELA_BIN" >&2; exit 1; }
+    [ -x "$OTELA_BIN" ] || { echo "[$(date -Is)] FATAL: otela binary missing: $OTELA_BIN — bash up.sh stages the latest official OpenTela via meta/common/download_otela.sh" >&2; exit 1; }
     echo "[$(date -Is)] starting otela worker on $HEAD for $SERVED_MODEL_NAME bootstrap=$OTELA_RELAY_ADDR"
     srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --export=ALL "${CONTAINER_OPTS[@]}" \

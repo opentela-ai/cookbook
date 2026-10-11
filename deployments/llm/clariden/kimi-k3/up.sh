@@ -6,4 +6,7 @@
 # README → Submit. First run: cold start ~105 min; `rcc --profile clariden job tail <JOBID> -f`.
 set -euo pipefail
 cd "$(dirname "$0")"
+# Stage the latest official OpenTela (arm64) on /capstor — best effort: a
+# stale staged binary still serves; a missing one FATALs in the sbatch preflight.
+rcc --profile clariden run --cwd "$PWD" -- bash -c 'OTELA_DIR=/capstor/scratch/cscs/xyao/opentela OTELA_ARCH=arm64 bash ../../../../meta/common/download_otela.sh || echo "[up.sh] WARN: OpenTela latest-check failed (no egress?); submitting with the staged binary"'
 rcc --profile clariden job submit deployments/llm/clariden/kimi-k3/serve_kimi_k3_otela_clariden.sbatch "$@"

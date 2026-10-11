@@ -417,7 +417,7 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `BENCH` | `0` | Set `1` to run `benchmark.py` — a concurrent `/v1/completions` throughput sweep (warmup + one JSON line per `CONC:NUMREQ` level) — after the correctness probe passes, BEFORE registration. Pair with `OTELA_BIN=/bin/true` for a pure benchmark. Knobs: `BENCH_SPEC` (default `1:16 8:32 32:64 64:64`), `BENCH_OUT_TOK` (256), `BENCH_IN_TOK` (32, short to isolate decode), `BENCH_TIMEOUT` (1800). **issue #42:** pass a 7th arg or set `BENCH_BASE_KDA_OFF` to a KDA-disabled baseline server (`K3_DISABLE_KDA=1`) — the SAME spec runs against both and a per-level throughput + per-request latency delta is reported (acceptance: KDA-on / KDA-off latency ratio ≤ 1.05×). |
 | `DISTRIBUTED_TIMEOUT_SECONDS` | _unset_ | Override the gloo/NCCL init+recv timeout (vLLM default 3600 s). Set low (e.g. `300`) with `K3_PIECEWISE=1` so a decode deadlock fails in 5 min, not 1 h. |
 | `VLLM_EXTRA_ARGS` | _empty_ | Passthrough for additional vLLM flags. |
-| `OTELA_BIN` | `/capstor/scratch/cscs/xyao/opentela/otela` | x86_64, sai-v0.0.6 (`--bootstrap.static`, `--label`). |
+| `OTELA_BIN` | `$OTELA_DIR/opentela-amd64-latest` | latest official OpenTela release, x86_64 (`--bootstrap.static`, `--label`) — staged by `up.sh` via `meta/common/download_otela.sh`. |
 | `OTELA_RELAY_ADDR` | `/ip4/148.187.108.178/tcp/43905/p2p/QmbUKJk…` | Alps OpenTela bootstrap peer (direct, no relay). |
 | `OTELA_SERVICE_NAME` | `llm` | Service registered on the mesh. |
 | `OTELA_SEED` | `21` | Deterministic libp2p identity. |

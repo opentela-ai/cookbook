@@ -68,7 +68,23 @@ if [ -z "$_edf_dir" ]; then
   exit 1
 fi
 export EDF_PATH="${_edf_dir}:${EDF_PATH:-${HOME}/.edf}"
-unset _edf_dir _cand
+
+# --------------------------------------------------------------------- lib ---
+# Shared helpers from the repo's meta/common/ — lib.sh (stop_otela),
+# download_otela.sh; per-recipe copies were removed. Walk up from the EDF dir
+# (and, for repo-root submits, SLURM_SUBMIT_DIR) to find it.
+COMMON_DIR=""
+for _root in "$_edf_dir" "${SLURM_SUBMIT_DIR:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+  [ -n "$_root" ] || continue
+  _d="$_root"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$_d/meta/common/lib.sh" ] && { COMMON_DIR="$_d/meta/common"; break 2; }
+    _d="$(dirname "$_d")"
+  done
+done
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above $_edf_dir — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+unset _edf_dir _cand _root _d
 
 # ---------------------------------------------------------------- deployment --
 # Reuses the existing /capstor/scratch/cscs/xyao/kimi-k3 tree: the imported
@@ -181,14 +197,14 @@ export HICACHE_WRITE_POLICY="${HICACHE_WRITE_POLICY:-write_back}"
 export HICACHE_IO_BACKEND="${HICACHE_IO_BACKEND:-kernel}"
 
 # ------------------------------------------------------------------- otela ----
-# arm64 build (sai-v0.0.6), statically linked -> runs on the host and inside the
-# container (mounted via /capstor). It is started INSIDE the kimi-k3 container
-# on the head so its HOME (set by the EDF to /capstor, not quota /users) is
-# correct for its libp2p identity + badger DB. The x86 binary at the same dir
-# is NOT usable on clariden (Exec format error).
+# Official OpenTela release (arm64), staged on a login node by up.sh via
+# meta/common/download_otela.sh (latest release; OTELA_VERSION pins a tag).
+# Runs INSIDE the kimi-k3 container on the head (mounted via /capstor) so its
+# HOME (set by the EDF to /capstor, not quota /users) is correct for its
+# libp2p identity + badger DB. The sai-v0.0.6 fork (and the ocf-share copy of
+# it) is retired.
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela-arm64}"
-# Shared alternative: /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-arm64-latest}"
 # Direct-mesh bootstrap (an Alps OpenTela peer). No relay needed.
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
@@ -257,8 +273,9 @@ echo "[$(date -Is)] hicache: enable=$HICACHE_ENABLE ratio=$HICACHE_RATIO policy=
 [ "$PP_SIZE" = "$NNODES" ] || echo "WARN: PP_SIZE=$PP_SIZE != NNODES=$NNODES (intended?)" >&2
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage an arm64 build on a login node, e.g.:" >&2
-  echo "         mkdir -p $OTELA_DIR && cp /capstor/store/cscs/swissai/infra01/ocf-share/otela-arm64 $OTELA_BIN && chmod +x $OTELA_BIN" >&2
+  echo "       bash up.sh stages the latest official OpenTela (arm64) automatically" >&2
+  echo "         OTELA_DIR=$OTELA_DIR OTELA_ARCH=arm64 bash ../../../../meta/common/download_otela.sh" >&2
+  echo "       (Override with OTELA_BIN=<path>; rollback: OTELA_VERSION=<tag> download_otela.sh)" >&2
   exit 1
 }
 # servekit is OPTIONAL (presharded staging + cold-start profile +
@@ -462,33 +479,10 @@ chmod +x "$RUNDIR/otela.sh"
 # ------------------------------------------------------------- lifecycle -----
 # otela publishes LEFT only on SIGTERM/INT; SIGKILL leaves a stale
 # connected:true row in the head's round-robin. Signal the STEP and wait.
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0   # trap fires for both TERM and EXIT
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
-    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
-    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  # 20 s: --signal=B:TERM@120 covers wall-time expiry, but on the `scancel` path
-  # the only grace is KillWait (default 30 s). otela needs ~10 s to shut down,
-  # so 20 s leaves margin and still finishes before SIGKILL.
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# stop_otela comes from meta/common/lib.sh (sourced above); the comment trail:
+# 20 s fuse < KillWait (30 s); otela needs ~10 s (AnnounceLeave -> 5 s CRDT
+# drain -> srv.Shutdown). A vanished step (SIGKILL) keeps a stale
+# connected=true row — harmless, the next run mints a fresh peer id.
 trap 'stop_otela' EXIT TERM INT
 
 # Register once the head's engine answers. The wait runs in the BATCH shell
@@ -531,6 +525,7 @@ trap 'stop_otela' EXIT TERM INT
   srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
        -w "$HEAD" --environment="$OTELA_EDF_NAME" -J "$OTELA_STEP_NAME" \
        bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
 ) &
 
 # ------------------------------------------------------------- run engine ----

@@ -94,7 +94,7 @@ SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-0}"
 # ------------------------------------------------------------------- otela ----
 # x86-64 build. The worker (not a relay) uses the release directly.
 OPENTELA_DIR="${OPENTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-OPENTELA_BIN="${OPENTELA_BIN:-${OPENTELA_DIR}/otela}"
+OPENTELA_BIN="${OPENTELA_BIN:-${OPENTELA_DIR}/opentela-amd64-latest}"   # official release; up.sh stages via meta/common/download_otela.sh
 OPENTELA_BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 OPENTELA_TCP_PORT="${OPENTELA_TCP_PORT:-43905}"
 OPENTELA_UDP_PORT="${OPENTELA_UDP_PORT:-59820}"
@@ -139,9 +139,8 @@ echo "started=$(date --iso-8601=seconds)"
 }
 [ -x "${OPENTELA_BIN}" ] || {
   echo "FATAL: otela binary not found/executable: ${OPENTELA_BIN}" >&2
-  echo "Stage it with (login node, needs egress):" >&2
-  echo "  mkdir -p ${OPENTELA_DIR} && cd ${OPENTELA_DIR} && \\" >&2
-  echo "    curl -fsSL -o otela <otela-x86_64-release-url> && chmod +x otela" >&2
+  echo "bash up.sh stages the latest official OpenTela (amd64) automatically:" >&2
+  echo "  OTELA_DIR=${OPENTELA_DIR} OTELA_ARCH=amd64 bash ../../../../meta/common/download_otela.sh" >&2
   exit 1
 }
 

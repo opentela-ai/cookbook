@@ -81,8 +81,8 @@ node configuration is not available".
 4. **All state off `/cluster/home` (over quota).** Home was at 46.4/47.7 GB
    at time of writing. The model (35 GB), SGLang image, caches, otela
    config, and run dirs all live on `/cluster/scratch/$USER/otela-qwen36`
-   (482 TB, 2.6 TB quota). The otela *binary* (`$DEPLOY/bin/otela-v0.2.3`,
-   72 MB) is read-only on scratch — that's fine. The otela *BadgerDB* (`.ocfcore`) is
+   (482 TB, 2.6 TB quota). The otela *binary* (`$DEPLOY/bin/opentela-amd64-latest`,
+   ~72 MB) is read-only on scratch — that's fine. The otela *BadgerDB* (`.ocfcore`) is
    relocated to `$TMPDIR/otela-home` (node-local SSD, auto-cleaned by Slurm)
    via a `HOME` env override, avoiding both home quota and Lustre stale file
    handles (documented in the JSC recipe).
@@ -153,10 +153,11 @@ huggingface-cli download Qwen/Qwen3.6-35B-A3B-FP8 \
 #          docker://lmsysorg/sglang:v0.5.16-cu129-runtime'
 #    (eth_proxy gives compute nodes HTTPS egress to Docker Hub.)
 
-# 3. OpenTela binary (v0.2.3, amd64 — from GitHub releases)
-curl -L -o "$DEPLOY/bin/otela-v0.2.3" \
-  "https://github.com/eth-easl/OpenTela/releases/download/v0.2.3/opentela-amd64"
-chmod +x "$DEPLOY/bin/otela-v0.2.3"
+# 3. OpenTela binary — bash up.sh does this via meta/common/download_otela.sh
+#    (latest official release → $DEPLOY/bin/opentela-amd64-latest). Manual form:
+curl -L -o "$DEPLOY/bin/opentela-amd64-latest" \
+  "https://github.com/eth-easl/OpenTela/releases/latest/download/opentela-amd64"
+chmod +x "$DEPLOY/bin/opentela-amd64-latest"
 
 # 4. Relay config (if not already at ~/opentela/relay.cfg.yaml)
 cat > ~/opentela/relay.cfg.yaml <<'YAML'
@@ -268,7 +269,7 @@ In `run-<jobid>/otela.log`:
 | `MEM_FRACTION_STATIC` | `0.85` | Room for SSM state + CUDA graphs within 96 GB |
 | `REASONING_PARSER` | `qwen3` | Model emits `<dynamic_thinking>` tags |
 | `HEALTH_TIMEOUT` | `900` | FP8 load + graph capture takes several min |
-| `OTELA_BIN` | `$DEPLOY_DIR/bin/otela-v0.2.3` | otela binary (OpenTela v0.2.3, x86_64) |
+| `OTELA_BIN` | `$DEPLOY_DIR/bin/opentela-amd64-latest` | otela binary (latest official OpenTela release, amd64 — staged by up.sh) |
 | `OTELA_RELAY_ADDR` | *(see relay.multiaddr)* | Override the relay multiaddr |
 | `RELAY_ADDR_FILE` | `$DEPLOY_DIR/relay.multiaddr` | Written by start_relay_euler.sh |
 | `OPENTELA_SEED` | `$$` | Fresh peer ID per start (avoids LEFT tombstone) |
@@ -282,5 +283,5 @@ In `run-<jobid>/otela.log`:
 | Env | Default | Why |
 |-----|---------|-----|
 | `DEPLOY_DIR` | `/cluster/scratch/$USER/otela-qwen36` | Logs + relay.multiaddr |
-| `OTELA_BIN` | `$DEPLOY_DIR/bin/otela-v0.2.3` | otela binary (v0.2.3) |
+| `OTELA_BIN` | `$DEPLOY_DIR/bin/opentela-amd64-latest` | otela binary (latest official release) |
 | `RELAY_CFG` | `$HOME/opentela/relay.cfg.yaml` | Relay config (role: relay) |

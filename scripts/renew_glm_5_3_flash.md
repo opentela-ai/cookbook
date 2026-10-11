@@ -46,7 +46,7 @@ without submitting.
 | `--watch` | Submit-if-needed, then block until the new job is `RUNNING` + `/health=200` + registered (bounded by `--max-wait`). |
 | `--handover` | Like `--watch`, but once the new job is confirmed live it `scancel`s the expiring running job for a zero-gap swap. |
 | `--force` | Submit even when the window is already covered (running job far from expiry, or a pending successor exists). |
-| `--update-otela` | Push [`download_otela.sh`](../deployments/llm/clariden/glm-53-flash/download_otela.sh) to clariden and run it there to stage the pinned official OpenTela release (`v0.2.6` by default; `OTELA_VERSION=latest` for the newest tag), then exit — never submits. Rollback = the previous official release (`OTELA_VERSION=v0.2.5`, then submit with `OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`); the legacy sai-v0.0.6 fork is retired. |
+| `--update-otela` | Push the shared stager ([`meta/common/download_otela.sh`](../meta/common/download_otela.sh)) to clariden and run it there to stage the **latest** official OpenTela release (`OTELA_VERSION=<tag>` pins one), repointing the `opentela-arm64-latest` symlink the recipe's `OTELA_BIN` default follows — no recipe bump needed. Then exits — never submits. Rollback = `OTELA_VERSION=v0.2.5` (stages the old versioned file alongside) and submit with `OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`; the legacy sai-v0.0.6 fork is retired. |
 | `--dry-run` (`-n`) | Resolve and print the exact submit command, but submit nothing. Skips `--watch`/`--handover`. |
 
 ## Submit overrides

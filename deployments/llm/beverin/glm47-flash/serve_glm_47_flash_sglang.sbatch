@@ -72,10 +72,11 @@ TRANSFORMERS_INSTALL_MODE="${TRANSFORMERS_INSTALL_MODE:-system}"
 TRANSFORMERS_TARGET_DIR="${TRANSFORMERS_TARGET_DIR:-${DEPLOY_DIR}/cache/pydeps/transformers-${TRANSFORMERS_VERSION}}"
 
 # ------------------------------------------------------------------- otela ----
-# x86-64 build, version sai-v0.0.6. The worker (not a relay) can use this
+# Official OpenTela release (amd64), staged by up.sh via meta/common/download_otela.sh
+# (the sai-v0.0.6 fork is retired). The worker (not a relay) can use this
 # release directly; --require_signed is left false so a dev build is accepted.
 OPENTELA_DIR="${OPENTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-OPENTELA_BIN="${OPENTELA_BIN:-${OPENTELA_DIR}/otela}"
+OPENTELA_BIN="${OPENTELA_BIN:-${OPENTELA_DIR}/opentela-amd64-latest}"
 OPENTELA_BOOTSTRAP="${OPENTELA_BOOTSTRAP:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 OPENTELA_TCP_PORT="${OPENTELA_TCP_PORT:-43905}"
 OPENTELA_UDP_PORT="${OPENTELA_UDP_PORT:-59820}"
@@ -125,7 +126,7 @@ echo "metrics_agent_bin=${METRICS_AGENT_BIN}"
 echo "started=$(date --iso-8601=seconds)"
 
 [ -d "${MODEL}" ] || { echo "FATAL: weights not found: ${MODEL}" >&2; exit 1; }
-[ -x "${OPENTELA_BIN}" ] || { echo "FATAL: otela binary not found/executable: ${OPENTELA_BIN}" >&2; exit 1; }
+[ -x "${OPENTELA_BIN}" ] || { echo "FATAL: otela binary not found/executable: ${OPENTELA_BIN} — bash up.sh (stages latest official OpenTela via meta/common/download_otela.sh)" >&2; exit 1; }
 
 # ================================================================ engine ======
 # Shared SGLang subprocess wrapper used by every rank. Each rank runs on its

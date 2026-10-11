@@ -56,7 +56,23 @@ if [ -z "$_edf_dir" ]; then
 fi
 export EDF_PATH="${_edf_dir}:${EDF_PATH:-${HOME}/.edf}"
 export SCRIPT_DIR="$_edf_dir"
-unset _edf_dir _cand
+
+# --------------------------------------------------------------------- lib ---
+# Shared helpers from the repo's meta/common/ — lib.sh (stop_otela),
+# gen_correctness.py, download_otela.sh; per-recipe copies were removed. Walk
+# up from the EDF dir (and, for repo-root submits, SLURM_SUBMIT_DIR) to find it.
+COMMON_DIR=""
+for _root in "$_edf_dir" "${SLURM_SUBMIT_DIR:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
+  [ -n "$_root" ] || continue
+  _d="$_root"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$_d/meta/common/lib.sh" ] && { COMMON_DIR="$_d/meta/common"; break 2; }
+    _d="$(dirname "$_d")"
+  done
+done
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
+unset _edf_dir _cand _root _d
 
 # ---------------------------------------------------------------- deployment --
 # Reuses the /iopsstor tree (image, caches, warm Triton — no re-pull/re-JIT).
@@ -185,7 +201,7 @@ export LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 # sai-v0.0.6 is retired; rollback = OTELA_VERSION=v0.2.5 re-stage.
 # The x86 binary in the same dir is NOT usable on clariden (Exec format error).
 export OTELA_DIR="${OTELA_DIR:-/iopsstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-arm64-v0.2.6}"
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-arm64-latest}"   # official release; up.sh stages via meta/common/download_otela.sh
 # Direct-mesh bootstrap (Alps peer, verified from a compute node). No relay
 # — clariden compute has outbound internet (the 306 GiB HF download proved it).
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
@@ -440,15 +456,16 @@ fi
 [ "$PP_SIZE" = "$NNODES" ] || echo "WARN: PP_SIZE=$PP_SIZE != NNODES=$NNODES (intended?)" >&2
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage the official release on a login node (sibling script):" >&2
-  echo "         bash $SCRIPT_DIR/download_otela.sh" >&2
+  echo "       bash up.sh stages the latest official OpenTela (arm64) automatically" >&2
+  echo "         OTELA_DIR=$OTELA_DIR OTELA_ARCH=arm64 bash ../../../../meta/common/download_otela.sh" >&2
   echo "       (or from the repo root: scripts/renew_glm_5_3_flash.sh --update-otela)" >&2
-  echo "       Rollback: OTELA_VERSION=v0.2.5 bash download_otela.sh && OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5" >&2
+  echo "       Rollback: OTELA_VERSION=v0.2.5 bash meta/common/download_otela.sh" >&2
   exit 1
 }
-# gen_correctness.py sibling (mandatory probe — see above).
-[ -f "$SCRIPT_DIR/gen_correctness.py" ] || {
-  echo "FATAL: gen_correctness.py not found next to this sbatch: $SCRIPT_DIR/gen_correctness.py" >&2
+# gen_correctness.py (meta/common — mandatory probe, see above).
+[ -f "$COMMON_DIR/gen_correctness.py" ] || {
+  echo "FATAL: gen_correctness.py not found at $COMMON_DIR/gen_correctness.py" >&2
+  echo "       meta/common is part of the repo checkout — submit from within it." >&2
   echo "       Submit with: cd \"$(cd "$SCRIPT_DIR" && pwd)\" && sbatch $0" >&2
   exit 1
 }
@@ -750,39 +767,10 @@ chmod +x "$RUNDIR/otela.sh"
 # skips peers that registered a service) and round-robins real traffic into a
 # dead endpoint. Signal the STEP (srun does not reliably relay signals to the
 # task) and wait for it to actually exit.
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0   # trap fires for both TERM and EXIT
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
-    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
-    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    echo "[$(date -Is)]       The next run mints a FRESH peer id (per-job" >&2
-    echo "[$(date -Is)]       config-dir + randomized seed — see the OTELA_SEED note), so it" >&2
-    echo "[$(date -Is)]       cannot overwrite this stale row; the head accumulates one" >&2
-    echo "[$(date -Is)]       dead connected=true peer per run. Non-fatal: registration" >&2
-    echo "[$(date -Is)]       and serving still succeed; it shows as ~5.5-min dial-then-" >&2
-    echo "[$(date -Is)]       peer-id-mismatch DEBUG spam sourced from the head's CRDT." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  # 20 s: --signal=B:TERM@120 covers wall-time expiry, but on the `scancel` path
-  # the only grace is KillWait (default 30 s). otela needs ~10 s to shut down,
-  # so 20 s leaves margin and still finishes before SIGKILL.
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# stop_otela comes from meta/common/lib.sh (sourced above); the comment trail:
+# 20 s fuse < KillWait (30 s); otela needs ~10 s (AnnounceLeave -> 5 s CRDT
+# drain -> srv.Shutdown). A vanished step (SIGKILL) keeps a stale
+# connected=true row — harmless, the next run mints a fresh peer id.
 trap 'stop_otela' EXIT TERM INT
 
 # Register once the head's engine answers /health AND the probe passes. The
@@ -828,7 +816,7 @@ trap 'stop_otela' EXIT TERM INT
       timeout "$((GEN_PROBE_TIMEOUT + 300))" \
       srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
            -w "$HEAD" --environment="$OTELA_EDF_NAME" \
-           python3 "$SCRIPT_DIR/gen_correctness.py" \
+           python3 "$COMMON_DIR/gen_correctness.py" \
                "http://127.0.0.1:$SERVE_PORT" "$SERVED_MODEL_NAME" \
                "$PROBE_OUT" "$GEN_CORRECTNESS_MAX_TOKENS" "$GEN_CORRECTNESS_MIN_PASS"
     rc=$?
@@ -869,6 +857,7 @@ trap 'stop_otela' EXIT TERM INT
   srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
        -w "$HEAD" --environment="$OTELA_EDF_NAME" -J "$OTELA_STEP_NAME" \
        bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
 ) &
 
 # ------------------------------------------------------------- run engine ----

@@ -16,4 +16,9 @@ rsync -a \
   ./ "$DEPLOY_DIR/"
 cp ../../../../meta/common/gen_correctness.py "$DEPLOY_DIR/gen_correctness.py"
 
+# Stage the latest official OpenTela (amd64) on /capstor — best effort: a
+# stale staged binary still serves; a missing one FATALs in the sbatch preflight.
+OTELA_DIR=/capstor/scratch/cscs/xyao/opentela OTELA_ARCH=amd64 \
+  bash ../../../../meta/common/download_otela.sh \
+  || echo "[up.sh] WARN: OpenTela latest-check failed (no egress?); submitting with the staged binary"
 sbatch "$@" serve_glm_53_flash_sglang.sbatch

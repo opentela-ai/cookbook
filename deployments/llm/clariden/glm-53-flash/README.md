@@ -88,16 +88,17 @@ rcc --profile clariden job tail <JOBID> -f
 ## OpenTela registration
 
 The sbatch starts the otela worker automatically in step 4. The worker is
-the **official OpenTela `v0.2.6` arm64 release** (staged on `/iopsstor` by
-the sibling [`download_otela.sh`](download_otela.sh), or via the renew
-script's `--update-otela`). It reads a generated per-job `cfg.yaml`
+the **latest official OpenTela arm64 release** (staged on `/iopsstor` by the
+shared [`meta/common/download_otela.sh`](../../../../meta/common/download_otela.sh),
+run automatically by `up.sh`, or via the renew script's `--update-otela`). It reads a generated per-job `cfg.yaml`
 (`mode: node`, `role: worker`, `reachability: private`, `loglevel: debug`,
 `cleanslate: true`) and joins the direct-mesh bootstrap — Clariden compute
 has outbound internet, so **no relay is needed**. Replaces the hand-staged
 `sai-v0.0.6` fork, now **retired** — nothing references it anymore (the
-old binary at `$OTELA_DIR/opentela-arm64` can be deleted). Rollback is the
-previous *official* release: `OTELA_VERSION=v0.2.5 bash download_otela.sh`
-re-stages it, then submit with `OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`.
+old binary at `$OTELA_DIR/opentela-arm64` can be deleted). Rollback is a
+pinned previous *official* release: `OTELA_VERSION=v0.2.5` re-stages it
+(keeps `opentela-arm64-latest` untouched), then submit with
+`OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`.
 
 | Where | Value |
 |-------|-------|
@@ -243,7 +244,6 @@ by keeping the job alive a few minutes before `scancel`.
 | File | Purpose |
 |------|---------|
 | `serve_glm_5_3_flash_otela_clariden.sbatch` | Self-contained Slurm batch: container/EDF setup, preflight, one distributed sglang engine, mandatory gen probe, otela registration, SIGTERM leave trap |
-| `download_otela.sh` | Stages the official OpenTela arm64 release (pinned `v0.2.6`, or `OTELA_VERSION=latest`) to `/iopsstor/.../opentela/opentela-arm64-<tag>`; also reachable via the renew script's `--update-otela` |
 | `glm-53-flash-clariden.toml` | enroot EDF — mounts + env + `com.hooks.aws_ofi_nccl.enabled=true` (bind-mounts the aws-ofi-ccl plugin + CXI provider for native Slingshot) |
 | `build_glm_5_3_flash_image.sbatch` | One-time enroot import of `docker://lmsysorg/sglang:glm-5.3-flash` (arm64, sm_90 cubins for GH200) to a local `.sqsh` |
 | `download_glm_5_3_flash.sbatch` | One-time HF weights download to `/capstor` (~306 GiB, 62 shards) |
@@ -265,7 +265,7 @@ by keeping the job alive a few minutes before `scancel`.
 | `GLM53_REASONING_PARSER` / `GLM53_TOOL_CALL_PARSER` | `glm45` / `glm47` | gated by `GLM53_ENABLE_PARSERS=1` |
 | `LOAD_FORMAT` | `auto` | `dummy` for a fast forward-path smoke (pair with `GEN_CORRECTNESS_SMOKE=1`) |
 | `GEN_CORRECTNESS_SMOKE` | 0 | 1 = probe only, skip otela registration |
-| `OTELA_BIN` | `$OTELA_DIR/opentela-arm64-v0.2.6` | official OpenTela v0.2.6 arm64 release (first with account linking) — stage it with `download_otela.sh` (or the renew script's `--update-otela`); rollback = previous official release (`OTELA_VERSION=v0.2.5`, then `OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`). The x86 `otela` is **not** usable on clariden (Exec format error) |
+| `OTELA_BIN` | `$OTELA_DIR/opentela-arm64-latest` | latest official OpenTela arm64 release — staged by `up.sh` via `meta/common/download_otela.sh` (or the renew script's `--update-otela`); rollback = previous official release (`OTELA_VERSION=v0.2.5`, then `OTELA_BIN=$OTELA_DIR/opentela-arm64-v0.2.5`). The x86 `otela` is **not** usable on clariden (Exec format error) |
 | `OTELA_DEPLOY_KEY` | from `OTD_API_KEY` in `~/.zshrc` | OpenTela Cloud deploy key (`otd-…`) for account linking; `none` disables — see [Account linking](#opentela-registration) above |
 | `OTELA_RELAY_ADDR` | `/ip4/140.238.223.116/tcp/43905/p2p/Qm…` | direct-mesh bootstrap (clariden has outbound; no relay) |
 | `OTELA_SEED` | randomized (`$$`) | fresh libp2p identity per job — avoids the LEFT-tombstone re-registration stall; set a constant only to pin the peer id |

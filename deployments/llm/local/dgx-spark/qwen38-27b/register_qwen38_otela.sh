@@ -26,9 +26,11 @@ DEPLOY_DIR="${DEPLOY_DIR:-${RECIPE_DIR}/run}"
 
 # Defaults keep the recipe self-contained: the otela binary, config, pid, and
 # log all live under $OTELA_DIR (default $DEPLOY_DIR/otela, i.e. a `run/otela`
-# dir next to the recipe). Drop the OpenTela `otela` binary at $OTELA_BIN.
+# dir next to the recipe). The binary is staged by up.sh via the shared
+# meta/common/download_otela.sh (latest official release, arm64); the
+# opentela-arm64-latest symlink is what $OTELA_BIN pins.
 OTELA_DIR="${OTELA_DIR:-${DEPLOY_DIR}/otela}"
-OTELA_BIN="${OTELA_BIN:-${OTELA_DIR}/otela}"
+OTELA_BIN="${OTELA_BIN:-${OTELA_DIR}/opentela-arm64-latest}"
 CFG_DIR="${OPENTELA_CFG_DIR:-${OTELA_DIR}}"
 PIDFILE="${PIDFILE:-${OTELA_DIR}/otela.pid}"
 LOGFILE="${LOGFILE:-${OTELA_DIR}/otela.log}"
@@ -46,11 +48,12 @@ SERVED_MODEL_ID="${SERVED_MODEL_ID:-Qwen/Qwen3.8-27B-FP8}"   # org/model-name fo
 OPENTELA_SEED="${OPENTELA_SEED:-0}"
 
 [ -x "${OTELA_BIN}" ] || { echo "FATAL: otela binary not found/executable: ${OTELA_BIN}" >&2
-  echo "       Obtain the OpenTela 'otela' binary (v0.2.3, arm64) and place it" >&2
-  echo "       at ${OTELA_BIN}, or set OTELA_BIN to an existing path." >&2
-  echo "       On this host the sibling qwen36 recipe already has it:" >&2
-  echo "         cp ${RECIPE_DIR}/../qwen36-35b-a3b/run/otela/otela ${OTELA_BIN}" >&2
-  echo "       (or: OTELA_BIN=${RECIPE_DIR}/../qwen36-35b-a3b/run/otela/otela bash $0 daemon)" >&2
+  echo "       Stage the latest official OpenTela release (arm64):" >&2
+  echo "         OTELA_DIR=${OTELA_DIR} bash meta/common/download_otela.sh   # from the repo root" >&2
+  echo "       or set OTELA_BIN to an existing path." >&2
+  echo "       On this host the sibling qwen36 recipe may already have it:" >&2
+  echo "         cp ${RECIPE_DIR}/../qwen36-35b-a3b/run/otela/opentela-arm64-latest ${OTELA_BIN}" >&2
+  echo "       (or: OTELA_BIN=${RECIPE_DIR}/../qwen36-35b-a3b/run/otela/opentela-arm64-latest bash $0 daemon)" >&2
   exit 1; }
 mkdir -p "${CFG_DIR}"
 # Idempotent: `otela init --config-dir $CFG_DIR` writes cfg.yaml + a fresh

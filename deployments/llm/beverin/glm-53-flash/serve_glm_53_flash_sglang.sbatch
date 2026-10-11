@@ -202,7 +202,7 @@ export LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
 
 # ------------------------------------------------------------------- otela ----
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela}"   # x86_64 build (not -arm64)
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-amd64-latest}"   # official release; up.sh stages via meta/common/download_otela.sh
 export OTELA_RELAY_ADDR="${OTELA_RELAY_ADDR:-/ip4/140.238.223.116/tcp/43905/p2p/QmTtnXKHvovCwkBZRR4NcxeHfnt5EJQgN4wo9KV8U8nYP7}"
 export OTELA_SERVICE_NAME="${OTELA_SERVICE_NAME:-llm}"
 export OTELA_TCP_PORT="${OTELA_TCP_PORT:-43905}"
@@ -231,8 +231,8 @@ echo "[$(date -Is)] DSA=$GLM53_DSA_PREFILL/$GLM53_DSA_DECODE topk=$GLM53_DSA_TOP
 if [ "$SMOKE" = "0" ]; then
   [ -x "$OTELA_BIN" ] || {
     echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-    echo "       Stage an x86_64 build (not -arm64), e.g.:" >&2
-    echo "         cp <x86_64 otela> $OTELA_BIN && chmod +x $OTELA_BIN" >&2
+    echo "       bash up.sh stages the latest official OpenTela (amd64) automatically" >&2
+    echo "         OTELA_DIR=$OTELA_DIR OTELA_ARCH=amd64 bash ../../../../meta/common/download_otela.sh" >&2
     exit 1
   }
 fi
@@ -259,14 +259,17 @@ _sib() { # name, why
     echo "       $2" >&2; exit 1; }
 }
 # Shared scripts (gen_correctness.py, sglang_launcher_mi300a.py) are
-# canonical in the repo's meta/common/ — walk up from the recipe dir.
+# Shared scripts live in the repo's meta/common/ — walk up from the recipe dir.
+# Per-recipe copies were removed; meta/common is the single canonical home
+# (lib.sh: stop_otela; gen_correctness.py; download_otela.sh).
 COMMON_DIR=""
 _cwd="$SCRIPT_DIR"
 for _ in 1 2 3 4 5 6; do
-  [ -d "$_cwd/meta/common" ] && { COMMON_DIR="$_cwd/meta/common"; break; }
+  [ -f "$_cwd/meta/common/lib.sh" ] && { COMMON_DIR="$_cwd/meta/common"; break; }
   _cwd="$(dirname "$_cwd")"
 done
-[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/ not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
 export COMMON_DIR   # reaches the container via srun-inherited env
 unset _cwd
 [ -f "$COMMON_DIR/gen_correctness.py" ] || { echo "FATAL: $COMMON_DIR/gen_correctness.py missing" >&2; exit 1; }
@@ -483,26 +486,8 @@ OTELA
 fi
 
 # --- lifecycle: clean otela leave on SIGTERM (SMOKE=0 only) -----------------
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$SMOKE" = "1" ] && return 0
-  [ "$_OTELA_STOPPED" = 1 ] && return 0
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then echo "[$(date -Is)] WARN: otela step not found; no LEFT published." >&2; return 0; fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# stop_otela comes from meta/common/lib.sh (sourced above); the _OTELA_LAUNCHED
+# guard set below makes it a silent no-op for SMOKE runs (no worker launched).
 trap 'stop_otela' EXIT TERM INT
 
 # --------------------------------------------------------- probe + register --
@@ -581,6 +566,7 @@ trap 'stop_otela' EXIT TERM INT
     srun --jobid="${SLURM_JOB_ID:-0}" --overlap --gres=none --nodes=1 --ntasks=1 \
          -w "$HEAD" --environment="$OTELA_EDF_NAME" -J "$OTELA_STEP_NAME" \
          bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
+    _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
   else
     echo "[$(date -Is)] SMOKE=1: probe passed; engine held by the foreground srun below for manual inspection (no otela registration)."
     echo "[$(date -Is)]       curl http://127.0.0.1:$SERVE_PORT/v1/models ; scancel $SLURM_JOB_ID when done."

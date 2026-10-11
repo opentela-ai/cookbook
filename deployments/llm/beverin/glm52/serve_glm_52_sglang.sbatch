@@ -64,16 +64,17 @@ set -uo pipefail
 # are not found (kimi-k3 job 590745).
 export SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 export EDF_PATH="${SCRIPT_DIR}:${EDF_PATH:-${HOME}/.edf}"
-# Shared scripts (gen_correctness.py, sglang_launcher_mi300a.py) live in the
-# repo's meta/common/ — walk up from the recipe dir to find it. Per-recipe
-# copies were removed; meta/common is the single canonical home.
+# Shared scripts live in the repo's meta/common/ — walk up from the recipe
+dir to find it. Per-recipe copies were removed; meta/common is the single
+# canonical home (lib.sh: stop_otela; gen_correctness.py; download_otela.sh).
 COMMON_DIR=""
 _cwd="$SCRIPT_DIR"
 for _ in 1 2 3 4 5 6; do
-  [ -d "$_cwd/meta/common" ] && { COMMON_DIR="$_cwd/meta/common"; break; }
+  [ -f "$_cwd/meta/common/lib.sh" ] && { COMMON_DIR="$_cwd/meta/common"; break; }
   _cwd="$(dirname "$_cwd")"
 done
-[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/ not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+[ -n "$COMMON_DIR" ] || { echo "FATAL: meta/common/lib.sh not found above $SCRIPT_DIR — submit from within the repo checkout" >&2; exit 1; }
+source "$COMMON_DIR/lib.sh"   # stop_otela + teardown contract
 export COMMON_DIR   # reaches the container via srun-inherited env (like SCRIPT_DIR)
 unset _cwd
 export OTELA_EDF_NAME="${OTELA_EDF_NAME:-sglang-rocm}"
@@ -150,13 +151,13 @@ export GLM52_ENABLE_PARSERS="${GLM52_ENABLE_PARSERS:-1}"
 export GLM52_SPECULATIVE="${GLM52_SPECULATIVE:-0}"
 
 # ------------------------------------------------------------------- otela ----
-# sai-v0.0.6 build (same as glm47/kimi-k3). multiaddr → --bootstrap.static
-# (NOT --bootstrap.addr, which takes a URL). cfg.yaml with loglevel/reachability/
+# Official OpenTela release (amd64; the sai-v0.0.6 fork is retired). multiaddr
+# → --bootstrap.static (NOT --bootstrap.addr, which takes a URL). cfg.yaml with loglevel/reachability/
 # role/seed is required (Clariden job 3000965): without it otela goes silent
 # during CRDT sync and only LOOKS hung. Runs inside the container on the head
 # so its HOME (EDF → /capstor) is writable for identity + badger DB.
 export OTELA_DIR="${OTELA_DIR:-/capstor/scratch/cscs/xyao/opentela}"
-export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/otela}"
+export OTELA_BIN="${OTELA_BIN:-$OTELA_DIR/opentela-amd64-latest}"   # official release; up.sh stages via meta/common/download_otela.sh
 # Direct-mesh bootstrap (an Alps OpenTela peer — the same one the glm47-flash
 # recipe uses; the older /ip4/148.187.108.178/... from kimi-k3 is an overrideable
 # fallback). No relay needed (Beverin compute has full outbound internet).
@@ -238,8 +239,9 @@ if [ "$LOAD_FORMAT" != "dummy" ]; then
 fi
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage the verified sai-dialect x86_64 build, e.g.:" >&2
-  echo "         mkdir -p $OTELA_DIR && cp <x86_64 otela> $OTELA_BIN && chmod +x $OTELA_BIN" >&2
+  echo "       bash up.sh stages the latest official OpenTela (amd64) automatically" >&2
+  echo "         OTELA_DIR=$OTELA_DIR OTELA_ARCH=amd64 bash ../../../../meta/common/download_otela.sh" >&2
+  echo "       (Override with OTELA_BIN=<path>; rollback: OTELA_VERSION=<tag> download_otela.sh)" >&2
   exit 1
 }
 _sib() { # name, why — checks the recipe dir, then meta/common (shared)
@@ -441,30 +443,7 @@ chmod +x "$RUNDIR/otela.sh"
 # ------------------------------------------------------------- lifecycle -----
 # otela only publishes LEFT on SIGTERM (AnnounceLeave); SIGKILL leaves a stale
 # connected:true row. --signal=B:TERM@120 + this batch-shell trap TERM the step.
-_OTELA_STOPPED=0
-stop_otela() {
-  [ "$_OTELA_STOPPED" = 1 ] && return 0   # trap fires for both TERM and EXIT
-  _OTELA_STOPPED=1
-  local step
-  step="$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-          | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}' | head -1)"
-  if [ -z "$step" ]; then
-    echo "[$(date -Is)] WARN: otela step $OTELA_STEP_NAME not found; cannot signal it." >&2
-    echo "[$(date -Is)]       If it was SIGKILLed, no LEFT was published and the head" >&2
-    echo "[$(date -Is)]       may keep a stale connected=true row for this worker." >&2
-    return 0
-  fi
-  echo "[$(date -Is)] stopping otela step $step"
-  scancel -s TERM "$step" 2>/dev/null
-  for _ in $(seq 1 20); do
-    [ -z "$(squeue -s -j "$SLURM_JOB_ID" -h -o '%i %j' 2>/dev/null \
-            | awk -v n="$OTELA_STEP_NAME" '$2==n{print $1}')" ] && break
-    sleep 1
-  done
-  grep -aqE "Announcing myself as LEFT|Leaving network" "$RUNDIR/otela.log" 2>/dev/null \
-    && echo "[$(date -Is)] otela: graceful leave confirmed" \
-    || echo "[$(date -Is)] WARN: otela did not announce LEFT" >&2
-}
+# stop_otela comes from meta/common/lib.sh (sourced above).
 trap 'stop_otela' EXIT TERM INT
 
 # Wait + probe run in the BATCH shell (host netns == container netns); the
@@ -511,6 +490,7 @@ trap 'stop_otela' EXIT TERM INT
   srun --jobid="$SLURM_JOB_ID" --overlap --gres=none --nodes=1 --ntasks=1 \
        -w "$HEAD" --environment="$OTELA_EDF_NAME" -J "$OTELA_STEP_NAME" \
        bash -c '"$0" >"$1" 2>&1' "$RUNDIR/otela.sh" "$RUNDIR/otela.log"
+  _OTELA_LAUNCHED=1   # stop_otela (lib.sh) is active only after a real launch
 ) &
 
 # Record endpoints for all nodes before srun starts so the metadata is

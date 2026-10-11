@@ -25,10 +25,11 @@ DEPLOY_DIR="${DEPLOY_DIR:-${RECIPE_DIR}/run}"
 
 # Defaults keep the recipe self-contained: the otela binary, config, pid, and
 # log all live under $OTELA_DIR (default $DEPLOY_DIR/otela, i.e. a `run/otela`
-# dir next to the recipe). Drop the OpenTela `opentela-arm64` binary at
-# $OTELA_BIN (the v0.2.3 release is named opentela-arm64; invoke it as otela).
+# dir next to the recipe). The binary is staged by up.sh via the shared
+# meta/common/download_otela.sh (latest official release, arm64); the
+# opentela-arm64-latest symlink is what $OTELA_BIN pins.
 OTELA_DIR="${OTELA_DIR:-${DEPLOY_DIR}/otela}"
-OTELA_BIN="${OTELA_BIN:-${OTELA_DIR}/otela}"
+OTELA_BIN="${OTELA_BIN:-${OTELA_DIR}/opentela-arm64-latest}"
 CFG_DIR="${OPENTELA_CFG_DIR:-${OTELA_DIR}}"
 PIDFILE="${PIDFILE:-${OTELA_DIR}/otela.pid}"
 LOGFILE="${LOGFILE:-${OTELA_DIR}/otela.log}"
@@ -49,8 +50,8 @@ OPENTELA_SEED="${OPENTELA_SEED:-0}"
 HEALTH_PATH="${HEALTH_PATH:-/}"
 
 [ -x "${OTELA_BIN}" ] || { echo "FATAL: otela binary not found/executable: ${OTELA_BIN}" >&2
-  echo "       Obtain the OpenTela v0.2.3 'opentela-arm64' release binary and" >&2
-  echo "       place it at ${OTELA_BIN} (run bash ${RECIPE_DIR}/download_otela.sh)," >&2
+  echo "       Stage the latest official OpenTela release (arm64):" >&2
+  echo "         OTELA_DIR=${OTELA_DIR} bash meta/common/download_otela.sh   # from the repo root" >&2
   echo "       or set OTELA_BIN to an existing path." >&2
   exit 1; }
 mkdir -p "${CFG_DIR}"
