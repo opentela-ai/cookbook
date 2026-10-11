@@ -238,7 +238,7 @@ if [ "$LOAD_FORMAT" != "dummy" ]; then
 fi
 [ -x "$OTELA_BIN" ] || {
   echo "FATAL: otela binary not found/executable: $OTELA_BIN" >&2
-  echo "       Stage an x86_64 (sai-v0.0.6) build, e.g.:" >&2
+  echo "       Stage the verified sai-dialect x86_64 build, e.g.:" >&2
   echo "         mkdir -p $OTELA_DIR && cp <x86_64 otela> $OTELA_BIN && chmod +x $OTELA_BIN" >&2
   exit 1
 }

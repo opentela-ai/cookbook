@@ -96,8 +96,19 @@ fallback for `--load-format dummy`.
    (`unset NCCL_NET_PLUGIN NCCL_NET`; `NCCL_SOCKET_IFNAME=hsn0`;
    `NCCL_IB_DISABLE=1`) so RCCL uses its built-in Socket transport over
    Slingshot IP. This is the verified bring-up path; cross-node TP all-reduce
-   is slow over Socket. **TODO:** a HIP-aware OFI/CXI plugin for real
-   throughput (filed separately).
+   is slow over Socket. The RCCL-native OFI plugin (`librccl-net-ofi.so`,
+   ROCm 7.2.3, aws-ofi-nccl 1.20.0) **initialises cleanly** (rccl-xport jobs
+   601320/601321/601339) but the **first cross-node collective hangs**
+   (≥2:47, with or without GDR) on this allocation — a CSCS netstack gap,
+   not an env tweak. Socket stays the default; test OFI with
+   `K3_RCCL_SOCKET=0`. Two Socket-side all-to-all knobs are default ON since
+   run-601453: `RCCL_ALL_TO_ALL_PIVOT_ENABLE` + `RCCL_CHANNEL_TUNING_ENABLE`
+   cut the MoE all-to-all GPU time −31% (15.50 s → 10.71 s) and lifted agg
+   tok/s 20.6 → 23.8. gloo is pinned to `hsn0` separately
+   (`GLOO_SOCKET_IFNAME`) — it needs an exact iface name (no prefix
+   matching); job 600189 (real weights) lost 1 h 52 m to a non-routable gloo
+   bind, and job 601406 to `hsn` prefix expansion. **TODO:** a HIP-aware
+   OFI/CXI plugin for real throughput (filed separately).
 
 5. **Weight-loading barrier tolerance.** vLLM's distributed init
    (`--master-addr`/`--master-port` store) and per-shard load from Lustre have
@@ -107,6 +118,21 @@ fallback for `--load-format dummy`.
    `HEALTH_TIMEOUT=14400` (4 h) give comfortable margin; the generation probe
    + otela registration run only after the head is both healthy *and*
    has produced a real token.
+
+6. **ROCm skinny GEMM disabled.** vLLM's custom ROCm skinny GEMM
+   (`wvSplitKrc_` in `csrc/rocm/skinny_gemms.hip`) fires a device-side
+   assertion on M=10, 7168×1536-class shapes and poisons the device queue —
+   async server: `/health` stays 200 but all forwards hang (jobs 586723,
+   588129). `VLLM_ROCM_USE_SKINNY_GEMM=0` falls back to torch/hipBLAS.
+
+7. **JIT/RAM contention controls.** AITER JIT compiles per-worker; 4×
+   simultaneous LLVM/Triton compilations OOM'd nodes (jobs 584773/584789/
+   584984). `K3_JIT_STAGGER=1` + `K3_JIT_STAGGER_DELAY=60` start one worker
+   per node at a time; `OMP_NUM_THREADS=1` keeps per-worker JIT memory at
+   ~5–8 GB (vs ~15 GB); `MALLOC_TRIM_THRESHOLD_=65536` returns freed heap to
+   the OS between load phases; TMPDIR + `TRITON_CACHE_DIR` live on
+   `/capstor/scratch` (project 2161, unlimited) after job 585851 hit the
+   project-7659 quota mid-JIT ("LLVM ERROR: IO failure").
 
 ## The weight-loading fix (one-time Lustre restripe — DONE)
 
@@ -194,6 +220,22 @@ On probe failure it logs `GEN_PROBE_FAILED`, writes a per-prompt report to
 is left running for inspection — `scancel` when ready). Set `GEN_PROBE=0` to
 skip (not recommended).
 
+## Cudagraph experiments (why ENFORCE_EAGER=1 is the proven path)
+
+Three attempts to keep cudagraphs under PP: (1) the AUTO default left
+cudagraph_mode=FULL_AND_PIECEWISE, whose decode_mode()=FULL means
+`@eager_break_during_capture` does NOT break → one monolithic decode graph →
+stale MoE routing + PP3 recv_object deadlock (jobs 588153/588156); (2)
+`K3_PIECEWISE=1` (mode=VLLM_COMPILE) is a no-op without
+`@support_torch_compile` on Kimi-K3 (job 589322 — runs EAGER); (3)
+`K3_BREAKABLE_PIECEWISE=1` is the vLLM-intended path for decorator-less
+models: `VLLM_USE_BREAKABLE_CUDAGRAPH=1` must be exported before `exec`
+(decoration time precedes vLLM's auto-default) + `cudagraph_mode=PIECEWISE`,
+splitting the graph at `VkernelFusedExperts.apply`. It must run TP8 PP1
+(no PP boundary → no recv_object to deadlock). Both experiment knobs default
+`0`; `ENFORCE_EAGER=1` + `K3_PREFIX_CACHE=0` + `LOAD_FORMAT=dummy` +
+`DISTRIBUTED_TIMEOUT_SECONDS=300` is the fast iteration loop.
+
 ## Graceful leave
 
 `--signal=B:TERM@120` signals the **batch shell** 120 s before wall-time,
@@ -218,11 +260,12 @@ Without `B:`, only KillWait (30 s) applies and the head keeps a
 |------|---------|
 | `kimi-k3-vllm.toml` | EDF: image (`.sqsh`), mounts (`/capstor`, `/users`, `/iopsstor`), HOME on `/capstor`, HF offline, `aws_ofi_nccl` annotation |
 | `serve_kimi_k3_otela_beverin.sbatch` | One self-contained sbatch: per-rank engine wrapper (`k3_patch.py` serialization + vLLM launch) + health/correctness-probe-gated otela worker on the head |
+| `edf_diag.sbatch` | 3-min single-GPU EDF env dump (SUBMIT_DIR/BASH_SOURCE/EDF_PATH resolution + `ofi-rccl-smoke.toml` visibility) — run from this dir when EDF-path issues strike |
 | `k3_patch.py` | The four gfx942 a16w4 flydsl kernel patches + installs `sitecustomize.py`, `vkernels_experts.py`, and `libvkernels_hip.so` into the overlay |
 | `sitecustomize.py` | Python runtime overrides (auto-imported at CPython startup): (1) adds `VKERNELS_MXFP4_BF16` to the `Mxfp4MoeBackend` enum; (2) patches both `convert_*_to_mxfp4_moe_kernel_format` functions for pass-through weight handling; (3) patches `_get_priority_backends` + `backend_to_kernel_cls` to route `VKERNELS_MXFP4_BF16 → VkernelFusedExperts`; (4) multi-node follower KV-init fix (job 580876); (5) AITER `module_moe_asm` PyTorch fallback (topk, moe_sum, moe_align_block_size); **(6) VkernelMLA + VkernelKDA registration (issue #42)** — `VKERNELS_MLA=1` selects the `vk_hip_mla_fwd` backend ahead of `TRITON_MLA`; `VKERNELS_KDA=1` routes the delta-rule to `vk_hip_kda_delta_rule_fwd`, re-enabling the KDA layer `K3_DISABLE_KDA=1` used to drop |
 | `vkernels_experts.py` | `VkernelFusedExperts` class — `UnfusedOAITritonExperts` subclass that calls `vk_hip_fused_moe_mxfp4` via ctypes with `tensor.data_ptr()`. Handles `moe_align_block_size` on CPU + device copy, SiTU/SwiGLU activation params, and `apply_router_weight_on_input`. |
 | `vkernels_attn.py` | **issue #42** — `VkernelMLAImpl`/`VkernelMLABackend` (absorbed-form MLA via `vk_hip_mla_fwd`) + a `KimiK3DeltaAttention._forward` patch routing the delta-rule to `vk_hip_kda_delta_rule_fwd` on gfx942. Both load `libvkernels_hip.so` via ctypes (reusing `vkernels_experts._find_libvkernels_hip`), are `on_gfx942()`-guarded, opt-in (`VKERNELS_MLA`/`VKERNELS_KDA`), default OFF, and cross-check the device output against the CPU oracle (`vk_mla_fwd`/`vk_kda_naive_delta_rule_fwd`, `max_rel<0.01`) on first use (`VKERNELS_*_VALIDATE`). |
-| `gen_correctness.py` | Six-prompt factual correctness probe (mirrors the Clariden servekit bench); gates otela registration on real answers, not just a non-empty body |
+| `gen_correctness.py` → `meta/common/` | Six-prompt factual correctness probe (mirrors the Clariden servekit bench); gates otela registration on real answers, not just a non-empty body. Resolved via directory walk-up to the shared canonical copy |
 
 ## Submit
 
@@ -347,13 +390,13 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `MODEL_PATH` | `/capstor/store/cscs/swissai/infra01/hf_models/models/moonshotai/Kimi-K3` | Weights. Point at a restriped copy to fix the load bottleneck. |
 | `SERVED_MODEL_NAME` | `SwissAI-Research/moonshot/kimi-k3-rocm` | Mesh-consistent (coexists with the Clariden sglang K3 as additive capacity). Override `moonshotai/Kimi-K3` or `kimi-k3` to match other probes. |
 | `TP_SIZE` | `8` | Must satisfy `TP × PP == nodes × 4`. |
-| `PP_SIZE` | `2` | As above. |
+| `PP_SIZE` | `3` | As above (93 layers → 31/stage). |
 | `CTX_LEN` | `131072` | `--max-model-len`. K3 supports up to `1048576`; KV pool is sized by `GPU_MEM_UTIL` (MLA+KDA, ~107 KB/token), not this. |
 | `MAX_NUM_SEQS` | `8` | `--max-num-seqs` (upper bound; vLLM admits fewer if KV is tight). |
 | `GPU_MEM_UTIL` | `0.8` | `--gpu-memory-utilization`. MI300A is an APU with unified HBM (~501 GiB/node); 0.9 leaves only ~40 GiB for the OS → system OOM kill. 0.8 leaves ~91 GiB. |
 | `MASTER_PORT` | `6379` | vLLM distributed-init store port. |
 | `SERVE_PORT` | `8080` | Head HTTP port (registered as the `llm` service). |
-| `K3_NIC` | `hsn0` | NCCL/GLOO socket bootstrap NIC. |
+| `K3_NIC` | `hsn` | NCCL Socket fan-out over all Slingshot NICs (single-`hsn0` pre-601453 path: set `hsn0`). gloo is pinned to `hsn0` separately (`K3_GLOO_NIC`). |
 | `HEALTH_TIMEOUT` | `14400` | Max wait for `/health` + generation before giving up on registration. |
 | `GEN_PROBE` | `1` | Mandatory factual-correctness probe before registration (0 = skip, not recommended). |
 | `GEN_PROBE_TIMEOUT` | `600` | Overall wall budget for the 6-prompt probe (s). |
@@ -363,6 +406,12 @@ curl -s http://<alps-head>/v1/service/llm/v1/chat/completions \
 | `ENFORCE_EAGER` | `0` | Set `1` to add `--enforce-eager` (skip CUDA-graph capture; the proven path on gfx942+PP3 per `BENCHMARK.md`). |
 | `K3_PREFIX_CACHE` | `0` | Set `1` to add `--enable-prefix-caching`. **Default `0` because prefix caching is unconditionally broken on this image** (HybridKVCacheCoordinator assertion at `kv_cache_coordinator.py:627`; K3's Mamba+attention groups share one KV cache spec). `0` selects `KVCacheCoordinatorNoPrefixCache` and restores the proven-working `ENFORCE_EAGER=1` path. Set `1` only after the upstream selection bug is fixed. |
 | `K3_ENABLE_PARSERS` | `1` | Adds `--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3` so `/v1/chat/completions` returns `reasoning_content` + `tool_calls`. Set `0` if an image bump drops the `kimi_k3` parser (startup errors `invalid tool call parser` first). |
+| `K3_BREAKABLE_PIECEWISE` | `0` | The vLLM-intended piecewise-cudagraph path for models without `@support_torch_compile`: exports `VLLM_USE_BREAKABLE_CUDAGRAPH=1` pre-exec + `cudagraph_mode=PIECEWISE` (splitting at `VkernelFusedExperts.apply` via `@eager_break_during_capture`). TP8 PP1 only (guard warns above). Mutually exclusive with `K3_PIECEWISE`/`ENFORCE_EAGER` (auto-resolved). |
+| `MAX_NUM_BATCHED_TOKENS` | `8192` | `--max-num-batched-tokens`. vLLM default 2048 too small for high-concurrency sweeps (C=256 prefill demand ~12800 tokens → HTTP timeout, job 600469); 8192 matches the BENCHMARK.md baseline (job 598005). |
+| `K3_JIT_STAGGER` / `_DELAY` | `1` / `60` | One worker per node starts at a time so 4× simultaneous weight allocation + JIT don't OOM the node (jobs 584773/584789/584984). |
+| `OMP_NUM_THREADS` | `1` | Single-threaded LLVM JIT keeps per-worker compile memory at ~5–8 GB (vs ~15 GB), 4 workers/node. |
+| `STEP_PROFILE` | `0` | Per-step torch.profiler pass: `benchmark.py` writes `$VLLM_STEP_PROFILE_DIR/.go` before its first measured level; sitecustomize arms profilers on `VLLM_STEP_PROFILE_RANKS` (default `0,8,16` = one per PP stage) for `VLLM_STEP_PROFILE_DUR` (15 s). Chrome traces → `$RUNDIR/step_profiles/`. |
+| `MALLOC_TRIM_THRESHOLD_` | `65536` | glibc returns freed heap to the OS aggressively; prevents multi-GiB fragmentation across 4 workers/node. |
 | `K3_PIECEWISE` | `0` | **Confirmed NOT viable** (job 589322). Sets `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `--compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'`, but `KimiK3ForConditionalGeneration` carries NO `@support_torch_compile`, so `mode=VLLM_COMPILE` only warns (`vllm.py:2410`) and at init (`gpu_model_runner.py:5442`) `is_breakable=False` + `PIECEWISE.has_full_cudagraphs()=False` installs NO wrapper — the model runs EAGER, identical to `ENFORCE_EAGER=1`. Real PIECEWISE cudagraph requires upstream `@support_torch_compile` on Kimi-K3. |
 | `LOAD_FORMAT` | _unset_ | Override weight loading (e.g. `dummy` for a 5-min cold start without real weights — used with `K3_PIECEWISE=1`). |
 | `BENCH` | `0` | Set `1` to run `benchmark.py` — a concurrent `/v1/completions` throughput sweep (warmup + one JSON line per `CONC:NUMREQ` level) — after the correctness probe passes, BEFORE registration. Pair with `OTELA_BIN=/bin/true` for a pure benchmark. Knobs: `BENCH_SPEC` (default `1:16 8:32 32:64 64:64`), `BENCH_OUT_TOK` (256), `BENCH_IN_TOK` (32, short to isolate decode), `BENCH_TIMEOUT` (1800). **issue #42:** pass a 7th arg or set `BENCH_BASE_KDA_OFF` to a KDA-disabled baseline server (`K3_DISABLE_KDA=1`) — the SAME spec runs against both and a per-level throughput + per-request latency delta is reported (acceptance: KDA-on / KDA-off latency ratio ≤ 1.05×). |
